@@ -1,5 +1,5 @@
 
-<center>[<img src="https://unsonet.github.io/excelsior-pdf/assets/img/excelsior-pdf.png" width="200" />](https://unsonet.github.io/excelsior-pdf/assets/img/excelsior-pdf.png)</center>
+<center><img src="https://unsonet.github.io/excelsior-pdf/assets/img/excelsior-pdf.png" width="200" /></center>
 
 # 📄 Excelsior PDF (parser)
 Excelsior PDF is a powerful JavaScript/TypeScript library for extracting table data from PDF files. It works in both browser and Node.js environments, detects tables with or without borders, supports merged cells, handles watermark-protected documents, and does all of this without using neural networks.
