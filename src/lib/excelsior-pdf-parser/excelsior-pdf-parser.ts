@@ -538,7 +538,7 @@ export function init({
                   }
                   let vector = { y: ry, x: rx, width: rwidth, height: rheight, transform: transformMatrix };
 
-                  // Пропускаем полноразмерные прямоугольники-фон/обрезку страницы
+                  // We skip the full‑size background rectangles/page cropping
                   let isFullPageRect = Math.abs(rwidth - pageWidth) < 1
                     && Math.abs(rheight - pageHeight) < 1
                     && Math.abs(rx) < 1
@@ -546,7 +546,7 @@ export function init({
                   if (isFullPageRect) {
                     current['vectorCache'] = vector;
                     current['vectorType'] = 'rectangle';
-                    continue; // не добавляем в rectangles / edges
+                    continue; // do not add to rectangles / edges
                   }
 
 
@@ -605,18 +605,17 @@ export function init({
                       }
                     }
 
-                    // --- НАЧАЛО ВСТАВКИ ---
                     let isPageBoundary = false;
                     let tol = 1.0;
 
-                    // Горизонтальная линия на верхнем/нижнем краю страницы
+                    // A horizontal line at the top/bottom edge of the page
                     if (vector.height < lineMaxWidth && vector.width > pageWidth * 0.9) {
                       let centerY = vector.y + vector.height / 2;
                       if (Math.abs(centerY) < tol || Math.abs(centerY - pageHeight) < tol) {
                         isPageBoundary = true;
                       }
                     }
-                    // Вертикальная линия на левом/правом краю страницы
+                    // A vertical line at the left/right edge of the page
                     if (vector.width < lineMaxWidth && vector.height > pageHeight * 0.9) {
                       let centerX = vector.x + vector.width / 2;
                       if (Math.abs(centerX) < tol || Math.abs(centerX - pageWidth) < tol) {
@@ -705,7 +704,16 @@ export function init({
               let norm = normalizeNumericArgs(args);
               if (norm.length >= 6) {
                 textMatrix = norm;
-                current.contentItem.transform = textMatrix;
+
+                // In PDF, textMatrix(Tm) sets the position/orientation without font size.
+                // We combine Tm with the current fontSize so that the transform includes full scaling.
+                let fs = current.fontSize || 1;
+                current.contentItem.transform = [
+                  norm[0] * fs, norm[1] * fs,
+                  norm[2] * fs, norm[3] * fs,
+                  norm[4], norm[5]
+                ];
+
                 current['pathConstructed'] = true;
               }
             } else if (fn === OPS.stroke) {
@@ -1080,6 +1088,11 @@ export function init({
                 return textContentItem ? [textContentItem.transform[5], textContentItem.transform[4]].join('-') : null;
               }
 
+              function trimCoordinate(item) {
+                if (!item || item.imageName || !item.chars?.length) return item;
+                return trimTableContentItem(item, true, true);
+              }
+
               function trimTableContentItem(item, clearStart = true, clearEnd = true) {
                 item = JSON.parse(JSON.stringify(item));
                 let chars = clearChars({
@@ -1089,10 +1102,15 @@ export function init({
                   clearEnd
                 });
                 chars = chars.length ? chars : item.chars;
+
+                let fontSize = Math.abs(item.transform[3]) || item.height || 1;
+
                 let handledValues = handleCharsArgs({
                   charsArr: chars,
-                  x: item.transform[4]
+                  x: item.transform[4],
+                  fontSize: fontSize
                 });
+
                 Object.assign(item, {
                   str: item?.str?.trim(),
                   chars: chars,
@@ -1121,7 +1139,6 @@ export function init({
 
               if (fontSizeIsNotSet) {
                 _widthAdvanceScale = effectiveHeight * _fontIdentityMatrix[0];
-                // Добавь это:
                 current.contentItem.height = effectiveHeight;
                 current.contentItem.transform[0] = effectiveHeight;
                 current.contentItem.transform[3] = effectiveHeight;
@@ -1147,7 +1164,6 @@ export function init({
 
               current['str'] = str;
 
-
               Object.assign(preliminaryItem, {
                 str: str,
                 chars: charsRangesArrays.flat(),//need to update
@@ -1164,37 +1180,251 @@ export function init({
                 y: preliminaryItem.transform[5],
                 height: preliminaryItem.height,
                 width: preliminaryItem.width
-              })
-                .filter(item => {
-                  let parseStr = (str) => {
-                    return str ? [...(str.match(/\p{L}+|\p{N}+|\w|\W/gmu) || [])] : [];
-                  };
-                  let [str1, str2] = [item?.str || '', str || ''];
-                  return parseStr(str1).some(i => str2.includes(i)) ||
-                    parseStr(str2).some(i => str1.includes(i));
-                });
+              }).filter(item => {
+                if (!item) return false;
+
+                // 1. String matching
+                let parseStr = (str) => {
+                  return str ? [...(str.match(/\p{L}+|\p{N}+|\w|\W/gmu) || [])] : [];
+                };
+                let [str1, str2] = [item?.str || '', str || ''];
+                let hasStrOverlap = parseStr(str1).some(i => str2.includes(i)) || parseStr(str2).some(i => str1.includes(i));
+                if (hasStrOverlap) return true;
+
+                // 2. Geometric adjacency: the element is in contact or has a gap of up to 2*fontSize.
+                let itemRight = item.transform[4] + item.width;
+                let itemLeft = item.transform[4];
+                let prelimRight = preliminaryItem.transform[4] + preliminaryItem.width;
+                let prelimLeft = preliminaryItem.transform[4];
+                let gapThreshold = Math.max(preliminaryItem.height * 2, 3);
+
+                let xAdjacent = (itemRight >= prelimLeft - gapThreshold && itemRight <= prelimLeft + gapThreshold) ||
+                  (itemLeft >= prelimRight - gapThreshold && itemLeft <= prelimRight + gapThreshold) ||
+                  (itemLeft <= prelimRight && itemRight >= prelimLeft); // пересечение
+
+                let sameY = Math.abs(item.transform[5] - preliminaryItem.transform[5]) < preliminaryItem.height * 1.5;
+
+                let hasMainStrOverlap = parseStr(str1).some(i => preliminaryItem.str.includes(i)) || parseStr(preliminaryItem.str).some(i => str1.includes(i));
+
+                return xAdjacent && sameY && hasMainStrOverlap;
+              });
               relatedTextContentItems = relatedTextContentItems.length ? relatedTextContentItems : [undefined];
 
-              for (let relatedTextContentIndex = 0; relatedTextContentIndex < relatedTextContentItems.length; relatedTextContentIndex++) {
-                const relatedTextContentItem = relatedTextContentItems[relatedTextContentIndex];
+              // ============================================================
+              // FUNCTIONS OF SEGMENTATION preliminaryItem BASED ON GLYPH GEOMETRY
+              // ============================================================
+              function segmentPreliminaryItem(item: any): any[] {
+                if (!item?.chars?.length) return [item];
+                const glyphs = item.chars.filter((ch: any) =>
+                  ch && typeof ch === 'object' && typeof ch.unicode === 'string' && ch.x !== undefined
+                );
+                if (glyphs.length <= 1) return [item];
+                const threshold = Math.max(item.height * 0.6, 2);
+                const segments: any[] = [];
+                let currentGlyphs: any[] = [glyphs[0]];
+                let currentStartX = glyphs[0].x;
+                let lastEndX = glyphs[0].x + (glyphs[0].charWidth || item.height * 0.5);
+
+                for (let i = 1; i < glyphs.length; i++) {
+                  const g = glyphs[i];
+                  const gap = g.x - lastEndX;
+                  if (gap > threshold) {
+                    segments.push(buildSegment(item, currentGlyphs, currentStartX));
+                    currentGlyphs = [g];
+                    currentStartX = g.x;
+                  } else {
+                    currentGlyphs.push(g);
+                  }
+                  lastEndX = g.x + (g.charWidth || item.height * 0.5);
+                }
+                if (currentGlyphs.length) {
+                  segments.push(buildSegment(item, currentGlyphs, currentStartX));
+                }
+                return segments.length > 0 ? segments : [item];
+              }
+
+              function buildSegment(baseItem: any, glyphs: any[], startX: number): any {
+                const endX = glyphs[glyphs.length - 1].x + (glyphs[glyphs.length - 1].charWidth || 0);
+                const width = Math.max(0, endX - startX);
+                const str = glyphs.map((g: any) => g.unicode).join('');
+                return {
+                  ...baseItem,
+                  str,
+                  chars: glyphs,
+                  width,
+                  transform: [
+                    baseItem.transform[0],
+                    baseItem.transform[1],
+                    baseItem.transform[2],
+                    baseItem.transform[3],
+                    startX,
+                    baseItem.transform[5]
+                  ]
+                };
+              }
+
+              function findRelatedForSegment(segment: any, relatedItems: any[]): any {
+                if (!relatedItems?.length) return undefined;
+                if (relatedItems.length === 1 && !relatedItems[0]) return undefined;
+
+                const segX1 = segment.transform[4];
+                const segX2 = segX1 + segment.width;
+                const segY1 = segment.transform[5];
+                const segY2 = segY1 + segment.height;
+                const segCenterX = (segX1 + segX2) / 2;
+                const segCenterY = (segY1 + segY2) / 2;
+
+                let bestMatch: any = undefined;
+                let bestScore = -Infinity;
+                const adjacencyThreshold = Math.max(segment.height * 0.5, 1);
+
+                for (const related of relatedItems) {
+                  if (!related) continue;
+                  const relX1 = related.transform[4];
+                  const relX2 = relX1 + related.width;
+                  const relY1 = related.transform[5];
+                  const relY2 = relY1 + related.height;
+
+                  // Пересечение по X и Y
+                  const xOverlap = Math.max(0, Math.min(segX2, relX2) - Math.max(segX1, relX1));
+                  const yOverlap = Math.max(0, Math.min(segY2, relY2) - Math.max(segY1, relY1));
+
+                  if (xOverlap > 0 && yOverlap > 0) {
+                    const score = xOverlap * yOverlap;
+                    if (score > bestScore) {
+                      bestScore = score;
+                      bestMatch = related;
+                    }
+                  } else if (yOverlap > 0) {
+                    // Adjacency along X (small gap = virtual intersection)
+                    const xGap = Math.min(Math.abs(segX1 - relX2), Math.abs(relX1 - segX2));
+                    if (xGap <= adjacencyThreshold) {
+                      const virtualOverlap = adjacencyThreshold - xGap;
+                      const score = virtualOverlap * yOverlap;
+                      if (score > bestScore) {
+                        bestScore = score;
+                        bestMatch = related;
+                      }
+                    }
+                  } else if (bestScore <= 0) {
+                    // Fallback: the closest one in terms of center.
+                    const dist = Math.sqrt(
+                      Math.pow(segCenterX - (relX1 + relX2) / 2, 2) +
+                      Math.pow(segCenterY - (relY1 + relY2) / 2, 2)
+                    );
+                    const fallbackScore = -dist;
+                    if (fallbackScore > bestScore) {
+                      bestScore = fallbackScore;
+                      bestMatch = related;
+                    }
+                  }
+                }
+                return bestMatch;
+              }
+
+              function getMergedCoordinatePaddingObj(lastItem, newItem, gridItemsType) {
+                if (!Array.isArray(lastItem) && !lastItem?.transform) {
+                  lastItem = newItem;
+                }
+                let lastItemArray = Array.isArray(lastItem) ? lastItem : [lastItem];
+                let newItemArray = Array.isArray(newItem) ? newItem : [newItem];
+                let mergedCoordinatePaddingObj = gridItemsType == 'cols' ? {
+                  'x': getCoordinateFromObj(lastItemArray).x[0] < getCoordinateFromObj(newItemArray).x[0] ? [
+                    Math.max(...lastItemArray.map(item => item.transform[4] + item.width)),
+                    Math.min(...newItemArray.map(item => item.transform[4]))
+                  ] : [
+                    Math.max(...newItemArray.map(item => item.transform[4] + item.width)),
+                    Math.min(...lastItemArray.map(item => item.transform[4]))
+                  ],
+                  'y': [
+                    Math.min(...lastItemArray.map(item => item.transform[5]), ...newItemArray.map(item => item.transform[5])),
+                    Math.max(...lastItemArray.map(item => item.transform[5] + item.height), ...newItemArray.map(item => item.transform[5] + item.height))
+                  ]
+                } : {
+                  'x': [
+                    Math.min(...lastItemArray.map(item => item.transform[4]), ...newItemArray.map(item => item.transform[4])),
+                    Math.max(...lastItemArray.map(item => item.transform[4] + item.width), ...newItemArray.map(item => item.transform[4] + item.width))
+                  ],
+                  'y': getCoordinateFromObj(lastItemArray).y[0] < getCoordinateFromObj(newItemArray).y[0] ? [
+                    Math.max(...lastItemArray.map(item => item.transform[5] + item.height)),
+                    Math.min(...newItemArray.map(item => item.transform[5]))
+                  ] : [
+                    Math.max(...newItemArray.map(item => item.transform[5] + item.height)),
+                    Math.min(...lastItemArray.map(item => item.transform[5]))
+                  ]
+                };
+                return mergedCoordinatePaddingObj;
+              }
+
+              function getCoordinateFromObj(obj) {
+                let array = Array.isArray(obj) ? obj : [obj];
+                return {
+                  x: [
+                    Math.min(...array.map(item => item.transform[4])),
+                    Math.max(...array.map(item => item.transform[4] + item.width))
+                  ],
+                  y: [
+                    Math.min(...array.map(item => item.transform[5])),
+                    Math.max(...array.map(item => item.transform[5] + item.height))
+                  ]
+                }
+              }
+
+              function intersectsEdges(options) {
+                let { first, second, targetGrids, edges, tolerance = 0 } = options || {};
+                return targetGrids.some(key => {
+                  if (first.length && second.length) {
+                    let paddingObj = getMergedCoordinatePaddingObj(first, second, key);
+
+                    // We expand paddingObj by the tolerance to catch edges at the boundary.
+                    let expandedPadding = {
+                      x: [paddingObj.x[0] - tolerance, paddingObj.x[1] + tolerance],
+                      y: [paddingObj.y[0] - tolerance, paddingObj.y[1] + tolerance]
+                    };
+
+                    let visibleEdges = edges.filter(item => isVisibleVector(item));
+                    return filterBlocks(visibleEdges, { ...expandedPadding, strictIntersecting: false })
+                      .filter(item => !paddingObj.x.includes(item.x) && !paddingObj.y.includes(item.y))
+                      .length;
+                  } else {
+                    return false;
+                  }
+                });
+              }
+
+              // ============================================================
+              // MAIN CYCLE BY SEGMENTS
+              // ============================================================
+              const segments = segmentPreliminaryItem(preliminaryItem);
+
+              for (let segIndex = 0; segIndex < segments.length; segIndex++) {
+                const segment = segments[segIndex];
+                const segmentStr = segment.str || '';
+                const normSegmentStr = normalizeCJKText(segmentStr);
+                const normSegmentStrTrimmed = normSegmentStr.trim();
+
+                let relatedTextContentItem = findRelatedForSegment(segment, relatedTextContentItems);
+                if (!relatedTextContentItem && relatedTextContentItems.length === 1 && !relatedTextContentItems[0]) {
+                  relatedTextContentItem = undefined;
+                }
 
                 let relatedTextContentId = getTextContentItemId(relatedTextContentItem);
                 let skippedLastTextContentItem = false;
                 let normRelatedStr = normalizeCJKText(relatedTextContentItem?.str || '');
-                let normStr = normalizeCJKText(str || '');
-
-                let identicalToRelated = normRelatedStr == normStr;
-                let similarToRelated = normRelatedStr.trim() == normStr.trim();
+                let normStr = normSegmentStr;
+                let normStrCompare = normSegmentStrTrimmed;
+                let identicalToRelated = normRelatedStr == normStrCompare;
+                let similarToRelated = normRelatedStr.trim() == normStrCompare;
 
                 let reachedEnd = (() => {
                   if (relatedTextContentItem ? normRelatedStr : false) {
-                    let subStrIndex = normRelatedStr.indexOf(normStr);
+                    let subStrIndex = normRelatedStr.indexOf(normStrCompare);
                     skippedLastTextContentItem = (subStrIndex != -1) && (subStrIndex != 0) && !tableContentItemsCache[relatedTextContentId]?.length;
-                    let reachedSubStrEnd = (subStrIndex + normStr.length) == normRelatedStr.length;
+                    let reachedSubStrEnd = (subStrIndex + normStrCompare.length) == normRelatedStr.length;
                     if (
                       (
-                        (preliminaryItem.transform[4] <= (relatedTextContentItem.transform[4] + relatedTextContentItem.width)) &&
-                        ((preliminaryItem.transform[4] + preliminaryItem.width) >= (relatedTextContentItem.transform[4] + relatedTextContentItem.width))
+                        (segment.transform[4] <= (relatedTextContentItem.transform[4] + relatedTextContentItem.width)) &&
+                        ((segment.transform[4] + segment.width) >= (relatedTextContentItem.transform[4] + relatedTextContentItem.width))
                       ) || reachedSubStrEnd
                     ) {
                       return true;
@@ -1205,7 +1435,6 @@ export function init({
                     return false;
                   }
                 })();
-
 
                 // if (skippedLastTextContentItem) {
                 //     let removedIndexes = [];
@@ -1227,7 +1456,6 @@ export function init({
                 //     tableContentItemsCache[relatedTextContentId] = [...removedItems, ...(tableContentItemsCache[relatedTextContentId] || [])];
                 // }
 
-
                 //update indexes
                 let newItemIndex;
                 // (()=>{
@@ -1237,24 +1465,24 @@ export function init({
                 let newItem;
                 let lastItemIndex = tableContentItems.length - 1;
                 let lastItem = tableContentItems?.[lastItemIndex] || {};
+                let reservedLastItemEOT = null;
 
                 if (relatedTextContentItem && !similarToRelated && reachedEnd) {
 
                   let intersectLast = (checkRectangleRanges(preliminaryItem, lastItem, {
                     axis: ['x', 'y']
                   }) as Array<any>).every(item => item.inRange);
-                  let currentCacheItems = preliminaryItem?.str?.includes(relatedTextContentItem?.str) ||
+                  let currentCacheItems = segment?.str?.includes(relatedTextContentItem?.str) ||
                     (
                       intersectLast &&
                       !tableContentItemsCache[relatedTextContentId]
-                    ) ? [preliminaryItem] : [...tableContentItemsCache[relatedTextContentId], preliminaryItem];
+                    ) ? [segment] : [...(tableContentItemsCache[relatedTextContentId] || []), segment];
 
                   newItem = currentCacheItems.reduce((prev, cur) => {
                     let newPrev;
-                    // Берём реальный масштаб из transform элемента (fallback на fontSize)
+                    // We take the actual scale from the transform element (fallback to fontSize).
                     let curEffectiveHeight = Math.abs(cur.transform[3]) || fontSize;
 
-                    //if (prev.str) {
                     if (prev?.str) {
                       let symbolsBetween = (() => {
                         let prevSubIndex = relatedTextContentItem.str.indexOf(prev.str);
@@ -1301,17 +1529,17 @@ export function init({
 
                     newPrev = handledValues.charsRangesArrays.flat().length ? {
                       str: handledValues?.str,
-                      chars: chars,
+                      chars: handledValues.charsRangesArrays.flat(),
                       fontName: fontName,
-                      height: cur.transform[3], //BUG in (13-sample-tables-3.pdf): old fontSize,
-                      dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(str),
+                      height: Math.max(Math.abs(prevTransform[3]) || curEffectiveHeight, Math.abs(cur.transform[3]) || curEffectiveHeight), //old:cur.transform[3] BUG in (13-sample-tables-3.pdf): old fontSize,
+                      dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(handledValues.str),
                       width: Math.max(...handledValues.widthRanges),
                       transform: [
                         Math.max(prevTransform[0], cur.transform[0]),
                         Math.max(prevTransform[1], cur.transform[1]),
                         Math.max(prevTransform[2], cur.transform[2]),
                         Math.max(prevTransform[3], cur.transform[3]),
-                        chars[0].x || Math.min(prevTransform[4], cur.transform[4]),
+                        handledValues.charsRangesArrays.flat()[0]?.x || Math.min(prevTransform[4], cur.transform[4]),
                         Math.max(prevTransform[5], cur.transform[5]),
                       ],
                     } : null;
@@ -1319,10 +1547,9 @@ export function init({
                     //     newPrev = cur;
                     // }
                     return newPrev;
-                  }, {});
-
+                  }, null);
                 } else {
-                  newItem = preliminaryItem;
+                  newItem = segment;
                 }
 
                 if (newItem) {
@@ -1356,7 +1583,22 @@ export function init({
                   })();
                   newItem['altStr'] = relatedTextContentItem?.str;
 
-                  if ((lastItem?.str || lastItem?.imageName) && !current['pathConstructed']) {
+                  let visibleEdges = edges.filter(item => isVisibleVector(item));
+                  let isIntersectsEdges = intersectsEdges({
+                    first: clearEmptyCoordinateItems([lastItem]).map(trimCoordinate),
+                    second: clearEmptyCoordinateItems([newItem]).map(trimCoordinate),
+                    targetGrids: ['cols', 'rows'],
+                    edges: visibleEdges
+                  });
+
+                  //newItem will be guaranteed to be combined with lastItem; newItem is likely to be a space with a line break.
+                  if (
+                    (lastItem?.str || lastItem?.imageName) &&
+                    !current['pathConstructed'] &&
+                    ((newItem.str == current['str'])) && //!BUGFIX (combined text items/coordinates ) 08-camelot-example.pdf 
+                    !isIntersectsEdges
+                  ) {
+                    reservedLastItemEOT = lastItem['hasEOT'];
                     lastItem['hasEOT'] = false;
                   }
 
@@ -1395,103 +1637,17 @@ export function init({
                       });
                       let eotIndex = eotObj.index;
                       let eolIndex = eotIndex > eolObj.index ? -1 : eolObj.index;
-
-                      let lastCoordinateEdge, coordinateItems = [],
-                        firstCoordinateEdge;
+                      let lastCoordinateEdge, coordinateItems = [], firstCoordinateEdge;
                       if (lastItem) {
                         let eotRange = eotObj.range;
                         coordinateItems = eotIndex == -1 ? [lastItem] : eotRange;
                         firstCoordinateEdge = coordinateItems[0] || lastItem;
                         lastCoordinateEdge = coordinateItems[coordinateItems.length - 1] || lastItem;
                       }
-
-                      return {
-                        eolIndex,
-                        eotIndex,
-                        firstCoordinateEdge,
-                        lastCoordinateEdge,
-                        coordinateItems
-                      }
+                      return { eolIndex, eotIndex, firstCoordinateEdge, lastCoordinateEdge, coordinateItems }
                     }
 
-                    function getMergedCoordinatePaddingObj(lastItem, newItem, gridItemsType) {
-                      if (!Array.isArray(lastItem) && !lastItem?.transform) {
-                        lastItem = newItem;
-                      }
 
-                      let lastItemArray = Array.isArray(lastItem) ? lastItem : [lastItem];
-                      let newItemArray = Array.isArray(newItem) ? newItem : [newItem];
-
-                      let mergedCoordinatePaddingObj = gridItemsType == 'cols' ? {
-                        'x': getCoordinateFromObj(lastItemArray).x[0] < getCoordinateFromObj(newItemArray).x[0] ? [
-                          Math.max(
-                            ...lastItemArray.map(item => item.transform[4] + item.width)
-                          ),
-                          Math.min(
-                            ...newItemArray.map(item => item.transform[4])
-                          )
-                        ] : [
-                          Math.max(
-                            ...newItemArray.map(item => item.transform[4] + item.width)
-                          ),
-                          Math.min(
-                            ...lastItemArray.map(item => item.transform[4])
-                          )
-                        ],
-                        'y': [
-                          Math.min(
-                            ...lastItemArray.map(item => item.transform[5]),
-                            ...newItemArray.map(item => item.transform[5]),
-                          ),
-                          Math.max(
-                            ...lastItemArray.map(item => item.transform[5] + item.height),
-                            ...newItemArray.map(item => item.transform[5] + item.height)
-                          )
-                        ]
-                      } : {
-                        'x': [
-                          Math.min(
-                            ...lastItemArray.map(item => item.transform[4]),
-                            ...newItemArray.map(item => item.transform[4])
-                          ),
-                          Math.max(
-                            ...lastItemArray.map(item => item.transform[4] + item.width),
-                            ...newItemArray.map(item => item.transform[4] + item.width)
-                          )
-                        ],
-                        'y': getCoordinateFromObj(lastItemArray).y[0] < getCoordinateFromObj(newItemArray).y[0] ? [ //DONE
-                          Math.max(
-                            ...lastItemArray.map(item => item.transform[5] + item.height)
-                          ),
-                          Math.min(
-                            ...newItemArray.map(item => item.transform[5])
-                          )
-                        ] : [ //DONE
-                          Math.max(
-                            ...newItemArray.map(item => item.transform[5] + item.height),
-                          ),
-                          Math.min(
-                            ...lastItemArray.map(item => item.transform[5])
-                          )
-                        ]
-                      };
-
-                      return mergedCoordinatePaddingObj;
-                    }
-
-                    function getCoordinateFromObj(obj) {
-                      let array = Array.isArray(obj) ? obj : [obj];
-                      return {
-                        x: [
-                          Math.min(...array.map(item => item.transform[4])),
-                          Math.max(...array.map(item => item.transform[4] + item.width))
-                        ],
-                        y: [
-                          Math.min(...array.map(item => item.transform[5])),
-                          Math.max(...array.map(item => item.transform[5] + item.height))
-                        ]
-                      }
-                    }
 
                     function intersectsTop(firstItem, secondItem, strict) {
                       let firstArray = Array.isArray(firstItem) ? firstItem : firstItem ? [firstItem] : [];
@@ -1500,12 +1656,8 @@ export function init({
                         let inRange = (
                           checkRectangleRanges(
                             getCoordinateFromObj(firstArray),
-                            getCoordinateFromObj(secondArray), {
-                            strict: strict,
-                            strictIntersecting: strict,
-                            axis: ['x'],
-                            tolerance: maxWidth / 2
-                          }
+                            getCoordinateFromObj(secondArray),
+                            { strict: strict, strictIntersecting: strict, axis: ['x'], tolerance: maxWidth / 2 }
                           ) as Array<any>
                         ).every(item => item.inRange);
                         return inRange;
@@ -1513,6 +1665,12 @@ export function init({
                         return false;
                       }
                     };
+
+                    function isSameFont(a, b) {
+                      return typeof a?.fontName == 'string' &&
+                        typeof b?.fontName == 'string' &&
+                        a?.fontName === b?.fontName;
+                    }
 
                     function checkPreviousCoordinate() {
                       let previousCoordinate = getCoordinateData(currentCoordinate.eotIndex, false);
@@ -1532,12 +1690,40 @@ export function init({
                       let previousIsLastItem = previousItem == lastItem;
                       let previousItemChanged = false;
                       let doubleIntersectXCheck = false;
+                      let isCompletedParagraph = false;
+
+                      // Find the paragraph boundary: go back from lastItem, skipping lastItem itself.
+                      let paragraphStartIndex = 0;
+                      for (let i = lastItemIndex; i >= 0; i--) {
+                        if (i !== lastItemIndex && tableContentItems[i]?.hasEOL) {
+                          paragraphStartIndex = i + 1;
+                          break;
+                        }
+                      }
+                      let paragraphItems = tableContentItems.slice(paragraphStartIndex, lastItemIndex + 1);
+
+                      if (paragraphItems.length > 0 && newItem && newItem.transform && lastItem && lastItem.transform) {
+                        let isUniformParagraph = paragraphItems.every(item => isSameFont(item, paragraphItems[0]));
+
+                        if (isUniformParagraph) {
+                          let sameY = Math.abs(lastItem.transform[5] - newItem.transform[5]) < 0.5;
+                          let sameFont = isSameFont(newItem, paragraphItems[0]);
+
+                          // We consider a paragraph to be finished only if BOTH conditions are violated:
+                          // the current element is on a different line AND in a different font
+                          if (!sameY && !sameFont) {
+                            isCompletedParagraph = true;
+                          }
+                        }
+                      }
+                      // ============================================================
 
                       if (previousItem?.['hasEOT'] && !isPreviousIntersectsEdges) {
-                        let previousIntersectsX = intersectsTop(previousMergedObj, currentMergedObj, false);
+                        let trim = (obj) => obj.map(trimCoordinate);
+                        let previousIntersectsX = intersectsTop(trim(previousMergedObj), trim(currentMergedObj), false);
 
                         if (!previousIntersectsX) {
-                          previousIntersectsX = intersectsTop(previousMergedObj, [...currentMergedObj, newItem], false);
+                          previousIntersectsX = intersectsTop(trim(previousMergedObj), trim([...currentMergedObj, newItem]), false);
                           doubleIntersectXCheck = true;
                         }
 
@@ -1582,31 +1768,12 @@ export function init({
                         verticleSiblings,
                         previousIsLastItem,
                         previousItemChanged,
-                        doubleIntersectXCheck
+                        doubleIntersectXCheck,
+                        isCompletedParagraph
                       }
                     }
 
-                    function intersectsEdges({
-                      first,
-                      second,
-                      targetGrids,
-                      edges
-                    }) {
-                      return targetGrids.some(key => {
-                        if (first.length && second.length) {
-                          let paddingObj = getMergedCoordinatePaddingObj(first, second, key);
-                          let visibleEdges = edges.filter(item => isVisibleVector(item));
-                          return filterBlocks(visibleEdges, {
-                            ...paddingObj,
-                            strictIntersecting: false
-                          })
-                            .filter(item => !paddingObj.x.includes(item.x) && !paddingObj.y.includes(item.y)) //BUGFIX
-                            .length;
-                        } else {
-                          return false;
-                        }
-                      })
-                    }
+
 
                     function getProperty(axisItem) {
                       let properties = {
@@ -1626,13 +1793,9 @@ export function init({
 
                         if (condition) {
                           let res: any = checkRectangleRanges(
-                            edge, {
-                            [axis]: [newItem.transform[transformIndex], newItem.transform[transformIndex] + newItem[axisValue]]
-                          }, {
-                            axis,
-                            strict: true,
-                            strictIntersecting: true
-                          }
+                            edge,
+                            { [axis]: [newItem.transform[transformIndex], newItem.transform[transformIndex] + newItem[axisValue]] },
+                            { axis, strict: true, strictIntersecting: true }
                           );
                           return res?.isContained || !res?.biggestArgument && res?.isIntersecting;
                         } else {
@@ -1658,7 +1821,6 @@ export function init({
                     }).flat());
                     maxWidth = (maxWidth + (maxWidth * 0.05)); // old : 0.001//need to add an additional threshold because the width of letters varies in the font
                     let maxHeight = Math.min(lastItem.height, newItem.height) / 2;
-
                     let intersectsX = intersectsTop(newItem, currentMergedObj, true);
                     let targetGrids = (() => {
                       let conditions = {
@@ -1669,11 +1831,14 @@ export function init({
                     })();
 
                     let visibleEdges = [...(edges || []), ...(rectanglesEdges || [])].filter(item => isVisibleVector(item));
+                    //let isIntersectsEdges = lastItem?.transform ? intersectsEdges({ first: clearEmptyCoordinateItems(currentMergedObj), second: clearEmptyCoordinateItems(newItem), targetGrids, edges: visibleEdges }) : false;
+                    let borderSize = getAverageBorderSize(visibleEdges || [], lineMaxWidth);
                     let isIntersectsEdges = lastItem?.transform ? intersectsEdges({
-                      first: clearEmptyCoordinateItems(currentMergedObj),
-                      second: clearEmptyCoordinateItems(newItem),
+                      first: clearEmptyCoordinateItems(currentMergedObj).map(trimCoordinate),
+                      second: clearEmptyCoordinateItems([newItem]).map(trimCoordinate),
                       targetGrids,
-                      edges: visibleEdges
+                      edges: visibleEdges,
+                      tolerance: borderSize * 2,
                     }) : false;
                     let topEdges = filterBlocks(visibleEdges, {
                       'x': [newItem.transform[4], newItem.transform[4] + newItem.width],
@@ -1681,7 +1846,7 @@ export function init({
                       strict: false,
                       withoutOverlap: false,
                       strictIntersecting: true
-                    })
+                    });
 
                     let intersectingGridItemsObj = (() => {
                       let obj = {};
@@ -1710,7 +1875,7 @@ export function init({
 
                         let returnOriginalValue = (key == 'cols' ? intersectingGridItemsObj[key].length > 2 : intersectingGridItemsObj[key].length > 3); //the table has enough edges (if rows then 3 (+header bottom line))
 
-                        return returnOriginalValue ? lastItem['hasEOT'] : jumps ? true : getResults(paddingObj, key); //BUG
+                        return returnOriginalValue ? lastItem['hasEOT'] : jumps ? true : getResults(paddingObj, key); //BUG?
                       });
                     })();
 
@@ -1734,7 +1899,7 @@ export function init({
                       //         : true
                       // )
                     ) {
-                      let res = checkPreviousCoordinate();
+                      //let res = checkPreviousCoordinate();
                       let newCurrentCoordinate = getCoordinateData(newItemIndex);
                       let newPaddingTop = lastItem.transform[5] - lastItem.height - newItem?.transform?.[5];
                       if (
@@ -1777,7 +1942,6 @@ export function init({
                           }
                         }
                       }
-
                     }
 
                     if (!skip) {
@@ -1816,7 +1980,7 @@ export function init({
                         ) {
                           //if (!(res.previousItemChanged && res.previousIsLastItem)) {
                           if (
-                            (res && res.doubleIntersectXCheck && res.verticleIntersects && res.verticleSiblings) //from checkPreviousCoordinate
+                            (res && res.doubleIntersectXCheck && res.verticleIntersects && res.verticleSiblings && !res.isCompletedParagraph) //from checkPreviousCoordinate
                             //(topEdges.length ? !isIntersectsEdges : false)
                           ) {
                             lastItem['hasEOL'] = true;
@@ -1836,55 +2000,47 @@ export function init({
                         }
 
                       } else {
-                        let isSmallXGap = (() => {
-                          let xGap = Math.max(0,
-                            Math.max(lastItem.transform[4], newItem.transform[4]) -
-                            Math.min(lastItem.transform[4] + lastItem.width, newItem.transform[4] + newItem.width)
-                          );
-                          let xGapMaxSympolsLength = 1.5;
-                          let xGapMaxWidth = Math.max(maxWidth, lineMaxWidth) * xGapMaxSympolsLength; //almost the same with maxWidth
+                        let sameY = Math.abs(lastItem.transform[5] - newItem.transform[5]) < 0.5;
+                        let sameFont = isSameFont(lastItem, newItem);
+                        let heightDiff = Math.abs(lastItem.height - newItem.height);
+                        let similarHeight = heightDiff < 0.5 || heightDiff / Math.max(lastItem.height, newItem.height) < 0.05;
 
+                        let isSmallXGap = ((a, b) => {
+                          a = trimCoordinate(a);
+                          b = trimCoordinate(b);
+                          let xGap = Math.max(0, Math.max(a.transform[4], b.transform[4]) - Math.min(a.transform[4] + a.width, b.transform[4] + b.width));
+                          let xGapMaxSympolsLength = 1.5;
+                          let xGapMaxWidth = Math.max(maxWidth, lineMaxWidth) * xGapMaxSympolsLength;
                           return xGap <= xGapMaxWidth
-                        })();
+                        })(lastItem, newItem);
 
                         let condition = (() => {
                           let lastItemCopy = lastItem?.chars ? trimTableContentItem(lastItem, false) : lastItem;
                           let newItemCopy = newItem?.chars ? trimTableContentItem(newItem) : newItem;
 
-                          // Жёсткий стоп: разрыв по X больше, чем 1.5 средних символа — точно разные ячейки
-                          if (!isSmallXGap) {
-                            return false;
-                          }
+                          // Strict stop: the gap in X is greater than 1.5 average symbols — definitely different cells.
+                          if (!isSmallXGap) { return false; }
 
-                          // Предвычисляем общие признаки (чтобы не считать внутри цикла)
-                          let sameY = Math.abs(lastItem.transform[5] - newItem.transform[5]) < 0.5;
-                          let sameFont = lastItem.fontName === newItem.fontName;
-                          let heightDiff = Math.abs(lastItem.height - newItem.height);
-                          let similarHeight = heightDiff < 0.5 || heightDiff / Math.max(lastItem.height, newItem.height) < 0.05;
                           let sameType = typeof typeValue(lastItem?.str) === typeof typeValue(newItem?.str);
-
                           for (let gridItem of targetGrids) {
                             let axis = gridItem === 'rows' ? 'y' : 'x';
                             let max = gridItem === 'rows' ? maxHeight : maxWidth;
                             let paddingObj = getMergedCoordinatePaddingObj(lastItemCopy, newItemCopy, gridItem);
                             let paddingDiff = Math.abs(paddingObj[axis][0] - paddingObj[axis][1]);
 
-                            // 1. Отступ между элементами в пределах допуска
+                            // 1. The spacing between elements is within the allowed tolerance.
                             if (paddingDiff > max) {
                               return false;
                             }
-
-                            // 2. Для строк дополнительно проверяем тип и шрифт
+                            // 2. For strings, we additionally check the type and font.
                             if (gridItem === 'rows' && (!sameType || !sameFont)) {
                               return false;
                             }
-
-                            // 3. Высота элементов должна быть сопоставима
+                            // 3. The height of the elements should be comparable.
                             if (!similarHeight) {
                               return false;
                             }
-
-                            // 4. Особый случай: много колонок и нет пересечения с edges — требуем строгое совпадение Y
+                            // 4. Special case: many columns and no intersection with edges — we require strict matching of Y
                             if (gridItem === 'cols') {
                               let hasManyGridLines = (intersectingGridItemsObj['cols']?.length > 2) && !isIntersectsEdges;
                               if (hasManyGridLines && !sameY) {
@@ -1893,7 +2049,7 @@ export function init({
                             }
                           }
 
-                          return true;
+                          return !isIntersectsEdges;
                         })();
 
                         let shouldMerge = false;
@@ -1901,12 +2057,6 @@ export function init({
                         if (condition) {
                           shouldMerge = true;
                         } else {
-                          // Fallback: if trimTableContentItem distorted the geometry or the height differs by epsilon
-                          let sameY = Math.abs(lastItem.transform[5] - newItem.transform[5]) < 0.5;
-                          let sameFont = lastItem.fontName === newItem.fontName;
-                          let heightDiff = Math.abs(lastItem.height - newItem.height);
-                          let similarHeight = heightDiff < 0.5 || heightDiff / Math.max(lastItem.height, newItem.height) < 0.05;
-
                           // Soft merge: one font, similar height, in one line, no borders
                           if (
                             sameY &&
@@ -1922,8 +2072,13 @@ export function init({
 
                         if (shouldMerge) {
                           lastItem['hasEOT'] = false;
-                          if (!lastItem['hasEOL'] && (lastItem?.transform?.[5] != newItem?.transform?.[5])) {
-                            lastItem['hasEOL'] = true;
+                          if (!lastItem['hasEOL']) {
+                            if ((lastItem?.transform?.[5] != newItem?.transform?.[5])) {
+                              lastItem['hasEOL'] = true;
+                            }
+                          }
+                          if (lastItem['hasEOL']) {
+                            lastItem['hasEOL'] = (lastItem?.transform?.[5] != newItem?.transform?.[5]);
                           }
                         } else {
                           if (
@@ -1936,11 +2091,10 @@ export function init({
                         }
                       }
                     }
-
                   }
 
                   if (newItem) {
-                    if (hasEOTCondition) {
+                    if (hasEOTCondition || reservedLastItemEOT) {
                       // Separation confirmed: newItem — the start of a new text block
                       newItem['hasEOT'] = true;
                     } else {
@@ -1958,10 +2112,12 @@ export function init({
                     });
                   }
                   current['pathConstructed'] = false;
-
                 }
+
               }
               //index++; //BUG no synchronization with pageTextContent.items
+              // СБРОС ТОЛЬКО ПОСЛЕ ВСЕХ СЕГМЕНТОВ
+              //current['pathConstructed'] = false;
             }
           }
 
@@ -2347,18 +2503,34 @@ export function init({
 
             if (!block || !edges?.length || !coordinates?.length) return false;
 
-            // Вертикальные разделители таблицы
+            // Vertical table separators
             let verticalEdges = edges.filter(e =>
               isVisibleVector(e) && e.width < lineMaxWidth && e.height > lineMaxWidth
             );
 
             if (!verticalEdges.length) return false;
 
-            // Границы таблицы по Y
+            // Table boundaries along the Y axis
             let tableYMin = Math.min(...coordinates.map(c => c.y));
             let tableYMax = Math.max(...coordinates.map(c => c.y + c.height));
 
-            // Линии, пересекающие внутреннюю часть блока по X и таблицу по Y
+            // If a block has a horizontal border at the top or bottom, it’s a cell, not a caption
+            let horizontalEdges = edges.filter(e =>
+              isVisibleVector(e) && e.height < lineMaxWidth && e.width > lineMaxWidth
+            );
+
+            let blockHasHorizontalBorder = horizontalEdges.some(e => {
+              let yMatchTop = Math.abs(e.y - block.y) < lineMaxWidth * 2;
+              let yMatchBottom = Math.abs(e.y - (block.y + block.height)) < lineMaxWidth * 2;
+              let xOverlap = !(e.x + e.width < block.x || e.x > block.x + block.width);
+              return (yMatchTop || yMatchBottom) && xOverlap;
+            });
+
+            // If the block is bounded by horizontal lines, it is part of the table (merged header), not a caption.
+            if (blockHasHorizontalBorder) return false;
+            
+
+            // Lines intersecting the interior of the block along X and the table along Y
             let dividersInBlock = filterBlocks(verticalEdges, {
               x: [block.x + 1, block.x + block.width - 1],
               y: [tableYMin, tableYMax],
@@ -2436,7 +2608,7 @@ export function init({
                 let rangeStr = range.join('-');
 
                 let medianBorderWidth = 0;
-                // Вертикальные разделители таблицы
+                // Vertical table separators
                 let verticalEdges = edges.filter(e => {
                   let res = isVisibleVector(e) && e.width < lineMaxWidth && e.height > lineMaxWidth;
                   if (res) {
@@ -2451,7 +2623,7 @@ export function init({
                   }), strictIntersecting: true
                 });
 
-                // GUARD: одноблочная строка на краю таблицы = caption?
+                // GUARD: single-block line at the edge of the table = caption?
                 if (textBlocks.length === 1 && edges?.length) {
                   let isFirstOrLastRow = (index === 0) || (index >= arr.length - 2);
                   if (!isFirstOrLastRow) return prev;
@@ -2467,7 +2639,7 @@ export function init({
                     return prev;
                   }
                 }
-                // --- КОНЕЦ GUARD ---
+                // --- END GUARD ---
 
                 let currentHeaderCombo = headersCombo[headersCombo.length - 1];
                 let lastTruthHeaderCombo = headersCombo?.findLast(item => item.isHeader == true);
@@ -3158,7 +3330,7 @@ export function init({
                 let increasedCoordinates = JSON.parse(JSON.stringify(coordinates));
                 let increasedCoordinatesIndexes = [];
 
-                // --- УДАЛЕНИЕ CAPTION ИЗ COORDINATES ---
+                // --- REMOVING CAPTION FROM COORDINATES ---
                 if (group['coordinates']?.length && group['edges']?.length) {
                   let tableYMin = Math.min(...group['coordinates'].map(c => c.y));
                   let tableYMax = Math.max(...group['coordinates'].map(c => c.y + c.height));
@@ -3167,10 +3339,10 @@ export function init({
                     let isTopEdge = Math.abs(c.y - tableYMin) < 1;
                     let isBottomEdge = Math.abs(c.y + c.height - tableYMax) < 1;
 
-                    // Проверяем caption-логику только на краях таблицы
+                    // We check the caption logic only at the edges of the table.
                     if (!isTopEdge && !isBottomEdge) return true;
 
-                    // Одиночный блок в своей строке?
+                    // A single block on its own line?
                     let sameRow = group['coordinates'].filter(other =>
                       Math.abs(other.y - c.y) < 0.5 || Math.abs(other.y + other.height - c.y - c.height) < 0.5
                     );
