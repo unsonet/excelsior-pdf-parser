@@ -2,7 +2,7 @@
 // import * as Path from 'path';
 // import { fileURLToPath } from 'url';
 // import { dirname } from 'path';
-import { getTextDirection, findClosestIndex, parseRGB, getMergedArray, uniqueArr, findMod, findAverage, caseIndependentCompare, splitByIndex, checkRectangleRanges, removeByIndexes, getSplitEdgeRange, calculateDifference, typeValue, sortArrayOfObjects, deepSet } from '@unsonet/js-utils'
+import { getTextDirection, findClosestIndex, parseRGB, getMergedArray, uniqueArr, findMod, findAverage, caseIndependentCompare, splitByIndex, checkRectangleRanges, removeByIndexes, getSplitEdgeRange, getOnePercentOfAbsoluteDifference, typeValue, sortArrayOfObjects, deepSet } from '@unsonet/js-utils'
 
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = dirname(__filename);
@@ -178,19 +178,56 @@ export function init({
             fillRGBColor: [0, 0, 0],
             strokeAlpha: 1,
             fillAlpha: 1,
+            textRenderingMode: 0,
             pathConstructed: false,
             vectorType: null,
             vectorCache: null,
             fontSpaceWidths: {},
             contentItem: {} as { [key: string]: any },
-
             fontDirection: null,
             fontName: null,
             fontSize: null,
+            colorType: null,
           };
 
           let rectangles = [];
           let rectanglesEdges = [];
+
+          function getTextColor() {
+            const mode = Number(
+              current.textRenderingMode ?? 0
+            );
+
+            const usesFill =
+              mode === 0 ||
+              mode === 2 ||
+              mode === 4 ||
+              mode === 6;
+
+            const usesStroke =
+              mode === 1 ||
+              mode === 2 ||
+              mode === 5 ||
+              mode === 6;
+
+            if (usesFill) {
+              const color = getColor('fill');
+
+              if (color) {
+                return color;
+              }
+            }
+
+            if (usesStroke) {
+              const color = getColor('stroke');
+
+              if (color) {
+                return color;
+              }
+            }
+
+            return null;
+          }
 
           function getColor(colorType) {
             let alpha = current[`${colorType}Alpha`];
@@ -229,6 +266,60 @@ export function init({
             return args;
           }
 
+          function grayToRGB(value: number): number[] {
+            const gray = Math.round(
+              Math.max(0, Math.min(1, value)) * 255
+            );
+
+            return [gray, gray, gray];
+          }
+
+          function cmykToRGB(
+            c: number,
+            m: number,
+            y: number,
+            k: number
+          ): number[] {
+            c = Math.max(0, Math.min(1, c));
+            m = Math.max(0, Math.min(1, m));
+            y = Math.max(0, Math.min(1, y));
+            k = Math.max(0, Math.min(1, k));
+
+            return [
+              Math.round(255 * (1 - Math.min(1, c + k))),
+              Math.round(255 * (1 - Math.min(1, m + k))),
+              Math.round(255 * (1 - Math.min(1, y + k))),
+            ];
+          }
+
+          function normalizeGenericColorArgs(args: any): number[] {
+            const values = normalizeNumericArgs(args)
+              .filter(value => typeof value === 'number');
+
+            if (values.length === 1) {
+              return grayToRGB(values[0]);
+            }
+
+            if (values.length === 3) {
+              return values.map(value =>
+                Math.round(
+                  Math.max(0, Math.min(1, value)) * 255
+                )
+              );
+            }
+
+            if (values.length === 4) {
+              return cmykToRGB(
+                values[0],
+                values[1],
+                values[2],
+                values[3]
+              );
+            }
+
+            return [];
+          }
+
           function normalizeColorArgs(args: any): number[] {
             if (Array.isArray(args) && args.length === 1 && typeof args[0] === 'string' && args[0].startsWith('#')) {
               var hex = args[0].slice(1);
@@ -258,6 +349,90 @@ export function init({
             let norm = normalizeNumericArgs(args);
             if (Array.isArray(norm[0])) return [norm[0][0], norm[0][1]];
             return [norm[0], norm[1]];
+          }
+
+          /**
+ * Выделяет из pathOps/pathCoords замкнутые осевые подпути
+ * (moveTo → lineTo×N → closePath), описывающие прямоугольники, и заменяет
+ * каждый одиночным OPS.rectangle. Неконвертируемые подпути (кривые,
+ * несомкнутые, невырожденные) копируются без изменений.
+ */
+          function extractClosedSubpathRectangles(pathOps: number[], pathCoords: number[]): { ops: number[], coords: number[] } {
+            const coordCountFor = (op: number): number => {
+              if (op === OPS.rectangle) return 4;
+              if (op === OPS.moveTo || op === OPS.lineTo) return 2;
+              if (op === OPS.curveTo) return 6;
+              if (op === OPS.curveTo2 || op === OPS.curveTo3) return 4;
+              return 0; // closePath и прочие без координат
+            };
+
+            const trySubpathToRect = (pts: number[][]): [number, number, number, number] | null => {
+              if (pts.length < 4) return null; // moveTo + минимум 3 угла
+              const xs = pts.map(p => p[0]);
+              const ys = pts.map(p => p[1]);
+              const x1 = Math.min(...xs), x2 = Math.max(...xs);
+              const y1 = Math.min(...ys), y2 = Math.max(...ys);
+              if (x2 - x1 < 0.01 || y2 - y1 < 0.01) return null;
+              // все сегменты — осевые и на периметре bbox, периметр пути равен периметру bbox
+              let perimeter = 0;
+              for (let k = 0; k < pts.length; k++) {
+                const [ax, ay] = pts[k];
+                const [bx, by] = pts[(k + 1) % pts.length];
+                const dx = bx - ax, dy = by - ay;
+                if (Math.abs(dx) > 1e-4 && Math.abs(dy) > 1e-4) return null;
+                perimeter += Math.abs(dx) + Math.abs(dy);
+              }
+              for (const [px, py] of pts) {
+                const onV = (Math.abs(px - x1) < 0.01 || Math.abs(px - x2) < 0.01) && py >= y1 - 0.01 && py <= y2 + 0.01;
+                const onH = (Math.abs(py - y1) < 0.01 || Math.abs(py - y2) < 0.01) && px >= x1 - 0.01 && px <= x2 + 0.01;
+                if (!onV && !onH) return null;
+              }
+              if (Math.abs(perimeter - 2 * ((x2 - x1) + (y2 - y1))) > 0.5) return null;
+              return [x1, y1, x2 - x1, y2 - y1];
+            };
+
+            const outOps: number[] = [];
+            const outCoords: number[] = [];
+            let ci = 0, i = 0;
+            while (i < pathOps.length) {
+              if (pathOps[i] !== OPS.moveTo) {
+                const op = pathOps[i];
+                outOps.push(op);
+                const n = coordCountFor(op);
+                for (let k = 0; k < n; k++) outCoords.push(pathCoords[ci++]);
+                i++;
+                continue;
+              }
+              // собираем подпуть до closePath / следующего moveTo
+              const pts: number[][] = [[pathCoords[ci], pathCoords[ci + 1]]];
+              ci += 2;
+              const subOps: number[] = [OPS.moveTo];
+              const subCoords: number[] = [...pts[0]];
+              let closed = false;
+              let hasCurves = false;
+              i++;
+              while (i < pathOps.length) {
+                const op = pathOps[i];
+                if (op === OPS.closePath) { closed = true; i++; break; }
+                if (op === OPS.moveTo) break;
+                subOps.push(op);
+                const n = coordCountFor(op);
+                for (let k = 0; k < n; k++) subCoords.push(pathCoords[ci]);
+                if (op === OPS.lineTo) pts.push([pathCoords[ci], pathCoords[ci + 1]]);
+                if (op >= OPS.curveTo && op <= OPS.curveTo3) hasCurves = true;
+                ci += n;
+                i++;
+              }
+              const rect = (closed && !hasCurves) ? trySubpathToRect(pts) : null;
+              if (rect) {
+                outOps.push(OPS.rectangle);
+                outCoords.push(...rect);
+              } else {
+                outOps.push(...subOps, ...(closed ? [OPS.closePath] : []));
+                outCoords.push(...subCoords);
+              }
+            }
+            return { ops: outOps, coords: outCoords };
           }
 
           function normalizeShowTextArgs(args: any): any[] {
@@ -338,23 +513,25 @@ export function init({
           console.error(`[DIAG Page ${pageNum}] total ops:`, _fnArray.length);
           let constructPathCount = 0;
 
-          // if (true) {
-          //   let content = opList.fnArray.map(item => Object.keys(pdfjs.OPS).find(key => pdfjs.OPS[key] == item)).map((item, index) => {
-          //     let args = opList.argsArray[index];
-          //     let operation = item;
-          //     if (operation == "showText") {
-          //       args = args.map(el => el.map(e => e.unicode).join('')).join('')
-          //     }
-          //     return [operation, args]
-          //   });
-          //   //let outputPath = Path.resolve('./tmp/page-items.json');
-          //   //Fs.writeFileSync(outputPath, JSON.stringify(content), 'utf-8');
-          //   console.log(content);
-          //   // pairArraysToAlignedSegments([oldArr, newArr], { compareKeys: ['0'] }).map(item => {
-          //   //   let isEq = JSON.stringify(item[0]?.[1]) == JSON.stringify(item[1]?.[1]);
-          //   //   return [item[0]?.[0], ...(isEq ? [item[0][1]] : [item[0]?.[1], item[1]?.[1]])]
-          //   // });
-          // }
+          if (true) {
+            let content = opList.fnArray
+              .map(item => Object.keys(pdfjs.OPS).find(key => pdfjs.OPS[key] == item))
+              .map((item, index) => {
+                let args = opList.argsArray[index];
+                let operation = item;
+                if (operation == "showText") {
+                  args = args.map(el => el.map(e => e.unicode).join('')).join('')
+                }
+                return [operation, args]
+              });
+            //let outputPath = Path.resolve('./tmp/page-items.json');
+            //Fs.writeFileSync(outputPath, JSON.stringify(content), 'utf-8');
+            console.log('CONTENT', content);
+            // pairArraysToAlignedSegments([oldArr, newArr], { compareKeys: ['0'] }).map(item => {
+            //   let isEq = JSON.stringify(item[0]?.[1]) == JSON.stringify(item[1]?.[1]);
+            //   return [item[0]?.[0], ...(isEq ? [item[0][1]] : [item[0]?.[1], item[1]?.[1]])]
+            // });
+          }
 
           for (let i = 0; i < _fnArray.length; i++) {
             if (i > 0 && i % 500 === 0) {
@@ -398,11 +575,12 @@ export function init({
                   rawSecond.some(v => v >= 13 && v <= 19) // old OPS: moveTo=13, lineTo=14, curveTo=15, closePath=18, rectangle=19
                 );
 
+                let bboxArr: number[] = []
                 if (isPdfjs6Format) {
                   // pdfjs 6.x: [paintType, ops<number[]>, coords<number[]>, bbox?]
                   pathOps = rawSecond;
                   pathCoords = rawThird;
-                  var bboxArr = normArgs.length >= 4 ? extractArrayLike(normArgs[3]) : [];
+                  bboxArr = normArgs.length >= 4 ? extractArrayLike(normArgs[3]) : [];
 
                   if (constructPathCount === 1) {
                     console.error(`[DIAG Page ${pageNum}] pdfjs6 format detected`);
@@ -476,18 +654,32 @@ export function init({
                   }
 
                   // Restoring rectangle from bbox (args[2])
-                  var bboxArr = extractArrayLike(normArgs[2]);
+                  bboxArr = extractArrayLike(normArgs[2]);
                   if (constructPathCount === 1) {
                     console.error(`[DIAG Page ${pageNum}] bboxArr:`, bboxArr);
                   }
-                  if (bboxArr.length >= 4) {
-                    var rx = bboxArr[0];
-                    var ry = bboxArr[1];
-                    var rwidth = bboxArr[2] - bboxArr[0];
-                    var rheight = bboxArr[3] - bboxArr[1];
-                    if (rwidth > 0 && rheight > 0) {
+                  if (isNewFormat && paintType != null && paintType !== OPS.endPath) {
+                    const isFillOnlyPaint = paintType === OPS.fill || paintType === OPS.eoFill;
+                    if (isFillOnlyPaint) {
+                      // Фон ячеек часто рисуется одним fill-путём из десятков подпрямоугольников;
+                      // каждый — геометрия отдельной ячейки (в т.ч. объединённых rowspan/colspan).
+                      const extracted = extractClosedSubpathRectangles(pathOps, pathCoords);
+                      pathOps = extracted.ops;
+                      pathCoords = extracted.coords;
+                    }
+                  }
+
+                  // minMax (bbox) — метаданные пути, а не нарисованная геометрия.
+                  // Добавляем только если сам путь не дал ни одного сегмента
+                  // (например, путь состоял только из пропускаемых кривых).
+                  if (isNewFormat && bboxArr.length >= 4 && !pathOps.includes(OPS.rectangle) && !pathOps.includes(OPS.lineTo)) {
+                    const rx = bboxArr[0];
+                    const ry = bboxArr[1];
+                    const rw = bboxArr[2] - bboxArr[0];
+                    const rh = bboxArr[3] - bboxArr[1];
+                    if (rw > 0 && rh > 0) {
                       pathOps.push(OPS.rectangle);
-                      pathCoords.push(rx, ry, rwidth, rheight);
+                      pathCoords.push(rx, ry, rw, rh);
                     }
                   }
                 }
@@ -527,15 +719,21 @@ export function init({
                   let ry = pathCoords[coordIdx++];
                   let rwidth = pathCoords[coordIdx++];
                   let rheight = pathCoords[coordIdx++];
+
                   let x2 = rx + rwidth;
                   let y2 = ry + rheight;
                   // Apply transform matrix to coordinates
                   if (!isDefaultTransformMatrix(transformMatrix)) {//BUGFIX earlier worked only for 07-multi-table, in 10-example the figures were shifted 
                     [rx, ry] = applyTransformFn([rx, ry], transformMatrix);
                     [x2, y2] = applyTransformFn([x2, y2], transformMatrix);
-                    rwidth = x2 - rx;
-                    rheight = y2 - ry;
                   }
+                  // CTM с отражением по Y (типичный «перевёрнутый» cm) даёт отрицательные
+                  // width/height — приводим к каноническому bbox, иначе containment-проверки
+                  // ниже по конвейеру молча отбрасывают такие прямоугольники.
+                  rwidth = Math.abs(x2 - rx);
+                  rheight = Math.abs(y2 - ry);
+                  rx = Math.min(rx, x2);
+                  ry = Math.min(ry, y2);
                   let vector = { y: ry, x: rx, width: rwidth, height: rheight, transform: transformMatrix };
 
                   // We skip the full‑size background rectangles/page cropping
@@ -690,11 +888,38 @@ export function init({
               }
 
             } else if (fn === OPS.save) {
-              transformStack.push(transformMatrix);
+              transformStack.push({
+                transformMatrix: [...transformMatrix],
+                fillRGBColor: [...(current.fillRGBColor || [])],
+                strokeRGBColor: [...(current.strokeRGBColor || [])],
+                fillAlpha: current.fillAlpha,
+                strokeAlpha: current.strokeAlpha,
+                lineWidth: current.lineWidth,
+                colorType: current.colorType,
+              });
+
               current['vectorType'] = null;
               current['vectorCache'] = null;
             } else if (fn === OPS.restore) {
-              transformMatrix = transformStack.pop();
+              const savedState = transformStack.pop();
+
+              if (savedState) {
+                transformMatrix = [...savedState.transformMatrix];
+
+                current.fillRGBColor = [
+                  ...(savedState.fillRGBColor || [])
+                ];
+
+                current.strokeRGBColor = [
+                  ...(savedState.strokeRGBColor || [])
+                ];
+
+                current.fillAlpha = savedState.fillAlpha;
+                current.strokeAlpha = savedState.strokeAlpha;
+                current.lineWidth = savedState.lineWidth;
+                current.colorType = savedState.colorType;
+              }
+
               current['vectorType'] = null;
               current['vectorCache'] = null;
             } else if (fn === OPS.transform) {
@@ -739,12 +964,64 @@ export function init({
                   Object.assign(vector, { [`${colorType}Color`]: color });
                 }
               }
+            } else if (fn === OPS.setTextRenderingMode) {
+              current.textRenderingMode =
+                normalizeNumericArgs(args)[0] ?? 0;
             } else if (fn === OPS.setStrokeRGBColor) {
-              current['strokeRGBColor'] = normalizeColorArgs(args);
-              current['colorType'] = 'stroke';
+              current.strokeRGBColor = normalizeColorArgs(args);
+              current.colorType = 'stroke';
             } else if (fn === OPS.setFillRGBColor) {
-              current['fillRGBColor'] = normalizeColorArgs(args);
-              current['colorType'] = 'fill';
+              current.fillRGBColor = normalizeColorArgs(args);
+              current.colorType = 'fill';
+            } else if (fn === OPS.setStrokeGray) {
+              const color = normalizeGenericColorArgs(args);
+
+              if (color.length === 3) {
+                current.strokeRGBColor = color;
+              }
+
+              current.colorType = 'stroke';
+            } else if (fn === OPS.setFillGray) {
+              const color = normalizeGenericColorArgs(args);
+
+              if (color.length === 3) {
+                current.fillRGBColor = color;
+              }
+
+              current.colorType = 'fill';
+            } else if (fn === OPS.setStrokeCMYKColor) {
+              const color = normalizeGenericColorArgs(args);
+
+              if (color.length === 3) {
+                current.strokeRGBColor = color;
+              }
+
+              current.colorType = 'stroke';
+            } else if (fn === OPS.setFillCMYKColor) {
+              const color = normalizeGenericColorArgs(args);
+
+              if (color.length === 3) {
+                current.fillRGBColor = color;
+              }
+
+              current.colorType = 'fill';
+            } else if (fn === OPS.setStrokeColor) {
+              const color = normalizeGenericColorArgs(args);
+
+              if (color.length === 3) {
+                current.strokeRGBColor = color;
+              }
+
+              current.colorType = 'stroke';
+            } else if (fn === OPS.setFillColor) {
+              const color = normalizeGenericColorArgs(args);
+
+              if (color.length === 3) {
+                current.fillRGBColor = color;
+              }
+
+              current.colorType = 'fill';
+
             } else if (fn === OPS.setGState) {
               // pdf.js transmits args in different formats: [Map], [[name, {ca:0.2}]], [{ca:0.2}], etc.
               // Doing brute-force: recursively searching for ca/CA in ANY structure.
@@ -1171,6 +1448,8 @@ export function init({
                 height: effectiveHeight,
                 dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(str),
                 width: widthRanges[1],
+                textColor: getTextColor(),
+
                 //transform: (textMatrix.slice(-2).toString() == preliminaryItem.transform.slice(-2).toString()) ? preliminaryItem.transform : transformFn(textMatrix, preliminaryItem.transform),
                 //hasEOL: hasEOL(str)//BUGFIX there are no line breaks in the text
               });
@@ -1531,6 +1810,7 @@ export function init({
                       str: handledValues?.str,
                       chars: handledValues.charsRangesArrays.flat(),
                       fontName: fontName,
+                      textColor: prev?.textColor || cur?.textColor || null,
                       height: Math.max(Math.abs(prevTransform[3]) || curEffectiveHeight, Math.abs(cur.transform[3]) || curEffectiveHeight), //old:cur.transform[3] BUG in (13-sample-tables-3.pdf): old fontSize,
                       dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(handledValues.str),
                       width: Math.max(...handledValues.widthRanges),
@@ -1921,7 +2201,7 @@ export function init({
 
                           let paddingTopTolerance = 0.005;
                           if (
-                            calculateDifference(newPaddingTop, paddingTop) <= paddingTopTolerance
+                            getOnePercentOfAbsoluteDifference(newPaddingTop, paddingTop) <= paddingTopTolerance
                           ) {
                             lastItem['paddingTop'] = newPaddingTop;
                             let lastItemChars = clearChars({
@@ -2307,7 +2587,8 @@ export function init({
                     height: getItemHeight(item),
                     chars: item.chars || [],
                     templateStr: item?.str || '',
-                    transform: item.transform
+                    transform: item.transform,
+                    textColor: item.textColor || null,
                   };
 
                   if (item.imageName) {
@@ -2420,6 +2701,7 @@ export function init({
                     width: width,
                     height: height,
                     chars: chars,
+                    textColor: lastItem.textColor || item.textColor || null,
                     transform: [height, 0, 0, height, x, y]
                   });
 
@@ -2528,7 +2810,7 @@ export function init({
 
             // If the block is bounded by horizontal lines, it is part of the table (merged header), not a caption.
             if (blockHasHorizontalBorder) return false;
-            
+
 
             // Lines intersecting the interior of the block along X and the table along Y
             let dividersInBlock = filterBlocks(verticalEdges, {
@@ -2989,7 +3271,7 @@ export function init({
               let { groups, globalGroup, downcheck } = options;
               return groups.reduce((prev, group, index, arr) => {
                 let headerRanges = [];
-
+                const forcedRowSplits = new Set<number>();
                 //Split the group again if it contains two headers
                 Object.keys(group.headerRows).sort((a: any, b: any) => b - a).forEach((rangeStr, rangeIndex, rangeArr) => {
                   let range = rangeStr.split('-').map(item => +item);
@@ -3012,11 +3294,72 @@ export function init({
                     let yRangeStr = yRange.join('-');
                     let textBlocks = group.headerRows[yRangeStr];
 
+                    let edgeTolerance;
+                    const visibleVerticalEdges = [
+                      ...(globalGroup.edges || []),
+                      ...(globalGroup.rectanglesEdges || [])
+                    ].filter(edge =>
+                      isVisibleVector(edge) &&
+                      edge.width < lineMaxWidth &&
+                      edge.height > lineMaxWidth
+                    );
+
+                    function getSideEdges(element: any) {
+                      if (!element) {
+                        return [];
+                      }
+
+                      const edges = visibleVerticalEdges.filter(edge => {
+                        const tolerance = -Math.min(edge.width, edge.height);
+                        edgeTolerance = (tolerance < edgeTolerance) || !edgeTolerance ? tolerance : edgeTolerance;
+                        const result = checkRectangleRanges(
+                          edge,
+                          element,
+                          {
+                            strict: false,
+                            strictIntersecting: false,
+                            axis: ['x', 'y'],
+                            tolerance,
+                          }
+                        ) as Array<any>;
+
+                        return result.some(item => item.inRange);
+                      });
+
+                      if (!edges.length) {
+                        return [];
+                      }
+
+                      const uniqueEdges = uniqueArr(
+                        edges,
+                        ['x', 'y', 'width', 'height']
+                      );
+
+                      if (uniqueEdges.length === 1) {
+                        return uniqueEdges;
+                      }
+
+                      return [
+                        uniqueEdges.reduce(
+                          (prev, cur) => cur.x < prev.x ? cur : prev,
+                          uniqueEdges[0]
+                        ),
+                        uniqueEdges.reduce(
+                          (prev, cur) => cur.x > prev.x ? cur : prev,
+                          uniqueEdges[0]
+                        ),
+                      ];
+                    }
+
                     textBlocks?.forEach(textBlock => {
                       let colIndex = group.cols.findIndex((col, index) => {
                         let res: any = checkRectangleRanges({ x: [textBlock.x, textBlock.x + textBlock.width] }, { x: [group.cols[index], group.cols[index + 1]] }, { axis: 'x', strict: true, strictIntersecting: true });
                         return group.cols[index + 1] && (res.isContained || !res.biggestArgument && res.isIntersecting);
                       });
+
+                      if (colIndex < 0) {
+                        return;
+                      }
 
                       let xRange = [group.cols[colIndex], group.cols[colIndex + 1]];
                       let mergedRows = getMergedArray(globalGroup.rows, group.rows).sort((a, b) => b - a);
@@ -3025,7 +3368,53 @@ export function init({
                         let row = mergedRows[index];
                         let nextRow = mergedRows[index + 1];
 
-                        let bottomElements = filterBlocks(globalGroup.coordinates, { 'x': xRange, 'y': [row, nextRow], strict: true, withoutOverlap: true, strictIntersecting: true })
+                        let bottomElements = filterBlocks(
+                          globalGroup.coordinates,
+                          {
+                            x: xRange,
+                            y: [row, nextRow],
+                            strict: true,
+                            withoutOverlap: true,
+                            strictIntersecting: true
+                          }
+                        );
+
+                        // if (!bottomElements.length) {//!BUG no last table in 13-sample-tables-3.pdf
+                        //   continue;
+                        // }
+
+                        const textBlockSideEdges = getSideEdges(textBlock);
+                        const bottomTextBlockSideEdges = getSideEdges(bottomElements[0]);
+
+                        const isSameSideEdges = (() => {
+                          /*
+                           * Если мы не можем определить обе границы,
+                           * никаких выводов не делаем.
+                           *
+                           * Это важно: отсутствие edge != доказательство
+                           * того, что таблица закончилась.
+                           */
+                          if (
+                            textBlockSideEdges.length < 2 ||
+                            bottomTextBlockSideEdges.length < 2
+                          ) {
+                            return null;
+                          }
+
+                          if (textBlockSideEdges?.length && bottomTextBlockSideEdges?.length) {
+                            let firstDiff = Math.abs(textBlockSideEdges[0].x - bottomTextBlockSideEdges[0].x);
+                            let lastDiff = Math.abs(textBlockSideEdges[textBlockSideEdges.length - 1].x - bottomTextBlockSideEdges[bottomTextBlockSideEdges.length - 1].x);
+                            let tolerance = Math.max(lineMaxWidth, 1);//edgeTolerance ? Math.abs(edgeTolerance) : Math.max(lineMaxWidth, 1);
+                            return (firstDiff <= tolerance) && (lastDiff <= tolerance);
+                          } else {
+                            return true;
+                          }
+                        })();
+
+                        if (isSameSideEdges === false) {
+                          forcedRowSplits.add(row);
+                          break;
+                        }
 
                         if (
                           (bottomElements?.length && !bottomElements?.intersectsNextGridItem) && //has elements at the bottom
@@ -3035,7 +3424,8 @@ export function init({
                               let blocks = filterBlocks(g.headerRows[r], { 'x': xRange, 'y': [row, nextRow], strict: true, withoutOverlap: true, strictIntersecting: true });
                               return !!(blocks.length && !bottomElements?.intersectsNextGridItem);
                             })
-                          })
+                          }) 
+                          //&& isSameSideEdges //share common visual boundaries
                         ) {
                           if (!group.rows.includes(nextRow)) {
                             group.rows = [...new Set([...group.rows.slice(0, group.rows.indexOf(row) + 1), nextRow])].sort((a, b) => a - b) || [];
@@ -3052,11 +3442,19 @@ export function init({
                 }
 
                 let rowsRanges = [];
+
                 let addToRowsRange = (...args) => {
-                  let lastRange = rowsRanges[rowsRanges.length - 1];
-                  [...args].forEach(col => {
-                    if (!lastRange.includes(col)) {
-                      lastRange.push(col);
+                  let lastRange =
+                    rowsRanges[rowsRanges.length - 1];
+
+                  if (!lastRange) {
+                    lastRange = [];
+                    rowsRanges.push(lastRange);
+                  }
+
+                  [...args].forEach(row => {
+                    if (!lastRange.includes(row)) {
+                      lastRange.push(row);
                     }
                   });
                 };
@@ -3089,13 +3487,34 @@ export function init({
                     return (groupRows.length - 1 > minRowsLength) ? (textBlocksLength <= 1) : !textBlocksLength;
                   })();
 
+                  /*
+         * ---------------------------------------------------------
+         * Forced split по изменению внешних вертикальных границ.
+         *
+         * ВАЖНО:
+         * firstRow нельзя выбрасывать из предыдущего range.
+         *
+         * Поэтому, если firstRow является split-point,
+         * сначала начинается новый range с этой строки.
+         *
+         * Благодаря этому boundary row присутствует
+         * и как нижняя граница предыдущей таблицы,
+         * и как верхняя граница следующей.
+         * ---------------------------------------------------------
+         */
+                  const forcedSplit =
+                    forcedRowSplits.has(firstRow);
+
                   if (
                     rowsRanges.length ? (
+                      forcedSplit ||
                       (
-                        targetRange ||
-                        splitRowsCondition && !edgesLength
-                      ) &&
-                      (rowsRanges[rowsRanges.length - 1] ? rowsRanges[rowsRanges.length - 1]?.length : true) //no need to add a new array if the previous one is empty
+                        (
+                          targetRange ||
+                          (splitRowsCondition && !edgesLength)
+                        ) &&
+                        (rowsRanges[rowsRanges.length - 1] ? rowsRanges[rowsRanges.length - 1]?.length : true) //no need to add a new array if the previous one is empty
+                      )
                     ) : true //rowIndex === 0
                     //!(textBlocks.length == 1 && ((rowIndex + 1) == groupRows.length)) //row is not included in the table
                   ) {
@@ -3912,8 +4331,8 @@ export function init({
               let positionTolerance = 0.005;
               if (!res) {
                 res = assuredEdges.find(item => {
-                  return (calculateDifference(edge.x, item.x) <= positionTolerance) &&
-                    (calculateDifference(edge.y, item.y) <= positionTolerance)
+                  return (getOnePercentOfAbsoluteDifference(edge.x, item.x) <= positionTolerance) &&
+                    (getOnePercentOfAbsoluteDifference(edge.y, item.y) <= positionTolerance);
                 });
               }
 
@@ -4406,6 +4825,731 @@ export function init({
               return [h, v];
             }
 
+            function inferMergesFromFillRectangles(options: {
+              tableGroup: any;
+              pageGroup: any;
+              verticles: any[];
+              horizons: any[];
+              merges: Record<string, any>;
+              mergeAlias: Record<string, string>;
+              lineMaxWidth: number;
+            }) {
+              const {
+                tableGroup,
+                pageGroup,
+                verticles,
+                horizons,
+                merges,
+                mergeAlias,
+                lineMaxWidth,
+              } = options;
+
+              if (
+                !tableGroup ||
+                !verticles?.length ||
+                !horizons?.length
+              ) {
+                return;
+              }
+
+              const borderSize = tableGroup.borderSize || 0.57;
+              const tolerance = Math.max(1, borderSize * 3);
+
+              const rectangles = uniqueArr(
+                [
+                  ...(tableGroup.rectangles || []),
+                  ...(pageGroup?.rectangles || []),
+                ]
+                  .filter((rect: any) =>
+                    rect &&
+                    rect.fillColor &&
+                    isVisibleVector(rect) &&
+                    Number(rect.width) > 0 &&
+                    Number(rect.height) > 0
+                  ),
+                ['x', 'y', 'width', 'height']
+              );
+
+              if (!rectangles.length) {
+                return;
+              }
+
+              const realEdges = uniqueArr(
+                [
+                  ...(tableGroup.edges || []),
+                  ...(pageGroup?.edges || []),
+                ].filter((edge: any) =>
+                  edge &&
+                  isVisibleVector(edge) &&
+                  !edge._isFakeLine
+                ),
+                ['x', 'y', 'width', 'height']
+              );
+
+              const coordinates = (tableGroup.coordinates || [])
+                .filter((item: any) =>
+                  item &&
+                  (
+                    item.str?.trim() ||
+                    item.imageName
+                  )
+                );
+
+              function getVerticalCoordinate(index: number) {
+                return Number(verticles[index]?.x);
+              }
+
+              function getHorizontalCoordinate(index: number) {
+                return Number(horizons[index]?.y);
+              }
+
+              function normalizeRect(rect: any) {
+                return {
+                  x1: Math.min(
+                    Number(rect.x),
+                    Number(rect.x) + Number(rect.width)
+                  ),
+                  x2: Math.max(
+                    Number(rect.x),
+                    Number(rect.x) + Number(rect.width)
+                  ),
+                  y1: Math.min(
+                    Number(rect.y),
+                    Number(rect.y) + Number(rect.height)
+                  ),
+                  y2: Math.max(
+                    Number(rect.y),
+                    Number(rect.y) + Number(rect.height)
+                  ),
+                };
+              }
+
+              /**
+               * verticles/horizons содержат объекты:
+               *
+               * verticles -> { x, lines }
+               * horizons  -> { y, lines }
+               *
+               * Поэтому здесь намеренно сравниваем координату
+               * со свойством .x/.y.
+               */
+              function findGridIndex(
+                grid: any[],
+                value: number,
+                axis: 'x' | 'y'
+              ) {
+                let result = -1;
+                let minDistance = Infinity;
+
+                for (let index = 0; index < grid.length; index++) {
+                  const gridValue = Number(
+                    axis === 'x'
+                      ? grid[index]?.x
+                      : grid[index]?.y
+                  );
+
+                  if (!Number.isFinite(gridValue)) {
+                    continue;
+                  }
+
+                  const distance = Math.abs(
+                    gridValue - value
+                  );
+
+                  if (distance < minDistance) {
+                    minDistance = distance;
+                    result = index;
+                  }
+                }
+
+                return minDistance <= tolerance
+                  ? result
+                  : -1;
+              }
+
+              function getRectGridSpan(rect: any) {
+                const normalized = normalizeRect(rect);
+
+                const colStartIndex = findGridIndex(
+                  verticles,
+                  normalized.x1,
+                  'x'
+                );
+
+                const colEndIndex = findGridIndex(
+                  verticles,
+                  normalized.x2,
+                  'x'
+                );
+
+                const rowStartIndex = findGridIndex(
+                  horizons,
+                  normalized.y1,
+                  'y'
+                );
+
+                const rowEndIndex = findGridIndex(
+                  horizons,
+                  normalized.y2,
+                  'y'
+                );
+
+                if (
+                  colStartIndex === -1 ||
+                  colEndIndex === -1 ||
+                  rowStartIndex === -1 ||
+                  rowEndIndex === -1
+                ) {
+                  return null;
+                }
+
+                return {
+                  x1: normalized.x1,
+                  x2: normalized.x2,
+                  y1: normalized.y1,
+                  y2: normalized.y2,
+
+                  colStart: Math.min(
+                    colStartIndex,
+                    colEndIndex
+                  ),
+
+                  colEnd: Math.max(
+                    colStartIndex,
+                    colEndIndex
+                  ),
+
+                  rowStart: Math.min(
+                    rowStartIndex,
+                    rowEndIndex
+                  ),
+
+                  rowEnd: Math.max(
+                    rowStartIndex,
+                    rowEndIndex
+                  ),
+                };
+              }
+
+              function getCellBounds(
+                row: number,
+                col: number
+              ) {
+                if (
+                  row < 0 ||
+                  col < 0 ||
+                  row >= horizons.length - 1 ||
+                  col >= verticles.length - 1
+                ) {
+                  return null;
+                }
+
+                const x1 = getVerticalCoordinate(col);
+                const x2 = getVerticalCoordinate(col + 1);
+
+                const y1 = getHorizontalCoordinate(row);
+                const y2 = getHorizontalCoordinate(row + 1);
+
+                if (
+                  !Number.isFinite(x1) ||
+                  !Number.isFinite(x2) ||
+                  !Number.isFinite(y1) ||
+                  !Number.isFinite(y2)
+                ) {
+                  return null;
+                }
+
+                return {
+                  x1: Math.min(x1, x2),
+                  x2: Math.max(x1, x2),
+                  y1: Math.min(y1, y2),
+                  y2: Math.max(y1, y2),
+                };
+              }
+
+              function findCoordinateCell(coordinate: any) {
+                const coordinateX1 = Number(coordinate.x);
+                const coordinateX2 =
+                  coordinateX1 + Number(coordinate.width);
+
+                const coordinateY1 = Number(coordinate.y);
+                const coordinateY2 =
+                  coordinateY1 + Number(coordinate.height);
+
+                const centerX =
+                  (coordinateX1 + coordinateX2) / 2;
+
+                const centerY =
+                  (coordinateY1 + coordinateY2) / 2;
+
+                let bestCell: {
+                  row: number;
+                  col: number;
+                  overlap: number;
+                } | null = null;
+
+                for (
+                  let row = 0;
+                  row < horizons.length - 1;
+                  row++
+                ) {
+                  for (
+                    let col = 0;
+                    col < verticles.length - 1;
+                    col++
+                  ) {
+                    const cell = getCellBounds(row, col);
+
+                    if (!cell) {
+                      continue;
+                    }
+
+                    const overlapX = Math.max(
+                      0,
+                      Math.min(cell.x2, coordinateX2) -
+                      Math.max(cell.x1, coordinateX1)
+                    );
+
+                    const overlapY = Math.max(
+                      0,
+                      Math.min(cell.y2, coordinateY2) -
+                      Math.max(cell.y1, coordinateY1)
+                    );
+
+                    const overlap =
+                      overlapX * overlapY;
+
+                    if (overlap > 0) {
+                      if (
+                        !bestCell ||
+                        overlap > bestCell.overlap
+                      ) {
+                        bestCell = {
+                          row,
+                          col,
+                          overlap,
+                        };
+                      }
+                    }
+
+                    if (
+                      centerX >= cell.x1 - tolerance &&
+                      centerX <= cell.x2 + tolerance &&
+                      centerY >= cell.y1 - tolerance &&
+                      centerY <= cell.y2 + tolerance
+                    ) {
+                      if (!bestCell) {
+                        bestCell = {
+                          row,
+                          col,
+                          overlap: 0,
+                        };
+                      }
+                    }
+                  }
+                }
+
+                return bestCell
+                  ? {
+                    row: bestCell.row,
+                    col: bestCell.col,
+                  }
+                  : null;
+              }
+
+              function getOccupiedCells(span: any) {
+                if (!span) {
+                  return [];
+                }
+
+                const cells = new Map<
+                  string,
+                  { row: number; col: number }
+                >();
+
+                coordinates.forEach((coordinate: any) => {
+                  const cell =
+                    findCoordinateCell(coordinate);
+
+                  if (!cell) {
+                    return;
+                  }
+
+                  if (
+                    cell.row < span.rowStart ||
+                    cell.row >= span.rowEnd ||
+                    cell.col < span.colStart ||
+                    cell.col >= span.colEnd
+                  ) {
+                    return;
+                  }
+
+                  cells.set(
+                    `${cell.row}-${cell.col}`,
+                    cell
+                  );
+                });
+
+                return [...cells.values()];
+              }
+
+              function hasHorizontalEdge(
+                y: number,
+                x1: number,
+                x2: number
+              ) {
+                const requiredOverlap = Math.max(
+                  lineMaxWidth,
+                  (x2 - x1) * 0.5
+                );
+
+                return realEdges.some((edge: any) => {
+                  const isHorizontal =
+                    edge.height < lineMaxWidth &&
+                    edge.width > lineMaxWidth;
+
+                  if (!isHorizontal) {
+                    return false;
+                  }
+
+                  if (
+                    Math.abs(edge.y - y) >
+                    tolerance
+                  ) {
+                    return false;
+                  }
+
+                  const overlap = Math.max(
+                    0,
+                    Math.min(
+                      edge.x + edge.width,
+                      x2
+                    ) -
+                    Math.max(
+                      edge.x,
+                      x1
+                    )
+                  );
+
+                  return overlap >= requiredOverlap;
+                });
+              }
+
+              function hasVerticalEdge(
+                x: number,
+                y1: number,
+                y2: number
+              ) {
+                const requiredOverlap = Math.max(
+                  lineMaxWidth,
+                  (y2 - y1) * 0.5
+                );
+
+                return realEdges.some((edge: any) => {
+                  const isVertical =
+                    edge.width < lineMaxWidth &&
+                    edge.height > lineMaxWidth;
+
+                  if (!isVertical) {
+                    return false;
+                  }
+
+                  if (
+                    Math.abs(edge.x - x) >
+                    tolerance
+                  ) {
+                    return false;
+                  }
+
+                  const overlap = Math.max(
+                    0,
+                    Math.min(
+                      edge.y + edge.height,
+                      y2
+                    ) -
+                    Math.max(
+                      edge.y,
+                      y1
+                    )
+                  );
+
+                  return overlap >= requiredOverlap;
+                });
+              }
+
+              function hasMergeConflict(
+                rowStart: number,
+                rowEnd: number,
+                colStart: number,
+                colEnd: number
+              ) {
+                for (
+                  let row = rowStart;
+                  row < rowEnd;
+                  row++
+                ) {
+                  for (
+                    let col = colStart;
+                    col < colEnd;
+                    col++
+                  ) {
+                    const key = `${row}-${col}`;
+
+                    if (mergeAlias[key]) {
+                      return true;
+                    }
+
+                    if (
+                      merges[key] &&
+                      key !== `${rowStart}-${colStart}`
+                    ) {
+                      return true;
+                    }
+                  }
+                }
+
+                return false;
+              }
+
+              function createMerge(
+                rowStart: number,
+                rowEnd: number,
+                colStart: number,
+                colEnd: number
+              ) {
+                const rootKey =
+                  `${rowStart}-${colStart}`;
+
+                if (
+                  merges[rootKey] ||
+                  mergeAlias[rootKey]
+                ) {
+                  return false;
+                }
+
+                if (
+                  hasMergeConflict(
+                    rowStart,
+                    rowEnd,
+                    colStart,
+                    colEnd
+                  )
+                ) {
+                  return false;
+                }
+
+                const arr: string[] = [];
+                const widthArr: string[] = [];
+                const heightArr: string[] = [];
+
+                for (
+                  let row = rowStart;
+                  row < rowEnd;
+                  row++
+                ) {
+                  for (
+                    let col = colStart;
+                    col < colEnd;
+                    col++
+                  ) {
+                    arr.push(`${row}-${col}`);
+                  }
+                }
+
+                for (
+                  let col = colStart;
+                  col < colEnd;
+                  col++
+                ) {
+                  widthArr.push(
+                    `${rowStart}-${col}`
+                  );
+                }
+
+                for (
+                  let row = rowStart;
+                  row < rowEnd;
+                  row++
+                ) {
+                  heightArr.push(
+                    `${row}-${colStart}`
+                  );
+                }
+
+                merges[rootKey] = {
+                  row: rowStart,
+                  col: colStart,
+                  arr: uniqueArr(arr),
+                  widthArr: uniqueArr(widthArr),
+                  heightArr: uniqueArr(heightArr),
+                  width: colEnd - colStart,
+                  height: rowEnd - rowStart,
+                };
+
+                arr.forEach(cellKey => {
+                  if (cellKey !== rootKey) {
+                    mergeAlias[cellKey] =
+                      rootKey;
+                  }
+                });
+
+                return true;
+              }
+
+              for (const rectangle of rectangles) {
+                const span =
+                  getRectGridSpan(rectangle);
+
+                /*
+                 * Временная диагностика.
+                 * Здесь теперь для 8 должен появиться кандидат.
+                 */
+                console.error(
+                  '[MERGE FROM FILL CANDIDATE]',
+                  {
+                    rectangle: normalizeRect(rectangle),
+                    span,
+                  }
+                );
+
+                if (!span) {
+                  continue;
+                }
+
+                const rowSpan =
+                  span.rowEnd - span.rowStart;
+
+                const colSpan =
+                  span.colEnd - span.colStart;
+
+                if (
+                  rowSpan <= 1 &&
+                  colSpan <= 1
+                ) {
+                  continue;
+                }
+
+                const occupiedCells =
+                  getOccupiedCells(span);
+
+                console.error(
+                  '[MERGE FROM FILL]',
+                  {
+                    rectangle: normalizeRect(rectangle),
+                    rowStart: span.rowStart,
+                    rowEnd: span.rowEnd,
+                    colStart: span.colStart,
+                    colEnd: span.colEnd,
+                    rowSpan,
+                    colSpan,
+                    occupiedCells,
+                  }
+                );
+
+                /*
+                 * У merged rectangle должен быть один anchor-content.
+                 *
+                 * Это отсекает обычные большие фоновые rectangles.
+                 */
+                if (
+                  occupiedCells.length !== 1
+                ) {
+                  continue;
+                }
+
+                const anchor =
+                  occupiedCells[0];
+
+                if (
+                  anchor.row !== span.rowStart ||
+                  anchor.col !== span.colStart
+                ) {
+                  continue;
+                }
+
+                /*
+                 * Проверяем реальные внутренние
+                 * горизонтальные границы.
+                 */
+                let hasInternalHorizontalEdge =
+                  false;
+
+                for (
+                  let row = span.rowStart + 1;
+                  row < span.rowEnd;
+                  row++
+                ) {
+                  const y =
+                    getHorizontalCoordinate(row);
+
+                  if (
+                    hasHorizontalEdge(
+                      y,
+                      span.x1,
+                      span.x2
+                    )
+                  ) {
+                    hasInternalHorizontalEdge =
+                      true;
+                    break;
+                  }
+                }
+
+                if (hasInternalHorizontalEdge) {
+                  continue;
+                }
+
+                /*
+                 * Проверяем реальные внутренние
+                 * вертикальные границы.
+                 */
+                let hasInternalVerticalEdge =
+                  false;
+
+                for (
+                  let col = span.colStart + 1;
+                  col < span.colEnd;
+                  col++
+                ) {
+                  const x =
+                    getVerticalCoordinate(col);
+
+                  if (
+                    hasVerticalEdge(
+                      x,
+                      span.y1,
+                      span.y2
+                    )
+                  ) {
+                    hasInternalVerticalEdge =
+                      true;
+                    break;
+                  }
+                }
+
+                if (hasInternalVerticalEdge) {
+                  continue;
+                }
+
+                const created =
+                  createMerge(
+                    span.rowStart,
+                    span.rowEnd,
+                    span.colStart,
+                    span.colEnd
+                  );
+
+                console.error(
+                  '[MERGE FROM FILL CREATED]',
+                  {
+                    created,
+                    anchor,
+                    span,
+                  }
+                );
+              }
+            }
+
             function createMatrix(verticles, horizons) {
               verticles = verticles.sort(function (a, b) { return a.x - b.x; });
               horizons = horizons.sort(function (a, b) { return b.y - a.y; });
@@ -4584,7 +5728,20 @@ export function init({
               return { matrix, merges, mergeAlias };
             }
 
-            let matrixData = createMatrix(verticles, horizons);
+            let matrixData = createMatrix(
+              verticles,
+              horizons
+            );
+
+            inferMergesFromFillRectangles({
+              tableGroup,
+              pageGroup: pageGroups[0],
+              verticles,
+              horizons,
+              merges: matrixData.merges,
+              mergeAlias: matrixData.mergeAlias,
+              lineMaxWidth,
+            });
 
             Object.assign(tableGroup, {
               verticles,
@@ -4592,7 +5749,7 @@ export function init({
               merges: matrixData.merges,
               mergeAlias: matrixData.mergeAlias,
               matrix: matrixData.matrix,
-            })
+            });
           }
 
           return { tableGroups, pageGroups }
@@ -4673,6 +5830,9 @@ export function init({
                   table.array[row][col]['str'] += (item?.str || '');
                   if (item.fillColor) {
                     table.array[row][col]['fillColor'] = item.fillColor;
+                  }
+                  if (item.textColor) {
+                    table.array[row][col]['textColor'] = item.textColor;
                   }
                 }
               } catch (err) {
@@ -4862,7 +6022,7 @@ export function init({
                       }
 
                       let fillColor = table.array[r][c]['fillColor'];
-
+                      let textColor = table.array[r][c]['textColor'];
                       // Defining the colors of the 4 sides of the cell
                       let cellBorders = { top: null, right: null, bottom: null, left: null };
 
@@ -4880,6 +6040,10 @@ export function init({
                       if (cellBorders.right) borderStyle += `border-right: 1px solid ${cellBorders.right};`;
                       if (cellBorders.bottom) borderStyle += `border-bottom: 1px solid ${cellBorders.bottom};`;
                       if (cellBorders.left) borderStyle += `border-left: 1px solid ${cellBorders.left};`;
+
+                      if (textColor) {
+                        borderStyle += `color: ${textColor};`;
+                      }
 
                       let safeStr = (table.array[r][c]['str'] || '').replace(/\n/gim, '<br>');
                       let cell = `<${tagName} style="${borderStyle}${fillColor ? ` background-color: ${fillColor};` : ''}"`;
