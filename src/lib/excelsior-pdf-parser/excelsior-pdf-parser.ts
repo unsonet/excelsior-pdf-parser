@@ -150,6 +150,35 @@ export function init({
           });
         };
 
+        const NESTED_RECT_TOLERANCE = 0.5;
+
+        function isSameFillColor(a: any, b: any): boolean {
+          return !!a?.fillColor && a.fillColor === b?.fillColor;
+        }
+
+        function isStrictlyContained(outer: any, inner: any, tolerance: number = NESTED_RECT_TOLERANCE): boolean {
+          const innerRight = inner.x + inner.width;
+          const innerBottom = inner.y + inner.height;
+          const outerRight = outer.x + outer.width;
+          const outerBottom = outer.y + outer.height;
+
+          const contained =
+            inner.x >= outer.x - tolerance &&
+            inner.y >= outer.y - tolerance &&
+            innerRight <= outerRight + tolerance &&
+            innerBottom <= outerBottom + tolerance;
+
+          if (!contained) return false;
+
+          // Отсекаем дубликаты/совпадающие прямоугольники:
+          // вложенный должен быть заметно меньше хотя бы по одной оси.
+          const strictlySmaller =
+            innerRight - inner.x < outerRight - outer.x - tolerance ||
+            innerBottom - inner.y < outerBottom - outer.y - tolerance;
+
+          return strictlySmaller;
+        }
+
         function isVisibleVector(item) {
           let color = item?.fillColor || item?.strokeColor;
           let numbers = parseRGB(color);
@@ -1215,7 +1244,7 @@ export function init({
                   wordSpacing = current.wordSpacing,
                   charSpacing = current.charSpacing,
                   spacingDir = _spacingDir,
-                  fontSize = current.fontSize
+                  fontSize = current.fontSize,
                 } = options;
                 x = x || 0;
                 let currentX = x;
@@ -1276,17 +1305,24 @@ export function init({
                   let charRangeIndex = (() => {
                     if (
                       rangeArr?.length &&
-                      !((glyph.isSpace || glyph.isLineBreak) && (charsArrFiltered[charsArrFiltered.length - 1] == glyph)) //if the last element is a space, it is taken into account
+                      !(
+                        (glyph.isSpace || glyph.isLineBreak) &&
+                        (charsArrFiltered[charsArrFiltered.length - 1] == glyph)
+                      )//if the last element is a space, it is taken into account
                     ) {
                       let tolerance = 0.05;
                       let start = rangeArr[0];
-                      let end = (rangeArr[1] + tolerance);
+                      let end = rangeArr[1] + tolerance;
+
                       let charRangeIndexes = {
                         0: currentX < start,
                         1: (currentX >= start) && (currentX <= end),
                         2: currentX > end,
                       };
-                      return Object.keys(charRangeIndexes).find(item => charRangeIndexes[item]);
+
+                      return Object.keys(charRangeIndexes).find(
+                        item => charRangeIndexes[item]
+                      );
                     } else {
                       return 1;
                     }
@@ -1542,7 +1578,478 @@ export function init({
                 };
               }
 
-              function findRelatedForSegment(segment: any, relatedItems: any[]): any {
+              function isSegmentContainedByRelatedItem(
+                segment: any,
+                relatedItem: any
+              ): boolean {
+                if (
+                  !segment?.transform ||
+                  !relatedItem?.transform
+                ) {
+                  return false;
+                }
+
+                const tolerance = Math.max(
+                  segment.height * 0.5,
+                  1
+                );
+
+                const segmentLeft =
+                  segment.transform[4];
+
+                const segmentRight =
+                  segmentLeft + segment.width;
+
+                const relatedLeft =
+                  relatedItem.transform[4];
+
+                const relatedRight =
+                  relatedLeft + relatedItem.width;
+
+                const segmentTop =
+                  Math.min(
+                    segment.transform[5],
+                    segment.transform[5] +
+                    segment.height
+                  );
+
+                const segmentBottom =
+                  Math.max(
+                    segment.transform[5],
+                    segment.transform[5] +
+                    segment.height
+                  );
+
+                const relatedTop =
+                  Math.min(
+                    relatedItem.transform[5],
+                    relatedItem.transform[5] +
+                    relatedItem.height
+                  );
+
+                const relatedBottom =
+                  Math.max(
+                    relatedItem.transform[5],
+                    relatedItem.transform[5] +
+                    relatedItem.height
+                  );
+
+                return (
+                  segmentLeft >=
+                  relatedLeft - tolerance &&
+                  segmentRight <=
+                  relatedRight + tolerance &&
+                  segmentTop >=
+                  relatedTop - tolerance &&
+                  segmentBottom <=
+                  relatedBottom + tolerance
+                );
+              }
+
+              function findExactRelatedTextContentItem(
+                segment: any,
+                relatedItems: any[]
+              ): any {
+                if (
+                  !segment?.str?.trim() ||
+                  !relatedItems?.length ||
+                  relatedItems.length <= 1
+                ) {
+                  return undefined;
+                }
+
+                const items = relatedItems
+                  .filter(item => item?.transform)
+                  .slice()
+                  .sort((a, b) => {
+                    const yDifference =
+                      b.transform[5] - a.transform[5];
+
+                    if (Math.abs(yDifference) > 0.5) {
+                      return yDifference;
+                    }
+
+                    return (
+                      a.transform[4] -
+                      b.transform[4]
+                    );
+                  });
+
+                if (items.length <= 1) {
+                  return undefined;
+                }
+
+                const normalizeForExactMatch = (value: any) =>
+                  normalizeCJKText(String(value || ''))
+                    .replace(/\s+/g, '')
+                    .trim();
+
+                const segmentText =
+                  normalizeForExactMatch(segment.str);
+
+                const relatedText =
+                  normalizeForExactMatch(
+                    items
+                      .map(item => item.str || '')
+                      .join('')
+                  );
+
+                /*
+                 * Главный критерий:
+                 *
+                 * preliminaryItem и ВСЯ группа PDF.js items
+                 * должны содержать один и тот же текст.
+                 *
+                 * Пробелы игнорируем, потому что PDF.js может
+                 * разбить "Cases of loose" на совершенно разные
+                 * textContent items с геометрическими промежутками.
+                 */
+                if (
+                  !segmentText ||
+                  segmentText !== relatedText
+                ) {
+                  return undefined;
+                }
+
+                /*
+                 * Проверяем, что все related items действительно
+                 * находятся в пределах preliminaryItem.
+                 */
+                const segmentX1 =
+                  segment.transform[4];
+
+                const segmentX2 =
+                  segmentX1 +
+                  segment.width;
+
+                const segmentY1 =
+                  segment.transform[5];
+
+                const segmentY2 =
+                  segmentY1 +
+                  segment.height;
+
+                const minX = Math.min(
+                  ...items.map(item => item.transform[4])
+                );
+
+                const maxX = Math.max(
+                  ...items.map(
+                    item =>
+                      item.transform[4] +
+                      item.width
+                  )
+                );
+
+                const minY = Math.min(
+                  ...items.map(item => item.transform[5])
+                );
+
+                const maxY = Math.max(
+                  ...items.map(
+                    item =>
+                      item.transform[5] +
+                      item.height
+                  )
+                );
+
+                const geometryTolerance =
+                  Math.max(
+                    segment.height * 0.75,
+                    2
+                  );
+
+                if (
+                  minX < segmentX1 - geometryTolerance ||
+                  maxX > segmentX2 + geometryTolerance ||
+                  minY < segmentY1 - geometryTolerance ||
+                  maxY > segmentY2 + geometryTolerance
+                ) {
+                  return undefined;
+                }
+
+                /*
+                 * Все items должны находиться на том же baseline
+                 * либо образовывать реальный многострочный preliminaryItem.
+                 */
+                const segmentTop = Math.min(
+                  segmentY1,
+                  segmentY2
+                );
+
+                const segmentBottom = Math.max(
+                  segmentY1,
+                  segmentY2
+                );
+
+                const allInsideSegment =
+                  items.every(item => {
+                    const itemTop = Math.min(
+                      item.transform[5],
+                      item.transform[5] + item.height
+                    );
+
+                    const itemBottom = Math.max(
+                      item.transform[5],
+                      item.transform[5] + item.height
+                    );
+
+                    return (
+                      itemBottom >=
+                      segmentTop -
+                      geometryTolerance &&
+                      itemTop <=
+                      segmentBottom +
+                      geometryTolerance
+                    );
+                  });
+
+                if (!allInsideSegment) {
+                  return undefined;
+                }
+
+                const firstItem = items[0];
+                const lastItem =
+                  items[items.length - 1];
+
+                /*
+                 * Создаём synthetic related item,
+                 * представляющий ВСЮ группу PDF.js items.
+                 *
+                 * chars здесь специально не объединяем:
+                 * при exact match downstream-код не должен
+                 * заходить в range-clipping ветку.
+                 */
+                return {
+                  ...firstItem,
+
+                  str: segment.str?.trim() || segment.str,
+
+                  width: maxX - minX,
+
+                  height: Math.max(
+                    maxY - minY,
+                    segment.height
+                  ),
+
+                  transform: [
+                    firstItem.transform[0],
+                    firstItem.transform[1],
+                    firstItem.transform[2],
+                    firstItem.transform[3],
+                    minX,
+                    minY,
+                  ],
+
+                  fontName:
+                    segment.fontName ||
+                    firstItem.fontName,
+
+                  hasEOL:
+                    lastItem?.hasEOL || false,
+
+                  hasEOT:
+                    lastItem?.hasEOT || false,
+
+                  isSyntheticRelatedTextContentItem:
+                    true,
+                };
+              }
+
+              function findRelatedTextContentSpan(
+                segment: any,
+                relatedItems: any[]
+              ) {
+                if (
+                  !segment?.str ||
+                  !relatedItems?.length
+                ) {
+                  return undefined;
+                }
+
+                const items = relatedItems
+                  .filter(item => item?.transform)
+                  .slice()
+                  .sort((a, b) => {
+                    const yDiff =
+                      b.transform[5] - a.transform[5];
+
+                    if (Math.abs(yDiff) > 0.5) {
+                      return yDiff;
+                    }
+
+                    return (
+                      a.transform[4] -
+                      b.transform[4]
+                    );
+                  });
+
+                if (!items.length) {
+                  return undefined;
+                }
+
+                const normalize = (value: any) =>
+                  normalizeCJKText(
+                    String(value || '')
+                  )
+                    .replace(/\s+/g, '')
+                    .trim();
+
+                const segmentNormalized =
+                  normalize(segment.str);
+
+                if (!segmentNormalized) {
+                  return undefined;
+                }
+
+                function createSpan(
+                  spanItems: any[]
+                ) {
+                  const first = spanItems[0];
+                  const last =
+                    spanItems[spanItems.length - 1];
+
+                  const x1 = Math.min(
+                    ...spanItems.map(item =>
+                      item.transform[4]
+                    )
+                  );
+
+                  const x2 = Math.max(
+                    ...spanItems.map(item =>
+                      item.transform[4] +
+                      item.width
+                    )
+                  );
+
+                  const y1 = Math.min(
+                    ...spanItems.map(item =>
+                      item.transform[5]
+                    )
+                  );
+
+                  const y2 = Math.max(
+                    ...spanItems.map(item =>
+                      item.transform[5] +
+                      item.height
+                    )
+                  );
+
+                  return {
+                    ...first,
+
+                    str: spanItems
+                      .map(item => item.str || '')
+                      .join(''),
+
+                    width: x2 - x1,
+
+                    height: Math.max(
+                      y2 - y1,
+                      segment.height || 0
+                    ),
+
+                    transform: [
+                      first.transform[0],
+                      first.transform[1],
+                      first.transform[2],
+                      first.transform[3],
+                      x1,
+                      y1,
+                    ],
+
+                    hasEOL:
+                      last?.hasEOL || false,
+
+                    hasEOT:
+                      last?.hasEOT || false,
+
+                    relatedItems: spanItems,
+
+                    relatedItemIds:
+                      spanItems.map(item =>
+                        getTextContentItemId(item)
+                      ),
+
+                    isRelatedTextContentSpan: true,
+                  };
+                }
+
+                /*
+                 * Сначала ищем точное соответствие:
+                 *
+                 * segment
+                 *     ==
+                 * concatenated related items
+                 *
+                 * Именно этот случай имеет место у:
+                 *
+                 * Cases / of loose / motion / and /
+                 * vomiting reported / from / Village
+                 */
+                for (
+                  let start = 0;
+                  start < items.length;
+                  start++
+                ) {
+                  let accumulated = '';
+
+                  for (
+                    let end = start;
+                    end < items.length;
+                    end++
+                  ) {
+                    const current = items[end];
+
+                    /*
+                     * Не смешиваем разные строки.
+                     *
+                     * Для одной строки baseline должен быть
+                     * практически одинаковым.
+                     */
+                    if (
+                      end > start &&
+                      Math.abs(
+                        current.transform[5] -
+                        items[start].transform[5]
+                      ) > 0.75
+                    ) {
+                      break;
+                    }
+
+                    accumulated +=
+                      current.str || '';
+
+                    const normalized =
+                      normalize(accumulated);
+
+                    if (normalized === segmentNormalized) {
+                      return createSpan(
+                        items.slice(start, end + 1)
+                      );
+                    }
+
+                    /*
+                     * Дальше уже точно больше segment,
+                     * поэтому продолжать бессмысленно.
+                     */
+                    if (
+                      !segmentNormalized.startsWith(
+                        normalized
+                      ) &&
+                      !normalized.startsWith(
+                        segmentNormalized
+                      )
+                    ) {
+                      break;
+                    }
+                  }
+                }
+
+                return undefined;
+              }
+
+              function findBestRelatedTextContentItem(segment: any, relatedItems: any[]): any {
                 if (!relatedItems?.length) return undefined;
                 if (relatedItems.length === 1 && !relatedItems[0]) return undefined;
 
@@ -1682,12 +2189,28 @@ export function init({
                 const normSegmentStr = normalizeCJKText(segmentStr);
                 const normSegmentStrTrimmed = normSegmentStr.trim();
 
-                let relatedTextContentItem = findRelatedForSegment(segment, relatedTextContentItems);
+                let relatedTextContentSpan =
+                  findRelatedTextContentSpan(
+                    segment,
+                    relatedTextContentItems
+                  );
+
+                let relatedTextContentItem =
+                  relatedTextContentSpan ||
+                  findBestRelatedTextContentItem(
+                    segment,
+                    relatedTextContentItems
+                  );
                 if (!relatedTextContentItem && relatedTextContentItems.length === 1 && !relatedTextContentItems[0]) {
                   relatedTextContentItem = undefined;
                 }
 
-                let relatedTextContentId = getTextContentItemId(relatedTextContentItem);
+                let relatedTextContentId =
+                  relatedTextContentItem?.isRelatedTextContentSpan
+                    ? relatedTextContentItem.relatedItemIds.join('|')
+                    : getTextContentItemId(
+                      relatedTextContentItem
+                    );
                 let skippedLastTextContentItem = false;
                 let normRelatedStr = normalizeCJKText(relatedTextContentItem?.str || '');
                 let normStr = normSegmentStr;
@@ -1763,12 +2286,11 @@ export function init({
                     let curEffectiveHeight = Math.abs(cur.transform[3]) || fontSize;
 
                     if (prev?.str) {
-                      let symbolsBetween = (() => {
-                        let prevSubIndex = relatedTextContentItem.str.indexOf(prev.str);
-                        let curSubIndex = relatedTextContentItem.str.indexOf(cur.str);
-                        let slice = relatedTextContentItem.str.slice(prevSubIndex + prev.str.length, curSubIndex);
-                        return slice;
-                      })();
+                      let symbolsBetween = getSymbolsBetween(
+                        relatedTextContentItem.str,
+                        prev.str,
+                        cur.str
+                      );
                       updateChars({
                         item: cur,
                         spaceNeeded: symbolsBetween ? spaceNeeded(cur, prev) : false,
@@ -1781,28 +2303,114 @@ export function init({
                       });
                     }
 
+                    /*
+                    * Preliminary glyph geometry is the primary source of truth.
+                    *
+                    * A textContentItem may correspond to only a fragment of the
+                    * preliminary item in N:N matching, therefore its horizontal
+                    * range must not be used to clip glyphs unless the relationship
+                    * range must not be used to clip glyphs unless the relationship
+                    * is unambiguously 1:1.
+                    */
+                    const useRelatedRange =
+                      relatedTextContentItems.length === 1 &&
+                      isSegmentContainedByRelatedItem(
+                        cur,
+                        relatedTextContentItem
+                      );
+
                     let {
                       str,
                       charsRangesArrays
                     } = handleCharsArgs({
                       charsArr: cur.chars,
                       x: cur.transform[4],
-                      rangeArr: [
-                        relatedTextContentItem.transform[4],
-                        relatedTextContentItem.transform[4] + relatedTextContentItem.width
-                      ],
+                      rangeArr: useRelatedRange
+                        ? [
+                          relatedTextContentItem.transform[4],
+                          relatedTextContentItem.transform[4] +
+                          relatedTextContentItem.width
+                        ]
+                        : undefined,
                       fontSize: curEffectiveHeight
                     });
-                    let chars = [...(prev?.['chars'] || []), ...charsRangesArrays[1]];
+
+                    const normalizeText = (value: string) =>
+                      (value || '').replace(/\s+/g, ' ').trim();
+
+                    const range1Str = charsRangesArrays[1]
+                      ?.map(g => g?.unicode || '')
+                      .join('');
+
+                    const range2Str = charsRangesArrays[2]
+                      ?.map(g => g?.unicode || '')
+                      .join('');
+
+                    const recoverRange2 =
+                      useRelatedRange &&
+                      !!range2Str &&
+                      normalizeText(`${range1Str}${range2Str}`) ===
+                      normalizeText(cur.str) &&
+                      normalizeText(cur.str) ===
+                      normalizeText(relatedTextContentItem.str);
+
+                    let chars = [
+                      ...(prev?.['chars'] || []),
+                      ...charsRangesArrays[1],
+                      ...(recoverRange2 ? charsRangesArrays[2] : [])
+                    ];
+
                     let handledValues = handleCharsArgs({
                       charsArr: chars,
                       fontSize: curEffectiveHeight
                     });
+
+                    console.error('[MERGE RANGE DEBUG]', {
+                      related: relatedTextContentItem?.str,
+                      cur: cur.str,
+                      useRelatedRange,
+                      curX: cur.transform[4],
+                      curRight:
+                        cur.transform[4] + cur.width,
+                      relatedX:
+                        relatedTextContentItem?.transform?.[4],
+                      relatedRight:
+                        relatedTextContentItem
+                          ? relatedTextContentItem.transform[4] +
+                          relatedTextContentItem.width
+                          : undefined,
+                      beforeClear:
+                        handledValues.charsRangesArrays[1]
+                          ?.map(g => g?.unicode || '')
+                          .join(''),
+                    });
+
                     chars = clearChars({
                       chars: handledValues.charsRangesArrays[1],
                       fullClear: false,
                       clearStart: true
                     });
+
+                    console.error('[MERGE CLEAR DEBUG]', {
+                      afterClear:
+                        chars
+                          ?.map(g => g?.unicode || '')
+                          .join(''),
+                    });
+
+                    let mergedChars = handledValues.charsRangesArrays.flat();
+
+                    let actualRight = Math.max(
+                      ...mergedChars
+                        .filter(char => char && typeof char === 'object' && Number.isFinite(char.x))
+                        .map(char => char.x + (char.charWidth || 0))
+                    );
+
+                    let actualLeft = Math.min(
+                      ...mergedChars
+                        .filter(char => char && typeof char === 'object' && Number.isFinite(char.x))
+                        .map(char => char.x)
+                    );
 
                     let prevTransform = prev?.str ? prev.transform : _defaultTransformMatrix;
 
@@ -1813,7 +2421,10 @@ export function init({
                       textColor: prev?.textColor || cur?.textColor || null,
                       height: Math.max(Math.abs(prevTransform[3]) || curEffectiveHeight, Math.abs(cur.transform[3]) || curEffectiveHeight), //old:cur.transform[3] BUG in (13-sample-tables-3.pdf): old fontSize,
                       dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(handledValues.str),
-                      width: Math.max(...handledValues.widthRanges),
+                      width: Number.isFinite(actualRight) &&
+                        Number.isFinite(actualLeft)
+                        ? actualRight - actualLeft
+                        : Math.max(...handledValues.widthRanges),
                       transform: [
                         Math.max(prevTransform[0], cur.transform[0]),
                         Math.max(prevTransform[1], cur.transform[1]),
@@ -1946,11 +2557,6 @@ export function init({
                       }
                     };
 
-                    function isSameFont(a, b) {
-                      return typeof a?.fontName == 'string' &&
-                        typeof b?.fontName == 'string' &&
-                        a?.fontName === b?.fontName;
-                    }
 
                     function checkPreviousCoordinate() {
                       let previousCoordinate = getCoordinateData(currentCoordinate.eotIndex, false);
@@ -2023,12 +2629,13 @@ export function init({
                           uniqueArr(currentMergedObj.map(item => item.height)).includes(previousItem.height) &&
                           (previousPaddingTop ? currentPaddingTop == previousPaddingTop : currentPaddingTop <= maxHeight)
                         ) {
+                          let sameY = Math.abs(previousItem.transform[5] - tableContentItems[currentCoordinate.eotIndex + 1].transform[5]) < 0.5;
                           previousItem['hasEOT'] = false;
                           if (doubleIntersectXCheck && verticleIntersects && verticleSiblings) {
                             previousItem['hasEOL'] = false;
                             removeLineBreak(previousItem);
                           } else {
-                            previousItem['hasEOL'] = true;
+                            previousItem['hasEOL'] = sameY ? false : true;
                           }
 
                           if (!previousPaddingTop && previousItem['hasEOL']) {
@@ -2148,6 +2755,7 @@ export function init({
 
                       return targetGrids.some(key => {
                         let paddingObj = getMergedCoordinatePaddingObj(key == 'cols' ? currentCoordinate.lastCoordinateEdge : lastItem, newItem, key);
+
                         let jumps = lastItem?.transform ? (
                           ((lastItem.transform[5] < newItem.transform[5]) && (key == 'cols')) ||
                           ((lastItem.transform[4] < newItem.transform[4]) && (key == 'rows'))
@@ -2258,9 +2866,23 @@ export function init({
                           )
                           //: false
                         ) {
+
+                          let isTrailingWhitespaceSeparator =
+                            !lastItem?.str?.trim() &&
+                            newItem?.hasEOT &&
+                            lastItem?.transform?.[5] != newItem?.transform?.[5] &&
+                            !intersectsX;
+
                           //if (!(res.previousItemChanged && res.previousIsLastItem)) {
                           if (
-                            (res && res.doubleIntersectXCheck && res.verticleIntersects && res.verticleSiblings && !res.isCompletedParagraph) //from checkPreviousCoordinate
+                            (
+                              res &&
+                              res.doubleIntersectXCheck &&
+                              res.verticleIntersects &&
+                              res.verticleSiblings &&
+                              !res.isCompletedParagraph &&
+                              !isTrailingWhitespaceSeparator
+                            ) //from checkPreviousCoordinate
                             //(topEdges.length ? !isIntersectsEdges : false)
                           ) {
                             lastItem['hasEOL'] = true;
@@ -2404,6 +3026,40 @@ export function init({
           console.log(`[DIAG T]`, tableContentItems);
           console.error(`[DIAG Page ${pageNum}] constructPath hits:`, constructPathCount);
           console.error(`[DIAG Page ${pageNum}] edges after loop:`, edges.length, 'rectangles:', rectangles.length);
+
+          function getSymbolsBetween(
+            relatedStr: string,
+            prevStr: string,
+            curStr: string
+          ): string {
+            if (!relatedStr || !prevStr || !curStr) {
+              return '';
+            }
+
+            const prevIndex = relatedStr.indexOf(prevStr);
+
+            if (prevIndex === -1) {
+              return '';
+            }
+
+            const prevEnd = prevIndex + prevStr.length;
+
+            // Spaces at the boundaries of a preliminary fragment are not
+            // necessarily present in the related text item.
+            const curContent = curStr.trim();
+
+            if (!curContent) {
+              return '';
+            }
+
+            const curIndex = relatedStr.indexOf(curContent, prevEnd);
+
+            if (curIndex === -1) {
+              return '';
+            }
+
+            return relatedStr.slice(prevEnd, curIndex);
+          }
 
           function updateChars(options) {
             let { item, lineBreakNeeded, spaceNeeded, fontSpaceWidth } = options;
@@ -2780,6 +3436,13 @@ export function init({
             return result;
           }
 
+          function isSameFont(a, b) {
+            return typeof a?.fontName == 'string' &&
+              typeof b?.fontName == 'string' &&
+              a?.fontName === b?.fontName;
+          }
+
+
           function isCaptionBlock(options) {
             let { block, edges, coordinates, lineMaxWidth } = options;
 
@@ -3065,21 +3728,28 @@ export function init({
 
             function addGridItems(group, item, type) {
               let isVisible = hasVectorColor(item);
+
+              // Nested decoration rectangle: extends the spatial bounds of the group
+              // (done by the caller), but must NOT create grid lines.
+              if (type === 'rectangles' && nestedRectangles.has(item)) {
+                return;
+              }
+
               switch (type) {
                 case 'edges': {
                   if ((item.height < lineMaxWidth) && (item.width > lineMaxWidth)) {
                     setGridItemsTo(group, 'rows', [item.y]);
-                    setGridItemsTo(group, 'cols', [item.x, item.x + item.width]);//?
+                    setGridItemsTo(group, 'cols', [item.x, item.x + item.width]);
                     if (isVisible) {
                       setGridItemsTo(group, 'edgesRows', [item.y]);
-                      setGridItemsTo(group, 'edgesCols', [item.x, item.x + item.width]);//?
+                      setGridItemsTo(group, 'edgesCols', [item.x, item.x + item.width]);
                     }
                   } else if ((item.width < lineMaxWidth) && (item.height > lineMaxWidth)) {
                     setGridItemsTo(group, 'cols', [item.x]);
-                    setGridItemsTo(group, 'rows', [item.y, item.y + item.height]);//?
+                    setGridItemsTo(group, 'rows', [item.y, item.y + item.height]);
                     if (isVisible) {
                       setGridItemsTo(group, 'edgesCols', [item.x]);
-                      setGridItemsTo(group, 'edgesRows', [item.y, item.y + item.height]);//?
+                      setGridItemsTo(group, 'edgesRows', [item.y, item.y + item.height]);
                     }
                   }
                   break;
@@ -3103,7 +3773,6 @@ export function init({
                 default: {
                   break;
                 }
-
               }
             }
 
@@ -3270,8 +3939,10 @@ export function init({
             function splitGroups(options) {
               let { groups, globalGroup, downcheck } = options;
               return groups.reduce((prev, group, index, arr) => {
+                const prevGroupsLength = prev.length;
+
                 let headerRanges = [];
-                const forcedRowSplits = new Set<number>();
+                const forcedRowSplits = new Set();
                 //Split the group again if it contains two headers
                 Object.keys(group.headerRows).sort((a: any, b: any) => b - a).forEach((rangeStr, rangeIndex, rangeArr) => {
                   let range = rangeStr.split('-').map(item => +item);
@@ -3424,7 +4095,7 @@ export function init({
                               let blocks = filterBlocks(g.headerRows[r], { 'x': xRange, 'y': [row, nextRow], strict: true, withoutOverlap: true, strictIntersecting: true });
                               return !!(blocks.length && !bottomElements?.intersectsNextGridItem);
                             })
-                          }) 
+                          })
                           //&& isSameSideEdges //share common visual boundaries
                         ) {
                           if (!group.rows.includes(nextRow)) {
@@ -3693,6 +4364,31 @@ export function init({
                   }
                 }
 
+                // --- Safety net для nested-rectangles --------------------------------
+                // После исключения вложенных same-fill rects из сетки валидная таблица
+                // может распасться на фрагменты «только header» + «только body», и все
+                // они проваливают header-фильтр выше. Если эта группа не породила ни
+                // одного валидного саб-таблицы, но сама валидна (есть headerRows и
+                // non-header контент) и содержит excluded nested rects — сохраняем
+                // исходную группу вместо потери таблицы.
+                if (prev.length === prevGroupsLength) {
+                  const hasExcludedNested = (group.rectangles || [])
+                    .some(rect => nestedRectangles.has(rect));
+                  const headerRowsKeys = Object.keys(group.headerRows || {});
+
+                  if (hasExcludedNested && headerRowsKeys.length) {
+                    const headerCoordinates = headerRowsKeys
+                      .map(key => group.headerRows[key])
+                      .flat();
+                    const groupCoordinates = group.coordinates || [];
+
+                    if (headerCoordinates.length && headerCoordinates.length !== groupCoordinates.length) {
+                      console.error(`[DIAG] splitGroups: fragments failed header filter, keeping original group (y=${group.y})`);
+                      prev.push(group);
+                    }
+                  }
+                }
+
                 return prev;
               }, []);
             }
@@ -3739,11 +4435,16 @@ export function init({
 
                 //fake edges
                 let borderSize = getAverageBorderSize(group.edges || [], lineMaxWidth);
-                let rectanglesEdges = uniqueArr(group.rectangles?.reduce((prev, cur) => {
-                  let vectors = createLinesFromRectangle(cur, borderSize);
-                  prev.push(...vectors);
-                  return prev;
-                }, []) || [], ['x', 'y', 'width', 'height']);
+                let rectanglesEdges = uniqueArr(
+                  group.rectangles
+                    ?.filter(rect => !nestedRectangles.has(rect))
+                    .reduce((prev, cur) => {
+                      let vectors = createLinesFromRectangle(cur, borderSize);
+                      prev.push(...vectors);
+                      return prev;
+                    }, []) || [],
+                  ['x', 'y', 'width', 'height']
+                );
                 group.rectanglesEdges = rectanglesEdges;
 
                 let increasedCoordinates = JSON.parse(JSON.stringify(coordinates));
@@ -3831,7 +4532,10 @@ export function init({
                   Math.max(...group['y'], ...group.rows)
                 ];
 
-                if (headerRanges.length || (tolerance == Infinity)) {
+                const hasExcludedNestedRectangles = (group['rectangles'] || [])
+                  .some(rect => nestedRectangles.has(rect));
+
+                if (headerRanges.length || (tolerance == Infinity) || hasExcludedNestedRectangles) {
                   prev.push(group);
                 }
 
@@ -4531,35 +5235,155 @@ export function init({
           let intersections = (() => {
             let watermarksIndexes = [];
             let array = [];
-            for (let mainIndex = 0; mainIndex < tableContentItems.length; mainIndex++) {
+
+            const findPreviousRelatedItem = (mainIndex, removedItem) => {
+              const removedX = removedItem?.x ?? removedItem?.transform?.[4] ?? 0;
+              const removedY = removedItem?.y ?? removedItem?.transform?.[5] ?? 0;
+              const removedHeight = Math.abs(
+                removedItem?.height || removedItem?.transform?.[3] || 0
+              );
+
+              const removedLeft = removedX;
+              const removedRight = removedX + Math.abs(removedItem?.width || 0);
+
+              let iterationLimit = 5;
+              for (
+                let index = mainIndex - 1;
+                index >= Math.max(0, mainIndex - iterationLimit);
+                index--
+              ) {
+                if (watermarksIndexes.includes(index)) {
+                  continue;
+                }
+
+                const candidate = tableContentItems[index];
+
+                if (!candidate) {//isEmptyCoordinate(candidate)
+                  continue;
+                }
+
+                let isEmptyRemoved = isEmptyCoordinate(removedItem);
+
+                if (isEmptyRemoved ? false : !isSameFont(candidate, removedItem)) {
+                  continue;
+                }
+
+                const candidateY =
+                  candidate?.y ?? candidate?.transform?.[5] ?? 0;
+
+                const candidateHeight = Math.abs(
+                  candidate?.height || candidate?.transform?.[3] || 0
+                );
+
+                const candidateLeft =
+                  candidate?.x ?? candidate?.transform?.[4] ?? 0;
+
+                const candidateRight =
+                  candidateLeft + Math.abs(candidate?.width || 0);
+
+                const sameY =
+                  Math.abs(candidateY - removedY) <= 0.5;
+
+                  let toleranceTypes = {
+                    empty: [4, 0.3],
+                    fill: [0.5, 0.05],
+                  };
+
+                  let tolerance = isEmptyRemoved ? toleranceTypes['empty'] : toleranceTypes['fill'];
+
+                const similarHeight =
+                  removedHeight > 0 &&
+                  candidateHeight > 0 &&
+                  (
+                    Math.abs(candidateHeight - removedHeight) < tolerance[0] ||
+                    (Math.abs(candidateHeight - removedHeight) / Math.max(candidateHeight, removedHeight)) < tolerance[1]
+                  );
+
+                if (!similarHeight) {
+                  continue;
+                }
+
+                const xTolerance = Math.max(0.5, removedHeight * 0.1);
+
+                const touchesX =
+                  Math.abs(candidateRight - removedLeft) <= xTolerance ||
+                  Math.abs(removedRight - candidateLeft) <= xTolerance;
+
+                if (touchesX && sameY) {
+                  return candidate;
+                }
+                return candidate;
+              }
+
+              return null;
+            };
+
+            for (
+              let mainIndex = 0;
+              mainIndex < tableContentItems.length;
+              mainIndex++
+            ) {
               let item = tableContentItems[mainIndex];
+
               let getObj = (obj) => {
                 return Object.assign({}, obj, (() => {
                   let [a, b, c, d, x, y] = obj.transform;
+
                   x = obj.x || x;
                   y = obj.y || y;
-                  return { x, y }
+
+                  return { x, y };
                 })());
-              }
+              };
+
               let data = {
                 index: mainIndex,
-                intersectionsIndexes: tableContentItems.reduce((prev, cur, index) => {
+                intersectionsIndexes: tableContentItems.reduce(
+                  (prev, cur, index) => {
+                    if (index != mainIndex) {
+                      let inRange = (
+                        checkRectangleRanges(
+                          getObj(cur),
+                          getObj(item),
+                          {
+                            strict: true,
+                            strictIntersecting: true,
+                            axis: ['x', 'y']
+                          }
+                        ) as Array<any>
+                      ).every(item => item.inRange);
 
-                  if (index != mainIndex) {
-                    let inRange = (checkRectangleRanges(getObj(cur), getObj(item), { strict: true, strictIntersecting: true, axis: ['x', 'y'] }) as Array<any>).every(item => item.inRange);
-                    if (inRange) {
-                      prev.push(index);
+                      if (inRange) {
+                        prev.push(index);
+                      }
                     }
-                  }
 
-                  return prev;
-                }, [])
+                    return prev;
+                  },
+                  []
+                )
               };
 
               let isIntersectsEdge = (() => {
-                let visibleEdges = [...(edges || []), ...(rectanglesEdges || [])].filter(item => isVisibleVector(item));
+                let visibleEdges = [
+                  ...(edges || []),
+                  ...(rectanglesEdges || [])
+                ].filter(item => isVisibleVector(item));
+
                 return visibleEdges.filter(edge => {
-                  let inRange = (checkRectangleRanges(getObj(edge), getObj(item), { strict: true, strictIntersecting: false, axis: ['x', 'y'], tolerance: -(Math.min(edge.width, edge.height)) }) as Array<any>).every(item => item.inRange);
+                  let inRange = (
+                    checkRectangleRanges(
+                      getObj(edge),
+                      getObj(item),
+                      {
+                        strict: true,
+                        strictIntersecting: false,
+                        axis: ['x', 'y'],
+                        tolerance: -(Math.min(edge.width, edge.height))
+                      }
+                    ) as Array<any>
+                  ).every(item => item.inRange);
+
                   return inRange;
                 });
               })();
@@ -4570,19 +5394,37 @@ export function init({
                 }
               }
 
+              let isWatermark =
+                (isIntersectsEdge.length && isEmptyCoordinate(tableContentItems[mainIndex])) ||
+                (
+                  tableContentItems[mainIndex]?.str == ' ' &&
+                  tableContentItems[mainIndex].hasEOT
+                );
 
-
-              let isWatermark = (isIntersectsEdge.length && isEmptyCoordinate(tableContentItems[mainIndex])) ||
-                ((tableContentItems[mainIndex]?.str == ' ') && tableContentItems[mainIndex].hasEOT); //exceptions
               if (isWatermark) {
-                if (isEmptyCoordinate(tableContentItems[mainIndex])) {//Transfer to the previous object the properties of the deleted object
-                  let tableContentItemsRange = tableContentItems.slice(0, mainIndex);
-                  let lastItem = tableContentItemsRange.findLast(item => !isEmptyCoordinate(item));
-                  if (lastItem) {
-                    lastItem['hasEOT'] = lastItem['hasEOT'] || item['hasEOT'];
-                    updateChars({ item: lastItem, lineBreakNeeded: lastItem['hasEOT'] ? false : tableContentItems[mainIndex]['hasEOL'] });
-                  }
+                let removedItem = tableContentItems[mainIndex];
+
+                let previousRelatedItem = findPreviousRelatedItem(
+                  mainIndex,
+                  removedItem
+                );
+
+                if (previousRelatedItem) {
+                  previousRelatedItem['hasEOT'] =
+                    previousRelatedItem['hasEOT'] || removedItem['hasEOT'];
+
+                  updateChars({
+                    item: previousRelatedItem,
+                    lineBreakNeeded:
+                      previousRelatedItem['hasEOT']
+                        ? false
+                        : isEmptyCoordinate(removedItem)
+                          ? removedItem['hasEOL']
+                          : false,
+                    spaceNeeded: false
+                  });
                 }
+
                 if (!watermarksIndexes.includes(mainIndex)) {
                   watermarksIndexes.push(mainIndex);
                 }
@@ -4615,6 +5457,23 @@ export function init({
           if (coordinates.length > 0) {
             console.error(`[DEBUG Page ${pageNum}] first coord:`, { str: coordinates[0].str?.substring(0, 30), x: coordinates[0].x, y: coordinates[0].y });
           }
+
+          // Nested decoration rectangles: fully contained in another visible rectangle
+          // of the same fill color. They keep the group spatially united but must not
+          // contribute their borders to the table grid (rows/cols/rectanglesEdges).
+          const nestedRectangles = new Set<any>();
+          {
+            const visibleFillRects = rectangles.filter(r => isVisibleVector(r) && r.fillColor);
+            for (const inner of visibleFillRects) {
+              const isNested = visibleFillRects.some(outer =>
+                outer !== inner && isSameFillColor(outer, inner) && isStrictlyContained(outer, inner)
+              );
+              if (isNested) {
+                nestedRectangles.add(inner);
+              }
+            }
+          }
+          console.error(`[DEBUG Page ${pageNum}] nested rectangles:`, nestedRectangles.size);
 
           //Defining cell boundaries
           let { tableGroups, pageGroups } = getGroups();
