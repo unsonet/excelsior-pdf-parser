@@ -5284,12 +5284,12 @@ export function init({
                 const sameY =
                   Math.abs(candidateY - removedY) <= 0.5;
 
-                  let toleranceTypes = {
-                    empty: [4, 0.3],
-                    fill: [0.5, 0.05],
-                  };
+                let toleranceTypes = {
+                  empty: [4, 0.3],
+                  fill: [0.5, 0.05],
+                };
 
-                  let tolerance = isEmptyRemoved ? toleranceTypes['empty'] : toleranceTypes['fill'];
+                let tolerance = isEmptyRemoved ? toleranceTypes['empty'] : toleranceTypes['fill'];
 
                 const similarHeight =
                   removedHeight > 0 &&
@@ -6619,7 +6619,7 @@ export function init({
             let tableGroup = tableGroups[tableIndex];
 
             function extractTableData(options) {
-              let { verticles, horizons, coordinates, merges = {}, mergeAlias = {}, headerRows = {}, edges, tableGroup, pageGroup, lineMaxWidth } = options;
+              let { verticles, horizons, coordinates, merges = {}, mergeAlias = {}, headerRows = {}, edges, tableGroup, pageGroup, lineMaxWidth, rectangles = [] } = options;
               // Sorting by requirements
               verticles = verticles.sort((a, b) => a.x - b.x);
               horizons = horizons.sort((a, b) => b.y - a.y); // Inverted y-axis
@@ -6693,6 +6693,149 @@ export function init({
                   if (item.textColor) {
                     table.array[row][col]['textColor'] = item.textColor;
                   }
+
+                  // Fallback for cell fill color:
+                  // when the coordinate itself has no fillColor,
+                  // find the rectangle matching the actual cell boundaries.
+                  if (table.array[row][col]['fillColor'] == null) {
+                    const mergeKey = `${row}-${col}`;
+                    const mergeInfo = merges[mergeKey];
+
+                    const rowSpan = mergeInfo?.height || 1;
+                    const colSpan = mergeInfo?.width || 1;
+
+                    const left = verticles[col]?.x;
+                    const right = verticles[col + colSpan]?.x;
+                    const top = horizons[row]?.y;
+                    const bottom = horizons[row + rowSpan]?.y;
+
+                    if (
+                      Number.isFinite(left) &&
+                      Number.isFinite(right) &&
+                      Number.isFinite(top) &&
+                      Number.isFinite(bottom)
+                    ) {
+                      const cellX1 = Math.min(left, right);
+                      const cellX2 = Math.max(left, right);
+                      const cellY1 = Math.min(top, bottom);
+                      const cellY2 = Math.max(top, bottom);
+
+                      const tolerance = Math.max(
+                        1,
+                        tableGroup?.borderSize || 0.57
+                      );
+
+                      if (table.array[row][col]['str'].includes('Sl.')) {
+                        console.error('[SL NO FILL DEBUG]', {
+                          row,
+                          col,
+
+                          cell: {
+                            x1: cellX1,
+                            x2: cellX2,
+                            y1: cellY1,
+                            y2: cellY2,
+                            width: cellX2 - cellX1,
+                            height: cellY2 - cellY1
+                          },
+
+                          mergeInfo,
+
+                          rectangles: (rectangles || [])
+                            .map(rectangle => {
+                              const rectX1 = Number(
+                                rectangle?.x ?? rectangle?.transform?.[4]
+                              );
+                              const rectY1 = Number(
+                                rectangle?.y ?? rectangle?.transform?.[5]
+                              );
+                              const rectWidth = Math.abs(
+                                Number(rectangle?.width) || 0
+                              );
+                              const rectHeight = Math.abs(
+                                Number(rectangle?.height) || 0
+                              );
+
+                              const rectX2 = rectX1 + rectWidth;
+                              const rectY2 = rectY1 + rectHeight;
+
+                              const intersects =
+                                rectX2 >= cellX1 &&
+                                rectX1 <= cellX2 &&
+                                rectY2 >= cellY1 &&
+                                rectY1 <= cellY2;
+
+                              return intersects
+                                ? {
+                                  x: rectX1,
+                                  y: rectY1,
+                                  width: rectWidth,
+                                  height: rectHeight,
+                                  x2: rectX2,
+                                  y2: rectY2,
+                                  fillColor: rectangle?.fillColor,
+                                  fillRGBColor: rectangle?.fillRGBColor
+                                }
+                                : null;
+                            })
+                            .filter(Boolean)
+                        });
+                      }
+
+                      const fillRectangle = (rectangles || []).find(rectangle => {
+                        if (
+                          rectangle?.fillColor == null &&
+                          !Array.isArray(rectangle?.fillRGBColor)
+                        ) {
+                          return false;
+                        }
+
+                        const rectX1 = Number(
+                          rectangle?.x ?? rectangle?.transform?.[4]
+                        );
+                        const rectY1 = Number(
+                          rectangle?.y ?? rectangle?.transform?.[5]
+                        );
+
+                        const rectWidth = Math.abs(
+                          Number(rectangle?.width) || 0
+                        );
+                        const rectHeight = Math.abs(
+                          Number(rectangle?.height) || 0
+                        );
+
+                        if (
+                          !Number.isFinite(rectX1) ||
+                          !Number.isFinite(rectY1) ||
+                          rectWidth <= 0 ||
+                          rectHeight <= 0
+                        ) {
+                          return false;
+                        }
+
+                        const rectX2 = rectX1 + rectWidth;
+                        const rectY2 = rectY1 + rectHeight;
+
+                        return (
+                          Math.abs(rectX1 - cellX1) <= tolerance &&
+                          Math.abs(rectX2 - cellX2) <= tolerance &&
+                          Math.abs(rectY1 - cellY1) <= tolerance &&
+                          Math.abs(rectY2 - cellY2) <= tolerance
+                        );
+                      });
+
+                      if (fillRectangle) {
+                        table.array[row][col]['fillColor'] =
+                          fillRectangle.fillColor ??
+                          (
+                            Array.isArray(fillRectangle.fillRGBColor)
+                              ? `rgb(${fillRectangle.fillRGBColor.join(',')})`
+                              : null
+                          );
+                      }
+                    }
+                  }
+
                 }
               } catch (err) {
                 console.error(`[FATAL] Error in coordinate placement phase:`, err.message);
@@ -7021,6 +7164,7 @@ export function init({
               tableGroup: tableGroup,
               pageGroup: pageGroups[0],
               lineMaxWidth: lineMaxWidth,
+              rectangles: tableGroup.rectangles,
             });
             if (tableData.table.array.length) {
               tableGroup.tableData = tableData;
