@@ -542,7 +542,8 @@ export function init({
           console.error(`[DIAG Page ${pageNum}] total ops:`, _fnArray.length);
           let constructPathCount = 0;
 
-          if (true) {
+          const DEBUG_DUMP_CONTENT = false;
+          if (DEBUG_DUMP_CONTENT) {
             let content = opList.fnArray
               .map(item => Object.keys(pdfjs.OPS).find(key => pdfjs.OPS[key] == item))
               .map((item, index) => {
@@ -586,6 +587,11 @@ export function init({
               // New format: normArgs = [strokeFillOp<number>, pathSegments<Array|Array-like>, bbox<Object|Array-like>]
               var isNewFormat = typeof normArgs[0] === 'number';
               var paintType = isNewFormat ? normArgs[0] : null;
+              const isPaintlessPath = isNewFormat && (
+                paintType === OPS.clip ||
+                paintType === OPS.eoClip ||
+                paintType === OPS.endPath
+              );
               let edgesStartIdx = edges.length;
               let rectsStartIdx = rectangles.length;
 
@@ -780,15 +786,18 @@ export function init({
                   let vectorType = Math.min(Math.abs(rwidth), Math.abs(rheight)) < lineMaxWidth ? 'edge' : 'rectangle';
                   let vectors = vectorType == 'rectangle' ? rectangles : edges;
 
-                  if (vectorType == 'rectangle') {
-                    //fake edges
-                    let borderSize = getAverageBorderSize(edges || [], lineMaxWidth);
-                    rectanglesEdges = uniqueArr(
-                      [...(rectanglesEdges || []), ...createLinesFromRectangle(vector, borderSize)],
-                      ['x', 'y', 'width', 'height']
-                    );
+                  if (!isPaintlessPath) {
+                    if (vectorType == 'rectangle') {
+                      //fake edges
+                      let borderSize = getAverageBorderSize(edges || [], lineMaxWidth);
+                      rectanglesEdges = uniqueArr(
+                        [...(rectanglesEdges || []), ...createLinesFromRectangle(vector, borderSize)],
+                        ['x', 'y', 'width', 'height']
+                      );
+                    }
+
+                    vectors.push(vector);
                   }
-                  vectors.push(vector);
                   current['vectorCache'] = vector;
                   current['vectorType'] = vectorType;
                 } else if (op === OPS.moveTo) {
@@ -850,7 +859,7 @@ export function init({
                       }
                     }
 
-                    if (!isPageBoundary) {
+                    if (!isPageBoundary) {//&& !isPaintlessPath BUG sales_order.pdf 
                       edges.push(vector);
                     }
 
@@ -2419,7 +2428,7 @@ export function init({
                       chars: handledValues.charsRangesArrays.flat(),
                       fontName: fontName,
                       textColor: prev?.textColor || cur?.textColor || null,
-                      height: Math.max(Math.abs(prevTransform[3]) || curEffectiveHeight, Math.abs(cur.transform[3]) || curEffectiveHeight), //old:cur.transform[3] BUG in (13-sample-tables-3.pdf): old fontSize,
+                      height: Math.max(Math.abs(prevTransform[3]) || curEffectiveHeight, Math.abs(cur.transform[3]) || curEffectiveHeight), //old:cur.transform[3] BUG in (three_tables_2.pdf): old fontSize,
                       dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(handledValues.str),
                       width: Number.isFinite(actualRight) &&
                         Number.isFinite(actualLeft)
@@ -2486,7 +2495,7 @@ export function init({
                   if (
                     (lastItem?.str || lastItem?.imageName) &&
                     !current['pathConstructed'] &&
-                    ((newItem.str == current['str'])) && //!BUGFIX (combined text items/coordinates ) 08-camelot-example.pdf 
+                    ((newItem.str == current['str'])) && //!BUGFIX (combined text items/coordinates ) table.pdf 
                     !isIntersectsEdges
                   ) {
                     reservedLastItemEOT = lastItem['hasEOT'];
@@ -2504,7 +2513,7 @@ export function init({
                     //     ((lastItem?.transform?.[4] != newItem?.transform?.[4]) && (!lastItem.hasEOT || true)) || //BUGFIX
                     //     ((lastItem?.transform?.[5] != newItem?.transform?.[5]) && !lastItem.hasEOL)
                     // )
-                  ) { //BUGFIX for 09-watermark.pdf
+                  ) { //BUGFIX for watermark.pdf
 
                     function getCoordinateData(newItemIndex, ignoreFirstSplitItem?) {
                       let lastItemIndex = newItemIndex - 1;
@@ -3343,11 +3352,21 @@ export function init({
                   let lastItemWidth = getItemWidth(lastItem);
 
                   let height = Math.max(lastItem.y + lastItemHeight, y + itemHeight) - Math.min(lastItem.y, y);
-                  let width = lastItem.y == y
-                    ? (((x + itemWidth) < (lastItem.x + lastItemWidth)) ? lastItemWidth : ((x + itemWidth) - lastItem.x))
-                    : Math.max(itemWidth, lastItemWidth);
-                  let str = [lastItem?.str || '', item?.str || ''].join('');//old:.join(hasEOL ? '\n' : '');
-                  let chars = [...(lastItem.chars || []), ...(item.chars || [])];
+                  let width = lastItem.y == y ? (((x + itemWidth) < (lastItem.x + lastItemWidth)) ? lastItemWidth : ((x + itemWidth) - lastItem.x)) : Math.max(itemWidth, lastItemWidth);
+
+                  // hasEOL относится к lastItem — если перенос был нужен, но ещё не
+                  // попал в его str/chars (bывает, когда hasEOL проставляется
+                  // постфактум, уже после того как для фрагмента отработал updateChars),
+                  // достраиваем перенос прямо здесь, перед склейкой
+                  let lastStr = lastItem?.str || '';
+                  let needsSyntheticLineBreak = hasEOL && !lastStr.endsWith('\n');
+                  if (needsSyntheticLineBreak) { lastStr += '\n'; }
+                  let str = [lastStr, item?.str || ''].join('');
+                  let syntheticBreakChar = needsSyntheticLineBreak ? [{
+                    originalCharCode: 10, fontChar: "\n", unicode: "\n", accent: null,
+                    width: 0, isSpace: false, isInFont: true, isLineBreak: true,
+                  }] : [];
+                  let chars = [...(lastItem.chars || []), ...syntheticBreakChar, ...(item.chars || [])];
                   x = Math.min(lastItem.x, x);
 
                   Object.assign(lastItem, {
@@ -3690,6 +3709,153 @@ export function init({
             return headerRows;
           }
 
+          function trimUnsupportedTrailingRows(group, lineMaxWidth) {
+            if (!group.rows?.length || !group.cols?.length || group.rows.length < 4) return group;
+
+            let sortedRows = [...group.rows].sort((a, b) => b - a);
+            let sortedCols = [...group.cols].sort((a, b) => a - b);
+            let fullColsCount = sortedCols.length - 1;
+            let realEdges = (group.edges || []).filter(e => isVisibleVector(e) && !e['_isFakeLine']);
+
+            function analyzeRange(topY, bottomY) {
+              let edgesInRange = realEdges.filter(e => e.y <= topY + 1 && e.y >= bottomY - 1);
+              let textBlocks = (group.coordinates || []).filter(c => c?.str?.trim() && c.y <= topY + 1 && c.y > bottomY - 1);
+              let usedCols = new Set<number>();
+              textBlocks.forEach(tb => {
+                for (let ci = 0; ci < sortedCols.length - 1; ci++) {
+                  if (tb.x >= sortedCols[ci] - 1 && tb.x + tb.width <= sortedCols[ci + 1] + 1) usedCols.add(ci);
+                }
+              });
+              return { edgesInRange, usedCols, textBlocks };
+            }
+
+            // проверяем от конца группы к началу: строка считается
+            // "неподкреплённой", если рядом с ней вообще нет реальных edges,
+            // либо использован узкий срез колонок (< 60% от полного набора) —
+            // это ровно сигнатура твоих двух PDF (пустые edges слева / только
+            // правые колонки)
+            let cutIndex = -1;
+            for (let i = 0; i < sortedRows.length - 1; i++) {
+              let { edgesInRange, usedCols, textBlocks } = analyzeRange(sortedRows[i], sortedRows[i + 1]);
+              if (!textBlocks.length) continue;
+              let unsupported = edgesInRange.length === 0 || (usedCols.size > 0 && usedCols.size < fullColsCount * 0.6);
+              if (!unsupported) { cutIndex = -1; continue; }
+              if (cutIndex === -1) cutIndex = i;
+            }
+            // cutIndex теперь указывает на ПЕРВУЮ строку самого длинного
+            // неподкреплённого хвоста, если он тянется до конца группы
+            if (cutIndex === -1) return group;
+            let tailIsUnbroken = true;
+            for (let j = cutIndex; j < sortedRows.length - 1; j++) {
+              let { edgesInRange, usedCols, textBlocks } = analyzeRange(sortedRows[j], sortedRows[j + 1]);
+              if (!textBlocks.length) continue;
+              let unsupported = edgesInRange.length === 0 || (usedCols.size > 0 && usedCols.size < fullColsCount * 0.6);
+              if (!unsupported) { tailIsUnbroken = false; break; }
+            }
+            if (!tailIsUnbroken || cutIndex < 2) return group; // не режем, если это не хвост или почти вся таблица
+
+            let cutoffY = sortedRows[cutIndex];
+            group.rows = group.rows.filter(y => y >= cutoffY);
+            group.coordinates = (group.coordinates || []).filter(c => c.y >= cutoffY - 1);
+            group.edges = (group.edges || []).filter(e => e.y >= cutoffY - 1);
+            group.rectangles = (group.rectangles || []).filter(r => r.y >= cutoffY - 1);
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [], edges: group.edges || [],
+              rectangles: group.rectangles || [], rows: group.rows || [], lineMaxWidth,
+            });
+            return group;
+          }
+
+          function extendGroupTopBorder(group, pageGroup, lineMaxWidth) {
+            if (!pageGroup || !group.rows?.length || !group.cols?.length) return group;
+
+            let currentTop = Math.max(...group.rows);
+            let groupXMin = Math.min(...group.cols);
+            let groupXMax = Math.max(...group.cols);
+            let groupWidth = groupXMax - groupXMin;
+            let borderSize = group.borderSize || 0.57;
+            let edgeTolerance = Math.max(1, borderSize * 3);
+
+            // окно поиска привязано к СОБСТВЕННОМУ шагу строки именно этой
+            // таблицы, а не к произвольной константе и не к странице целиком
+            let sortedRows = [...group.rows].sort((a, b) => a - b);
+            let rowGaps = sortedRows.slice(1).map((y, i) => y - sortedRows[i]).filter(g => g > 0);
+            let modalRowHeight = +findMod(rowGaps) || findAverage(rowGaps) || 20;
+            let searchLimit = currentTop + modalRowHeight * 1.5;
+
+            let candidates = (pageGroup.edges || [])
+              .filter(e => isVisibleVector(e))
+              .filter(e => e.height < lineMaxWidth && e.width > lineMaxWidth)
+              .filter(e => e.y > currentTop + 0.5 && e.y <= searchLimit);
+
+            if (!candidates.length) return group;
+
+            let byY: Record<string, any[]> = {};
+            candidates.forEach(e => {
+              let existingKey = Object.keys(byY).find(k => Math.abs(+k - e.y) < 1);
+              let key = existingKey ?? String(e.y);
+              byY[key] = byY[key] || [];
+              byY[key].push(e);
+            });
+
+            // структурное доказательство: у САМОЙ этой таблицы (по её
+            // собственным крайним X — левой/правой колонке) должно физически
+            // что-то быть рядом с кандидатной Y. Случайная чужая линия дальше
+            // на странице почти никогда не совпадёт по X с границами именно
+            // этой таблицы.
+            let hasOwnBoundaryEvidence = (y: number) => {
+              return (pageGroup.edges || []).some(e =>
+                isVisibleVector(e) &&
+                (Math.abs(e.x - groupXMin) <= edgeTolerance || Math.abs(e.x - groupXMax) <= edgeTolerance) &&
+                y >= e.y - edgeTolerance && y <= e.y + (e.height || 0) + edgeTolerance
+              );
+            };
+
+            let bestY = null;
+            Object.keys(byY).forEach(yKey => {
+              let y = +yKey;
+              let covered = byY[yKey].reduce((sum, s) => sum + s.width, 0);
+              let wideEnough = covered >= groupWidth * 0.85;
+              if (wideEnough && hasOwnBoundaryEvidence(y)) {
+                if (bestY === null || y < bestY) bestY = y;
+              }
+            });
+            if (bestY === null) return group;
+
+            let newCoordinates = (pageGroup.coordinates || []).filter(c =>
+              c.y > currentTop && c.y <= bestY &&
+              c.x >= groupXMin - 1 && c.x <= groupXMax + 1
+            );
+            // под линией нет вообще никакого текста ЭТОЙ таблицы — вероятно,
+            // это не её граница, отказываемся расширять
+            if (!newCoordinates.length) return group;
+
+            group.rows = [...new Set([...group.rows, bestY])].sort((a, b) => a - b);
+            group.edgesRows = [...new Set([...(group.edgesRows || []), bestY])].sort((a, b) => a - b);
+            group.y = [Math.min(...group.y, bestY), Math.max(...group.y, bestY)];
+
+            let newEdges = (pageGroup.edges || []).filter(e => e.y > currentTop && e.y <= bestY);
+            group.edges = uniqueArr([...(group.edges || []), ...newEdges], ['x', 'y', 'width', 'height']);
+
+            let newRectangles = (pageGroup.rectangles || []).filter(r =>
+              r.y >= currentTop - 1 && (r.y + r.height) <= bestY + 1 &&
+              r.x >= groupXMin - 1 && (r.x + r.width) <= groupXMax + 1
+            );
+            group.rectangles = uniqueArr([...(group.rectangles || []), ...newRectangles], ['x', 'y', 'width', 'height']);
+
+            group.coordinates = uniqueArr([...(group.coordinates || []), ...newCoordinates], ['x', 'y', 'width', 'height']);
+
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: group.rows || [],
+              lineMaxWidth: lineMaxWidth,
+            });
+
+            return group;
+          }
+
           //Function for defining tables
           function defineGroups(options) {
             let { item, type, axis, tolerance, groups, lineMaxWidth, downcheck } = options;
@@ -3698,7 +3864,7 @@ export function init({
             let isIntersecting = false;
 
             let getUnique = (arr, axis) => {
-              let data = uniqueArr(arr, ['x', 'y', 'width', 'height']);//old, axis
+              let data = uniqueArr(arr, ['x', 'y', 'width', 'height', 'fillColor', 'strokeColor']);//old, axis
               let sortedData = sortArrayOfObjects(
                 data,
                 axis.map(axisItem => ({ field: axisItem, order: 'asc' }))
@@ -3882,6 +4048,19 @@ export function init({
             return groups;
           }
 
+          function calculateEdgeToleranceValue(edges, lineMaxWidth) {
+            let horizontalEdges = (edges || []).filter(e =>
+              isVisibleVector(e) && e.height < lineMaxWidth && e.width > lineMaxWidth
+            );
+            if (horizontalEdges.length < 2) return null;
+
+            let ys = uniqueArr(horizontalEdges.map(e => e.y)).sort((a, b) => a - b);
+            let gaps = ys.slice(1).map((y, i) => y - ys[i]).filter(g => g > 0);
+            if (!gaps.length) return null;
+
+            return +findMod(gaps) || findAverage(gaps);
+          }
+
           function calculateToleranceValue(coordinates) {
             //Find the modulus of text height
             let modeTextHeight = findMod(coordinates.map(item => item.height));
@@ -3927,10 +4106,26 @@ export function init({
           // Function for defining cell boundaries
           function getGroups() {
             let tolerance = calculateToleranceValue(coordinates);
+
             let pageGroups = createGroup({ edges, rectangles, coordinates, tolerance: Infinity });
             let tableGroups = createGroup({ edges, rectangles, coordinates, tolerance });
 
+            console.error('rows from createGroup (до extendGroupTopBorder, которого больше нет):', tableGroups.map(g => g.rows))
+
             tableGroups = splitGroups({ groups: tableGroups, globalGroup: pageGroups[0], downcheck: true });
+
+            tableGroups = tableGroups.map(group => extendGroupTopBorder(group, pageGroups[0], lineMaxWidth));
+            tableGroups = tableGroups.map(group => trimUnsupportedTrailingRows(group, lineMaxWidth));
+
+            // порядок таблиц в результате должен соответствовать порядку
+            // чтения (сверху вниз на странице), а не порядку, в котором их
+            // случайно построила кластеризация
+            tableGroups = [...tableGroups].sort((a, b) => {
+              let aTop = a.rows?.length ? Math.max(...a.rows) : (a.y ? a.y[1] : 0);
+              let bTop = b.rows?.length ? Math.max(...b.rows) : (b.y ? b.y[1] : 0);
+              return bTop - aTop;
+            });
+
             tableGroups.forEach(group => {
               group.assuredCols = group.cols;
               group.assuredRows = group.rows;
@@ -4050,7 +4245,7 @@ export function init({
                           }
                         );
 
-                        // if (!bottomElements.length) {//!BUG no last table in 13-sample-tables-3.pdf
+                        // if (!bottomElements.length) {//!BUG no last table in three_tables_2.pdf
                         //   continue;
                         // }
 
@@ -4972,8 +5167,8 @@ export function init({
               paddingSize,
               headerRows
             } = options;
-            cols = cols.sort((a, b) => a - b);
-            rows = rows.sort((a, b) => a - b);
+            cols = [...cols].sort((a, b) => a - b);
+            rows = [...rows].sort((a, b) => a - b);
             let verticalAssuredEdges = [];
             let horizontalAssuredEdges = [];
             let headerRowsKeys = uniqueArr(Object.keys(headerRows).map(item => item.split('-').map(i => +i)).flat());
@@ -4981,7 +5176,7 @@ export function init({
               let isVisible = hasVectorColor(edge);
               if (isVisible) {
                 if ((edge.height < lineMaxWidth) && (edge.width > lineMaxWidth)) {
-                  //if (!headerRowsKeys.includes(edge.y)) {//!BUG 08-camelot-example.pdf
+                  //if (!headerRowsKeys.includes(edge.y)) {//!BUG table.pdf
                   horizontalAssuredEdges.push(edge);
                   //}
                 } else if ((edge.width < lineMaxWidth) && (edge.height > lineMaxWidth)) {
@@ -4993,6 +5188,112 @@ export function init({
 
             let borderSize = getAverageBorderSize(assuredEdges, lineMaxWidth);
             let deletedEdges = [];
+
+            /**
+             * Удаляет фантомные крайние строки сетки — строки за пределами реальных
+             * границ таблицы (линий/прямоугольников), появившиеся из-за «висящего»
+             * текста рядом с таблицей (сноски, легенды, подписи).
+             *
+             * Такой текст полностью отделён от ближайшей реальной границы зазором,
+             * тогда как текст настоящих ячеек примыкает к границам своей строки.
+             * Трогаем только таблицы с видимыми горизонтальными линиями: в таблицах
+             * без линий (borderless) крайние строки формируются исключительно
+             * координатами и всегда легитимны.
+             */
+            function removePhantomBoundaryRows(gridRows) {
+              if (!gridRows.length || !horizontalAssuredEdges.length) {
+                return gridRows;
+              }
+              const realYs = [...new Set(horizontalAssuredEdges.map(edge => edge.y))].sort((a, b) => a - b);
+              const edgeTolerance = Math.max(lineMaxWidth, borderSize * 2, 1);
+              // Текст настоящей ячейки может слегка заступать на линию границы,
+              // но не «плавает» в отрыве от неё. Зазор больше — призмер отрывного блока.
+              const detachTolerance = Math.max(borderSize, 0.5);
+
+              function hasContent(coordinate) {
+                return coordinate && (coordinate.str?.trim() || coordinate.imageName);
+              }
+
+              function getBox(coordinate) {
+                return {
+                  top: Math.min(coordinate.y, coordinate.y + coordinate.height),
+                  bottom: Math.max(coordinate.y, coordinate.y + coordinate.height),
+                };
+              }
+
+              function isPhantomRow(rowY, inwardDir) {
+                // Крайняя строка фантомна только если за таблицей нет реальной линии
+                const hasRealEdge = horizontalAssuredEdges.some(
+                  edge => Math.abs(edge.y - rowY) <= edgeTolerance
+                );
+                if (hasRealEdge) {
+                  return false;
+                }
+                // Ближайшая реальная граница внутрь таблицы
+                const inwardRealYs = realYs.filter(y => inwardDir > 0 ? y > rowY : y < rowY);
+                if (!inwardRealYs.length) {
+                  return false;
+                }
+                const nearestRealY = inwardDir > 0 ? Math.min(...inwardRealYs) : Math.max(...inwardRealYs);
+                const content = (coordinates || []).filter(hasContent);
+                // Контент не должен торчать за пределы крайней строки сетки
+                const hasOutsideContent = content.some(coordinate => {
+                  const box = getBox(coordinate);
+                  return inwardDir > 0 ? box.top < rowY : box.bottom > rowY;
+                });
+                if (hasOutsideContent) {
+                  return false;
+                }
+                // Вся полоса между фантомной строкой и реальной границей должна
+                // состоять только из текста, отделённого от реальной границы зазором
+                const bandCoordinates = content.filter(coordinate => {
+                  const box = getBox(coordinate);
+                  return inwardDir > 0
+                    ? (box.bottom > rowY && box.top < nearestRealY)
+                    : (box.top < rowY && box.bottom > nearestRealY);
+                });
+                return bandCoordinates.every(coordinate => {
+                  const box = getBox(coordinate);
+                  const gap = inwardDir > 0 ? nearestRealY - box.bottom : box.top - nearestRealY;
+                  return gap > detachTolerance;
+                });
+              }
+
+              if (gridRows.length < 2) {
+                return gridRows;
+              }
+              const firstRowY = gridRows[0];
+              const lastRowY = gridRows[gridRows.length - 1];
+              const filtered = gridRows.filter(rowY => {
+                if (rowY === firstRowY && isPhantomRow(rowY, +1)) {
+                  return false;
+                }
+                if (rowY === lastRowY && isPhantomRow(rowY, -1)) {
+                  return false;
+                }
+                return true;
+              });
+              // Не даём вырождать сетку меньше двух строк
+              return filtered.length >= 2 ? filtered : gridRows;
+            }
+
+            rows = removePhantomBoundaryRows(rows);
+
+            // внутри generateVirtualEdges — сразу после removePhantomBoundaryRows(rows)
+            // intersectingElements зависит ТОЛЬКО от textBlock, а не от позиции в сетке.
+            // Считаем один раз на координату вместо пересчёта в каждой ячейке сетки.
+            let verticalIntersectorsByCoordinate = coordinates.map((textBlock) => {
+              return verticalAssuredEdges?.filter((vector) => {
+                let res: any = checkRectangleRanges(vector, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true });
+                return res.isContained || !res.biggestArgument && res.isIntersecting;
+              }) || [];
+            });
+            let horizontalIntersectorsByCoordinate = coordinates.map((textBlock) => {
+              return horizontalAssuredEdges?.filter((vector) => {
+                let res: any = checkRectangleRanges(vector, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true });
+                return res.isContained || !res.biggestArgument && res.isIntersecting;
+              }) || [];
+            });
 
             let isIntersecting = (rect1, rect2) => {
               return (checkRectangleRanges(rect1, rect2, { axis: ['x', 'y'], strictIntersecting: true }) as Array<any>).every(item => item.isIntersecting);
@@ -5070,12 +5371,11 @@ export function init({
                 // }
                 for (let k = 0; k < coordinates.length; k++) {
                   let textBlock = coordinates[k];
-
-                  let intersectingElements = verticalAssuredEdges?.filter(vector => {
-                    let res: any = checkRectangleRanges(vector, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true });
-                    return res.isContained || !res.biggestArgument && res.isIntersecting;
-                  }) || [];
-
+                  let intersectingElements = verticalIntersectorsByCoordinate[k];
+                  // let intersectingElements = verticalAssuredEdges?.filter(vector => {
+                  //   let res: any = checkRectangleRanges(vector, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true });
+                  //   return res.isContained || !res.biggestArgument && res.isIntersecting;
+                  // }) || [];
                   let relatedAssuredEdge = getRelatedAssuredEdge(edge, verticalAssuredEdges);
                   if (relatedAssuredEdge) {
                     if (!edge['strokeColor']) {
@@ -5090,9 +5390,7 @@ export function init({
                     let res: any = checkRectangleRanges(edge, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true })
                     return res.isIntersecting;//old: res.isContained || !res.biggestArgument && res.isIntersecting; //BUGFIX if the text block is located in a merged cell and crosses two edges
                   })();
-
                   let intersectingGridItems = uniqueArr(intersectingElements, 'x');
-
                   if (
                     //intersectingElements.length == cols.length && //BUG
                     intersectingGridItems.length > 2 && //threshold of number of edges for corrective detection of merged cells
@@ -5118,7 +5416,13 @@ export function init({
               }
             }
 
+            let sortedRowsForGap = [...rows].sort((a, b) => a - b);
+            let rowGapsForSuppression = sortedRowsForGap.slice(1).map((y, i) => y - sortedRowsForGap[i]).filter(g => g > 0);
+            let modalRowHeightForSuppression = +findMod(rowGapsForSuppression) || findAverage(rowGapsForSuppression) || 20;
+            let yProximityTolerance = modalRowHeightForSuppression * 1.5;
+
             let horizontalEdges = [];
+
             for (let i = 0; i < rows.length; i++) {
               for (let j = 0; j < cols.length - 1; j++) {
                 let x = cols[j];
@@ -5130,8 +5434,9 @@ export function init({
                   width: nextX - x,
                   height: borderSize
                 };
-
                 let isIntersectingTextBlock = false;
+
+                //if (!isOuterBoundary) {//!BUG
                 // let foundAssuredEdges = sortArrayOfObjects(
                 //     horizontalAssuredEdges?.filter(item=>isIntersecting(item, edge)),
                 //     { field: ['x', 'width'], order: 'asc' }
@@ -5144,12 +5449,20 @@ export function init({
                 //     Object.assign(foundAssuredEdge, {x, y, width});
                 // }
 
+                let isOuterBoundary = (i === 0 || i === rows.length - 1);
                 for (let k = 0; k < coordinates.length; k++) {
                   let textBlock = coordinates[k];
-                  let intersectingElements = horizontalAssuredEdges?.filter(vector => {
-                    let res: any = checkRectangleRanges(vector, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true });
-                    return res.isContained || !res.biggestArgument && res.isIntersecting;
-                  }) || [];
+
+                  // let textBlockCenterY = textBlock.y - (textBlock.height || 0) / 2; //!BUG ломает объединение ячеек в twotables_1.pdf
+                  // if (Math.abs(textBlockCenterY - y) > yProximityTolerance) {
+                  //   continue;
+                  // }
+
+                  let intersectingElements = horizontalIntersectorsByCoordinate[k];
+                  // let intersectingElements = horizontalAssuredEdges?.filter(vector => {
+                  //   let res: any = checkRectangleRanges(vector, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true });
+                  //   return res.isContained || !res.biggestArgument && res.isIntersecting;
+                  // }) || [];
 
                   let relatedAssuredEdge = getRelatedAssuredEdge(edge, horizontalAssuredEdges);
                   if (relatedAssuredEdge) {
@@ -5170,13 +5483,12 @@ export function init({
 
                   //exclude header edges for correct definition of table type
                   if (!isHeader(textBlock)) {
-                    intersectingGridItems = intersectingGridItems
-                      .filter(item => {
-                        return !headerRowsKeys.some(key => (checkRectangleRanges({ y: item.y }, { y: key }, { axis: ['y'], strictIntersecting: true, tolerance: 1 }) as Array<any>).every(item => item.isIntersecting))
-                      })
+                    intersectingGridItems = intersectingGridItems.filter(item => {
+                      return !headerRowsKeys.some(key => (checkRectangleRanges({ y: item.y }, { y: key }, { axis: ['y'], strictIntersecting: true, tolerance: 1 }) as Array<any>).every(item => item.isIntersecting))
+                    })
                   }
-
                   if (
+                    !isOuterBoundary &&
                     //intersectingElements.length == rows.length && //BUG
                     intersectingGridItems.length > 3 && //threshold of number of edges for corrective detection of merged cells
                     //colIndex == -1 &&
@@ -5189,7 +5501,6 @@ export function init({
                     break;
                   }
                 }
-
                 if (!isIntersectingTextBlock) {
                   let newEdge: any = edge;//foundAssuredEdge || edge;
                   if (!newEdge.used) {
@@ -5201,7 +5512,6 @@ export function init({
             }
 
             let edges = [...verticalEdges, ...horizontalEdges];
-
             return edges;
           }
 
@@ -5645,6 +5955,9 @@ export function init({
               return {};
             }
             horizons.push({ y: current['y'], lines: lines });
+            console.error('[DIAG final horizons near 673]',
+              horizons.find(h => Math.abs(h.y - 673.53) < 2)
+            );
 
             function parseId(str) {
               let [row, col] = str.split('-').map(item => item ? +item : undefined);
@@ -6409,6 +6722,88 @@ export function init({
               }
             }
 
+            function validateColumnMerges(options: {
+              merges: Record<string, any>;
+              mergeAlias: Record<string, string>;
+              verticles: any[];
+              horizons: any[];
+              coordinates: any[];
+            }) {
+              let { merges, mergeAlias, verticles, coordinates } = options;
+              let sortedV = [...verticles].sort((a, b) => a.x - b.x);
+              let colBounds = (colIndex: number) => [sortedV[colIndex]?.x, sortedV[colIndex + 1]?.x];
+
+              Object.keys(merges).forEach(rootKey => {
+                let merge = merges[rootKey];
+                if (merge.width <= 1) return; // не colspan — не трогаем
+
+                let colFrom = merge.col;
+                let colTo = merge.col + merge.width;
+                let xFrom = sortedV[colFrom]?.x;
+                let xTo = sortedV[colTo]?.x;
+                if (!Number.isFinite(xFrom) || !Number.isFinite(xTo)) return;
+
+                let rowFrom = merge.row;
+                let rowTo = merge.row + merge.height;
+                let ySorted = [...options.horizons].sort((a, b) => b.y - a.y);
+                let yTop = ySorted[rowFrom]?.y;
+                let yBottom = ySorted[rowTo]?.y;
+                if (!Number.isFinite(yTop) || !Number.isFinite(yBottom)) return;
+
+                let itemsInSpan = (coordinates || []).filter(c => {
+                  if (!c?.str?.trim()) return false;
+                  let cx1 = c.x, cx2 = c.x + c.width;
+                  return cx1 >= xFrom - 1 && cx2 <= xTo + 1 && c.y <= yTop + 1 && c.y > yBottom - 1;
+                });
+                if (itemsInSpan.length < 2) return; // делить нечего
+
+                let subColumnsUsed = new Set<number>();
+                let anyItemSpansMultipleColumns = false;
+                itemsInSpan.forEach(item => {
+                  let itemLeft = item.x;
+                  let itemRight = item.x + item.width;
+                  let touchedCols: number[] = [];
+                  for (let c = colFrom; c < colTo; c++) {
+                    let [cxFrom, cxTo] = colBounds(c);
+                    let overlap = Math.min(itemRight, cxTo) - Math.max(itemLeft, cxFrom);
+                    if (overlap > Math.min(item.width, cxTo - cxFrom) * 0.5) touchedCols.push(c);
+                  }
+                  if (touchedCols.length > 1) anyItemSpansMultipleColumns = true;
+                  touchedCols.forEach(c => subColumnsUsed.add(c));
+                });
+
+                // ни один текстовый блок реально не пересекает границу между
+                // колонками, при этом блоки лежат в разных колонках — значит
+                // это НЕ единая объединённая ячейка, а просто отсутствующий
+                // разделитель. Разбиваем colspan-merge на отдельные
+                // rowspan-only merge'и по каждой колонке.
+                if (!anyItemSpansMultipleColumns && subColumnsUsed.size > 1) {
+                  delete merges[rootKey];
+                  (merge.arr || []).forEach((cellKey: string) => {
+                    if (mergeAlias[cellKey] === rootKey) delete mergeAlias[cellKey];
+                  });
+
+                  if (merge.height > 1) {
+                    for (let c = colFrom; c < colTo; c++) {
+                      let newRootKey = `${rowFrom}-${c}`;
+                      let arr: string[] = [];
+                      for (let r = rowFrom; r < rowTo; r++) arr.push(`${r}-${c}`);
+                      merges[newRootKey] = {
+                        row: rowFrom, col: c, arr,
+                        widthArr: [newRootKey], heightArr: arr,
+                        width: 1, height: merge.height,
+                      };
+                      arr.forEach(cellKey => {
+                        if (cellKey !== newRootKey) mergeAlias[cellKey] = newRootKey;
+                      });
+                    }
+                  }
+                }
+              });
+
+              return { merges, mergeAlias };
+            }
+
             function createMatrix(verticles, horizons) {
               verticles = verticles.sort(function (a, b) { return a.x - b.x; });
               horizons = horizons.sort(function (a, b) { return b.y - a.y; });
@@ -6587,10 +6982,15 @@ export function init({
               return { matrix, merges, mergeAlias };
             }
 
+            console.error('[DIAG all horizons]', horizons.map(h => ({ y: h.y, lines: h.lines })));
+
             let matrixData = createMatrix(
               verticles,
               horizons
             );
+
+            console.error('[DIAG raw matrix merges]', JSON.parse(JSON.stringify(matrixData.merges)));
+            console.error('[DIAG raw matrix mergeAlias]', JSON.parse(JSON.stringify(matrixData.mergeAlias)));
 
             inferMergesFromFillRectangles({
               tableGroup,
@@ -6602,12 +7002,19 @@ export function init({
               lineMaxWidth,
             });
 
+            validateColumnMerges({
+              merges: matrixData.merges,
+              mergeAlias: matrixData.mergeAlias,
+              verticles, horizons,
+              coordinates: tableGroup.coordinates || [],
+            });
+
             Object.assign(tableGroup, {
               verticles,
               horizons,
               merges: matrixData.merges,
               mergeAlias: matrixData.mergeAlias,
-              matrix: matrixData.matrix,
+              matrix: matrixData.matrix
             });
           }
 
@@ -6882,9 +7289,17 @@ export function init({
 
                   let allEdges = uniqueArr([...groupEdges, ...pageEdgesFiltered], ['x', 'y', 'width', 'height']);
                   let hasAnyBorders = groupEdges.length > 0 || pageEdgesFiltered.length > 0;
-                  let tableBorderColor = hasAnyBorders
-                    ? findMod(allEdges.map(item => item.strokeColor || item.fillColor).filter(Boolean))
-                    : null;
+
+                  // Тонкие полоски заливки (артефакты отрисовки поверх линий, толщиной ~0.03)
+                  // не должны участвовать в выборе модального цвета рамки таблицы —
+                  // иначе белые «крышки» ячеек перебивают реальный цвет границы.
+                  const minCarrierThickness = 0.1;
+                  let tableBorderColor = hasAnyBorders ? findMod(
+                    allEdges
+                      .filter(item => Math.min(item.width, item.height) >= minCarrierThickness)
+                      .map(item => item.strokeColor || item.fillColor)
+                      .filter(Boolean)
+                  ) : null;
 
                   // Adaptive tolerance: the thinner the real boundaries, the more accurate the matching
                   let borderSize = tableGroup?.borderSize || 0.57;
@@ -6894,8 +7309,9 @@ export function init({
 
                   function findColorInPool(idealLine, pool, isHorizontalIdeal, idealLength) {
                     // Let's summarize the overlaps for each unique color.
-                    let colorOverlapMap = {};
-                    let totalOverlap = 0;
+                    let realOverlapMap = {};
+                    let degenerateOverlapMap = {};
+                    let realTotal = 0, degenerateTotal = 0;
 
                     for (let edge of pool) {
                       let edgeColor = edge.isLinePath ? edge.strokeColor : (edge.strokeColor || edge.fillColor);
@@ -6908,12 +7324,7 @@ export function init({
                       if (!isHorizontalIdeal && !isVerticalEdge) continue;
 
                       // Proximity along the main axis
-                      let axisMatch = false;
-                      if (isHorizontalIdeal) {
-                        axisMatch = Math.abs(edge.y - idealLine.y1) <= tolerance;
-                      } else {
-                        axisMatch = Math.abs(edge.x - idealLine.x1) <= tolerance;
-                      }
+                      let axisMatch = isHorizontalIdeal ? Math.abs(edge.y - idealLine.y1) <= tolerance : Math.abs(edge.x - idealLine.x1) <= tolerance;
                       if (!axisMatch) continue;
 
                       // Overlap in length
@@ -6926,23 +7337,36 @@ export function init({
                         overlapEnd = Math.min(edge.y + edge.height, Math.max(idealLine.y1, idealLine.y2));
                       }
                       let overlap = Math.max(0, overlapEnd - overlapStart);
+                      if (overlap <= 0) continue;
 
-                      if (overlap > 0) {
-                        totalOverlap += overlap;
-                        colorOverlapMap[edgeColor] = (colorOverlapMap[edgeColor] || 0) + overlap;
+                      // вырожденный (0pt) сегмент — гораздо менее надёжное доказательство
+                      // реальной границы, чем сегмент с настоящей толщиной, даже если
+                      // он тоже залит цветом (часто это дубль того же контура)
+                      let thickness = isHorizontalIdeal ? edge.height : edge.width;
+                      if (thickness > 0.3) { // old: > 0.01
+                        realOverlapMap[edgeColor] = (realOverlapMap[edgeColor] || 0) + overlap;
+                        realTotal += overlap;
+                      } else {
+                        degenerateOverlapMap[edgeColor] = (degenerateOverlapMap[edgeColor] || 0) + overlap;
+                        degenerateTotal += overlap;
                       }
+                      //let weight = thickness > 0.01 ? 1 : 0.05;
                     }
 
-                    if (totalOverlap > 0) {
-                      let sortedColors = Object.entries(colorOverlapMap).sort((a: any, b: any) => b[1] - a[1]);
+                    if (realTotal > 0) {
+                      let sortedColors = Object.entries(realOverlapMap)
+                        .sort((a: any, b: any) => b[1] - a[1]);
+
                       let bestColor: any = sortedColors[0][0];
                       let bestOverlap: any = sortedColors[0][1];
                       // Порог: 5% длины или минимум 1px
                       let threshold = Math.min(idealLength * 0.05, 1);
+
                       if (bestOverlap >= threshold) {
                         return bestColor;
                       }
                     }
+
                     return null;
                   }
 
@@ -7031,6 +7455,8 @@ export function init({
                       const mergeInfo = merges[r_c];
                       const rowSpan = mergeInfo ? mergeInfo.height : 1;
                       const colSpan = mergeInfo ? mergeInfo.width : 1;
+
+                      console.error('pool for State top border:', groupEdges.filter(e => Math.abs(e.y - 689.6409912109375) <= 2 && e.x < 179));
 
                       cellBorders.top = getSegmentBorderColor({ x1: verticles[c].x, y1: horizons[r].y, x2: verticles[c + colSpan].x, y2: horizons[r].y });
                       cellBorders.bottom = getSegmentBorderColor({ x1: verticles[c].x, y1: horizons[r + rowSpan].y, x2: verticles[c + colSpan].x, y2: horizons[r + rowSpan].y });
