@@ -170,8 +170,8 @@ export function init({
 
           if (!contained) return false;
 
-          // Отсекаем дубликаты/совпадающие прямоугольники:
-          // вложенный должен быть заметно меньше хотя бы по одной оси.
+          // We filter out duplicates/matching rectangles:
+          // the nested one must be noticeably smaller in at least one axis.
           const strictlySmaller =
             innerRight - inner.x < outerRight - outer.x - tolerance ||
             innerBottom - inner.y < outerBottom - outer.y - tolerance;
@@ -381,28 +381,28 @@ export function init({
           }
 
           /**
- * Выделяет из pathOps/pathCoords замкнутые осевые подпути
- * (moveTo → lineTo×N → closePath), описывающие прямоугольники, и заменяет
- * каждый одиночным OPS.rectangle. Неконвертируемые подпути (кривые,
- * несомкнутые, невырожденные) копируются без изменений.
- */
+          * Extracts closed axial subpaths from pathOps/pathCoords
+          * (moveTo → lineTo×N → closePath) that describe rectangles, and replaces
+          * each with a single OPS.rectangle. Non‑convertible subpaths (curves,
+          * non‑closed, non‑degenerate) are copied unchanged.
+          */
           function extractClosedSubpathRectangles(pathOps: number[], pathCoords: number[]): { ops: number[], coords: number[] } {
             const coordCountFor = (op: number): number => {
               if (op === OPS.rectangle) return 4;
               if (op === OPS.moveTo || op === OPS.lineTo) return 2;
               if (op === OPS.curveTo) return 6;
               if (op === OPS.curveTo2 || op === OPS.curveTo3) return 4;
-              return 0; // closePath и прочие без координат
+              return 0; // closePath and others without coordinates
             };
 
             const trySubpathToRect = (pts: number[][]): [number, number, number, number] | null => {
-              if (pts.length < 4) return null; // moveTo + минимум 3 угла
+              if (pts.length < 4) return null; // moveTo + at least 3 corners
               const xs = pts.map(p => p[0]);
               const ys = pts.map(p => p[1]);
               const x1 = Math.min(...xs), x2 = Math.max(...xs);
               const y1 = Math.min(...ys), y2 = Math.max(...ys);
               if (x2 - x1 < 0.01 || y2 - y1 < 0.01) return null;
-              // все сегменты — осевые и на периметре bbox, периметр пути равен периметру bbox
+              // all segments are axial and on the perimeter of the bbox; the path perimeter is equal to the bbox perimeter
               let perimeter = 0;
               for (let k = 0; k < pts.length; k++) {
                 const [ax, ay] = pts[k];
@@ -432,7 +432,7 @@ export function init({
                 i++;
                 continue;
               }
-              // собираем подпуть до closePath / следующего moveTo
+              // collect the subpath up to closePath / the next moveTo
               const pts: number[][] = [[pathCoords[ci], pathCoords[ci + 1]]];
               ci += 2;
               const subOps: number[] = [OPS.moveTo];
@@ -696,17 +696,17 @@ export function init({
                   if (isNewFormat && paintType != null && paintType !== OPS.endPath) {
                     const isFillOnlyPaint = paintType === OPS.fill || paintType === OPS.eoFill;
                     if (isFillOnlyPaint) {
-                      // Фон ячеек часто рисуется одним fill-путём из десятков подпрямоугольников;
-                      // каждый — геометрия отдельной ячейки (в т.ч. объединённых rowspan/colspan).
+                      // The cell background is often drawn using a single fill path consisting of dozens of sub‑rectangles;
+                      // each represents the geometry of a separate cell (including merged rowspan/colspan).
                       const extracted = extractClosedSubpathRectangles(pathOps, pathCoords);
                       pathOps = extracted.ops;
                       pathCoords = extracted.coords;
                     }
                   }
 
-                  // minMax (bbox) — метаданные пути, а не нарисованная геометрия.
-                  // Добавляем только если сам путь не дал ни одного сегмента
-                  // (например, путь состоял только из пропускаемых кривых).
+                  // minMax (bbox) — path metadata, not drawn geometry.
+                  // Add only if the path itself did not provide any segments
+                  // (for example, the path consisted only of skipped curves).
                   if (isNewFormat && bboxArr.length >= 4 && !pathOps.includes(OPS.rectangle) && !pathOps.includes(OPS.lineTo)) {
                     const rx = bboxArr[0];
                     const ry = bboxArr[1];
@@ -762,9 +762,9 @@ export function init({
                     [rx, ry] = applyTransformFn([rx, ry], transformMatrix);
                     [x2, y2] = applyTransformFn([x2, y2], transformMatrix);
                   }
-                  // CTM с отражением по Y (типичный «перевёрнутый» cm) даёт отрицательные
-                  // width/height — приводим к каноническому bbox, иначе containment-проверки
-                  // ниже по конвейеру молча отбрасывают такие прямоугольники.
+                  // CTM with reflection along Y (typical “inverted” cm) yields negative width/height
+                  // We convert to the canonical bbox; otherwise, containment checks
+                  // further down the pipeline silently discard such rectangles.
                   rwidth = Math.abs(x2 - rx);
                   rheight = Math.abs(y2 - ry);
                   rx = Math.min(rx, x2);
@@ -1524,7 +1524,7 @@ export function init({
 
                 let xAdjacent = (itemRight >= prelimLeft - gapThreshold && itemRight <= prelimLeft + gapThreshold) ||
                   (itemLeft >= prelimRight - gapThreshold && itemLeft <= prelimRight + gapThreshold) ||
-                  (itemLeft <= prelimRight && itemRight >= prelimLeft); // пересечение
+                  (itemLeft <= prelimRight && itemRight >= prelimLeft); // intersection
 
                 let sameY = Math.abs(item.transform[5] - preliminaryItem.transform[5]) < preliminaryItem.height * 1.5;
 
@@ -1704,14 +1704,14 @@ export function init({
                   );
 
                 /*
-                 * Главный критерий:
+                 * The main criterion:
                  *
-                 * preliminaryItem и ВСЯ группа PDF.js items
-                 * должны содержать один и тот же текст.
+                 * preliminaryItem and the ENTIRE group of PDF.js items
+                 * must contain the same text.
                  *
-                 * Пробелы игнорируем, потому что PDF.js может
-                 * разбить "Cases of loose" на совершенно разные
-                 * textContent items с геометрическими промежутками.
+                 * We ignore spaces because PDF.js may
+                 * split the text data into completely different
+                 * textContent items with geometric gaps.
                  */
                 if (
                   !segmentText ||
@@ -1721,22 +1721,13 @@ export function init({
                 }
 
                 /*
-                 * Проверяем, что все related items действительно
-                 * находятся в пределах preliminaryItem.
+                 * We check that all related items are indeed
+                 * within the scope of preliminaryItem.
                  */
-                const segmentX1 =
-                  segment.transform[4];
-
-                const segmentX2 =
-                  segmentX1 +
-                  segment.width;
-
-                const segmentY1 =
-                  segment.transform[5];
-
-                const segmentY2 =
-                  segmentY1 +
-                  segment.height;
+                const segmentX1 = segment.transform[4];
+                const segmentX2 = segmentX1 + segment.width;
+                const segmentY1 = segment.transform[5];
+                const segmentY2 = segmentY1 + segment.height;
 
                 const minX = Math.min(
                   ...items.map(item => item.transform[4])
@@ -1778,8 +1769,8 @@ export function init({
                 }
 
                 /*
-                 * Все items должны находиться на том же baseline
-                 * либо образовывать реальный многострочный preliminaryItem.
+                 * All items must be on the same baseline
+                 * or form a real multi-line preliminaryItem.
                  */
                 const segmentTop = Math.min(
                   segmentY1,
@@ -1822,12 +1813,12 @@ export function init({
                   items[items.length - 1];
 
                 /*
-                 * Создаём synthetic related item,
-                 * представляющий ВСЮ группу PDF.js items.
+                 * We create a synthetic related item,
+                 * representing the ENTIRE group of PDF.js items.
                  *
-                 * chars здесь специально не объединяем:
-                 * при exact match downstream-код не должен
-                 * заходить в range-clipping ветку.
+                 * We deliberately don’t combine the chars here:
+                 * in the case of an exact match, the downstream code should not
+                 * go into the range-clipping branch.
                  */
                 return {
                   ...firstItem,
@@ -1985,16 +1976,10 @@ export function init({
                 }
 
                 /*
-                 * Сначала ищем точное соответствие:
-                 *
+                 * First, we look for an exact match:
                  * segment
                  *     ==
-                 * concatenated related items
-                 *
-                 * Именно этот случай имеет место у:
-                 *
-                 * Cases / of loose / motion / and /
-                 * vomiting reported / from / Village
+                 * combined related elements
                  */
                 for (
                   let start = 0;
@@ -2011,10 +1996,10 @@ export function init({
                     const current = items[end];
 
                     /*
-                     * Не смешиваем разные строки.
+                     * Don't mix different lines.
                      *
-                     * Для одной строки baseline должен быть
-                     * практически одинаковым.
+                     * For a single line, baseline should be
+                     * practically the same.
                      */
                     if (
                       end > start &&
@@ -2039,8 +2024,8 @@ export function init({
                     }
 
                     /*
-                     * Дальше уже точно больше segment,
-                     * поэтому продолжать бессмысленно.
+                     * Further on, it’s definitely more segment,
+                     * so continuing is pointless.
                      */
                     if (
                       !segmentNormalized.startsWith(
@@ -2080,7 +2065,7 @@ export function init({
                   const relY1 = related.transform[5];
                   const relY2 = relY1 + related.height;
 
-                  // Пересечение по X и Y
+                  // Intersection along X and Y
                   const xOverlap = Math.max(0, Math.min(segX2, relX2) - Math.max(segX1, relX1));
                   const yOverlap = Math.max(0, Math.min(segY2, relY2) - Math.max(segY1, relY1));
 
@@ -3027,7 +3012,7 @@ export function init({
 
               }
               //index++; //BUG no synchronization with pageTextContent.items
-              // СБРОС ТОЛЬКО ПОСЛЕ ВСЕХ СЕГМЕНТОВ
+              // RESET ONLY AFTER ALL SEGMENTS
               //current['pathConstructed'] = false;
             }
           }
@@ -3354,10 +3339,10 @@ export function init({
                   let height = Math.max(lastItem.y + lastItemHeight, y + itemHeight) - Math.min(lastItem.y, y);
                   let width = lastItem.y == y ? (((x + itemWidth) < (lastItem.x + lastItemWidth)) ? lastItemWidth : ((x + itemWidth) - lastItem.x)) : Math.max(itemWidth, lastItemWidth);
 
-                  // hasEOL относится к lastItem — если перенос был нужен, но ещё не
-                  // попал в его str/chars (bывает, когда hasEOL проставляется
-                  // постфактум, уже после того как для фрагмента отработал updateChars),
-                  // достраиваем перенос прямо здесь, перед склейкой
+                  // hasEOL refers to lastItem — if the transfer was needed, but not yet
+                  // got into his str/chars (b) when hasEOL is added
+                  // after the fact, after updateChars has worked for the fragment),
+                  // we finish building the transfer right here, before gluing
                   let lastStr = lastItem?.str || '';
                   let needsSyntheticLineBreak = hasEOL && !lastStr.endsWith('\n');
                   if (needsSyntheticLineBreak) { lastStr += '\n'; }
@@ -3729,11 +3714,11 @@ export function init({
               return { edgesInRange, usedCols, textBlocks };
             }
 
-            // проверяем от конца группы к началу: строка считается
-            // "неподкреплённой", если рядом с ней вообще нет реальных edges,
-            // либо использован узкий срез колонок (< 60% от полного набора) —
-            // это ровно сигнатура твоих двух PDF (пустые edges слева / только
-            // правые колонки)
+            // we check from the end of the group to the beginning: the string is considered
+            // "unsupported" if there are no real edges next to it at all,
+            // or a narrow slice of columns was used (< 60% of the full set) —
+            // this is exactly the signature of your two PDFs (empty edges on the left / only
+            // right columns)
             let cutIndex = -1;
             for (let i = 0; i < sortedRows.length - 1; i++) {
               let { edgesInRange, usedCols, textBlocks } = analyzeRange(sortedRows[i], sortedRows[i + 1]);
@@ -3742,8 +3727,8 @@ export function init({
               if (!unsupported) { cutIndex = -1; continue; }
               if (cutIndex === -1) cutIndex = i;
             }
-            // cutIndex теперь указывает на ПЕРВУЮ строку самого длинного
-            // неподкреплённого хвоста, если он тянется до конца группы
+            // cutIndex now points to the FIRST line of the longest
+            // unanchored tail, if it extends to the end of the group
             if (cutIndex === -1) return group;
             let tailIsUnbroken = true;
             for (let j = cutIndex; j < sortedRows.length - 1; j++) {
@@ -3752,7 +3737,7 @@ export function init({
               let unsupported = edgesInRange.length === 0 || (usedCols.size > 0 && usedCols.size < fullColsCount * 0.6);
               if (!unsupported) { tailIsUnbroken = false; break; }
             }
-            if (!tailIsUnbroken || cutIndex < 2) return group; // не режем, если это не хвост или почти вся таблица
+            if (!tailIsUnbroken || cutIndex < 2) return group; // we don’t cut if it’s not the tail or almost the entire table
 
             let cutoffY = sortedRows[cutIndex];
             group.rows = group.rows.filter(y => y >= cutoffY);
@@ -3776,8 +3761,8 @@ export function init({
             let borderSize = group.borderSize || 0.57;
             let edgeTolerance = Math.max(1, borderSize * 3);
 
-            // окно поиска привязано к СОБСТВЕННОМУ шагу строки именно этой
-            // таблицы, а не к произвольной константе и не к странице целиком
+            // the search window is tied to the PROPER row step of this particular table,             
+            // not to an arbitrary constant or the entire page.
             let sortedRows = [...group.rows].sort((a, b) => a - b);
             let rowGaps = sortedRows.slice(1).map((y, i) => y - sortedRows[i]).filter(g => g > 0);
             let modalRowHeight = +findMod(rowGaps) || findAverage(rowGaps) || 20;
@@ -3798,11 +3783,11 @@ export function init({
               byY[key].push(e);
             });
 
-            // структурное доказательство: у САМОЙ этой таблицы (по её
-            // собственным крайним X — левой/правой колонке) должно физически
-            // что-то быть рядом с кандидатной Y. Случайная чужая линия дальше
-            // на странице почти никогда не совпадёт по X с границами именно
-            // этой таблицы.
+            // structural proof: this table ITSELF (according to its
+            // own extreme X — left/right column) must physically
+            // something to be close to candidate Y. Someone else's random line is further away
+            // on a page , the X will almost never match the borders exactly
+            // of this table.
             let hasOwnBoundaryEvidence = (y: number) => {
               return (pageGroup.edges || []).some(e =>
                 isVisibleVector(e) &&
@@ -3826,8 +3811,8 @@ export function init({
               c.y > currentTop && c.y <= bestY &&
               c.x >= groupXMin - 1 && c.x <= groupXMax + 1
             );
-            // под линией нет вообще никакого текста ЭТОЙ таблицы — вероятно,
-            // это не её граница, отказываемся расширять
+            // There is no text in THIS table at all below the line — probably,
+            // this is not its boundary; we refuse to expand it.
             if (!newCoordinates.length) return group;
 
             group.rows = [...new Set([...group.rows, bestY])].sort((a, b) => a - b);
@@ -4110,16 +4095,14 @@ export function init({
             let pageGroups = createGroup({ edges, rectangles, coordinates, tolerance: Infinity });
             let tableGroups = createGroup({ edges, rectangles, coordinates, tolerance });
 
-            console.error('rows from createGroup (до extendGroupTopBorder, которого больше нет):', tableGroups.map(g => g.rows))
-
             tableGroups = splitGroups({ groups: tableGroups, globalGroup: pageGroups[0], downcheck: true });
 
             tableGroups = tableGroups.map(group => extendGroupTopBorder(group, pageGroups[0], lineMaxWidth));
             tableGroups = tableGroups.map(group => trimUnsupportedTrailingRows(group, lineMaxWidth));
 
-            // порядок таблиц в результате должен соответствовать порядку
-            // чтения (сверху вниз на странице), а не порядку, в котором их
-            // случайно построила кластеризация
+            // the order of the tables in the result must match the order
+            // reading (from top to bottom on the page), rather than the order in which they are
+            // I accidentally built clusterization
             tableGroups = [...tableGroups].sort((a, b) => {
               let aTop = a.rows?.length ? Math.max(...a.rows) : (a.y ? a.y[1] : 0);
               let bTop = b.rows?.length ? Math.max(...b.rows) : (b.y ? b.y[1] : 0);
@@ -4254,11 +4237,11 @@ export function init({
 
                         const isSameSideEdges = (() => {
                           /*
-                           * Если мы не можем определить обе границы,
-                           * никаких выводов не делаем.
+                           * If we cannot determine both boundaries,
+                           * we draw no conclusions.
                            *
-                           * Это важно: отсутствие edge != доказательство
-                           * того, что таблица закончилась.
+                           * This is important: the absence of an edge != proof
+                           * that the table is over.
                            */
                           if (
                             textBlockSideEdges.length < 2 ||
@@ -4354,20 +4337,20 @@ export function init({
                   })();
 
                   /*
-         * ---------------------------------------------------------
-         * Forced split по изменению внешних вертикальных границ.
-         *
-         * ВАЖНО:
-         * firstRow нельзя выбрасывать из предыдущего range.
-         *
-         * Поэтому, если firstRow является split-point,
-         * сначала начинается новый range с этой строки.
-         *
-         * Благодаря этому boundary row присутствует
-         * и как нижняя граница предыдущей таблицы,
-         * и как верхняя граница следующей.
-         * ---------------------------------------------------------
-         */
+                  * ---------------------------------------------------------
+                  * Forced split to change external vertical boundaries..
+                  *
+                  * IMPORTANT:
+                  * firstRow cannot be discarded from the previous range..
+                  *
+                  * Therefore, if firstRow is a split-point,
+                  * a new range starts with this row first..
+                  *
+                  * Thanks to this, the boundary row is present.
+                  * and as the lower boundary of the previous table,
+                  * and as the upper boundary of the next one.
+                  * ---------------------------------------------------------
+                  */
                   const forcedSplit =
                     forcedRowSplits.has(firstRow);
 
@@ -4559,13 +4542,13 @@ export function init({
                   }
                 }
 
-                // --- Safety net для nested-rectangles --------------------------------
-                // После исключения вложенных same-fill rects из сетки валидная таблица
-                // может распасться на фрагменты «только header» + «только body», и все
-                // они проваливают header-фильтр выше. Если эта группа не породила ни
-                // одного валидного саб-таблицы, но сама валидна (есть headerRows и
-                // non-header контент) и содержит excluded nested rects — сохраняем
-                // исходную группу вместо потери таблицы.
+                // --- Safety net for nested-rectangles --------------------------------
+                // After excluding nested same-fill rects from the grid, a valid table
+                // may break down into “header only” + “body only” fragments, and all
+                // of them fail the header filter above. If this group did not generate any
+                // valid sub-table, but is itself valid (it has headerRows and
+                // non-header content) and contains excluded nested rects — we keep it.
+                // the original group instead of losing the table.
                 if (prev.length === prevGroupsLength) {
                   const hasExcludedNested = (group.rectangles || [])
                     .some(rect => nestedRectangles.has(rect));
@@ -4671,7 +4654,7 @@ export function init({
                     });
                   });
                 }
-                // --- КОНЕЦ ---
+                // --- END ---
 
                 let headerRows = group['headerRows'] = determineHeaderRows({
                   coordinates: group['coordinates'] || [],
@@ -5190,24 +5173,22 @@ export function init({
             let deletedEdges = [];
 
             /**
-             * Удаляет фантомные крайние строки сетки — строки за пределами реальных
-             * границ таблицы (линий/прямоугольников), появившиеся из-за «висящего»
-             * текста рядом с таблицей (сноски, легенды, подписи).
-             *
-             * Такой текст полностью отделён от ближайшей реальной границы зазором,
-             * тогда как текст настоящих ячеек примыкает к границам своей строки.
-             * Трогаем только таблицы с видимыми горизонтальными линиями: в таблицах
-             * без линий (borderless) крайние строки формируются исключительно
-             * координатами и всегда легитимны.
-             */
+            * Removes the phantom edge lines of the grid — lines outside the real ones
+            * table borders (lines/rectangles) that appeared due to "hanging"
+            * text next to the table (footnotes, legends, captions).
+            * Such text is completely separated from the nearest real border by a gap,
+            * whereas the text of the real cells is adjacent to the borders of its row.
+            * We only touch tables with visible horizontal lines: in tables
+            * without lines (borderless) the outer rows are formed exclusively by coordinates and are always legitimate.
+            */
             function removePhantomBoundaryRows(gridRows) {
               if (!gridRows.length || !horizontalAssuredEdges.length) {
                 return gridRows;
               }
               const realYs = [...new Set(horizontalAssuredEdges.map(edge => edge.y))].sort((a, b) => a - b);
               const edgeTolerance = Math.max(lineMaxWidth, borderSize * 2, 1);
-              // Текст настоящей ячейки может слегка заступать на линию границы,
-              // но не «плавает» в отрыве от неё. Зазор больше — призмер отрывного блока.
+              // The text of this cell may slightly extend beyond the border line,  
+              // but it does not “float” away from it.  The gap is larger — the size of the tear‑off block.
               const detachTolerance = Math.max(borderSize, 0.5);
 
               function hasContent(coordinate) {
@@ -5222,21 +5203,21 @@ export function init({
               }
 
               function isPhantomRow(rowY, inwardDir) {
-                // Крайняя строка фантомна только если за таблицей нет реальной линии
+                // The bottom line is phantom only if there is no real line behind the table.
                 const hasRealEdge = horizontalAssuredEdges.some(
                   edge => Math.abs(edge.y - rowY) <= edgeTolerance
                 );
                 if (hasRealEdge) {
                   return false;
                 }
-                // Ближайшая реальная граница внутрь таблицы
+                // The nearest real boundary inside the table
                 const inwardRealYs = realYs.filter(y => inwardDir > 0 ? y > rowY : y < rowY);
                 if (!inwardRealYs.length) {
                   return false;
                 }
                 const nearestRealY = inwardDir > 0 ? Math.min(...inwardRealYs) : Math.max(...inwardRealYs);
                 const content = (coordinates || []).filter(hasContent);
-                // Контент не должен торчать за пределы крайней строки сетки
+                // The content should not protrude beyond the boundaries of the last row of the grid.
                 const hasOutsideContent = content.some(coordinate => {
                   const box = getBox(coordinate);
                   return inwardDir > 0 ? box.top < rowY : box.bottom > rowY;
@@ -5244,8 +5225,8 @@ export function init({
                 if (hasOutsideContent) {
                   return false;
                 }
-                // Вся полоса между фантомной строкой и реальной границей должна
-                // состоять только из текста, отделённого от реальной границы зазором
+                // The entire strip between the phantom line and the real border should 
+                // consist only of text, separated from the real border by a gap.
                 const bandCoordinates = content.filter(coordinate => {
                   const box = getBox(coordinate);
                   return inwardDir > 0
@@ -5273,15 +5254,15 @@ export function init({
                 }
                 return true;
               });
-              // Не даём вырождать сетку меньше двух строк
+              // We don’t allow the grid to degenerate into fewer than two rows.
               return filtered.length >= 2 ? filtered : gridRows;
             }
 
             rows = removePhantomBoundaryRows(rows);
 
-            // внутри generateVirtualEdges — сразу после removePhantomBoundaryRows(rows)
-            // intersectingElements зависит ТОЛЬКО от textBlock, а не от позиции в сетке.
-            // Считаем один раз на координату вместо пересчёта в каждой ячейке сетки.
+            // inside generateVirtualEdges — immediately after removePhantomBoundaryRows(rows)
+            // intersectingElements depends ONLY on the textBlock, not on the position in the grid.
+            // We calculate it once per coordinate instead of recalculating in each grid cell.
             let verticalIntersectorsByCoordinate = coordinates.map((textBlock) => {
               return verticalAssuredEdges?.filter((vector) => {
                 let res: any = checkRectangleRanges(vector, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true });
@@ -5453,7 +5434,7 @@ export function init({
                 for (let k = 0; k < coordinates.length; k++) {
                   let textBlock = coordinates[k];
 
-                  // let textBlockCenterY = textBlock.y - (textBlock.height || 0) / 2; //!BUG ломает объединение ячеек в twotables_1.pdf
+                  // let textBlockCenterY = textBlock.y - (textBlock.height || 0) / 2; //!BUG breaks cell merging in twotables_1.pdf
                   // if (Math.abs(textBlockCenterY - y) > yProximityTolerance) {
                   //   continue;
                   // }
@@ -6097,13 +6078,13 @@ export function init({
               }
 
               /**
-               * verticles/horizons содержат объекты:
+               * verticles/horizons contain objects:
                *
                * verticles -> { x, lines }
                * horizons  -> { y, lines }
                *
-               * Поэтому здесь намеренно сравниваем координату
-               * со свойством .x/.y.
+               * Therefore, here we deliberately compare the coordinate
+               * with the .x/.y
                */
               function findGridIndex(
                 grid: any[],
@@ -6569,30 +6550,14 @@ export function init({
               }
 
               for (const rectangle of rectangles) {
-                const span =
-                  getRectGridSpan(rectangle);
-
-                /*
-                 * Временная диагностика.
-                 * Здесь теперь для 8 должен появиться кандидат.
-                 */
-                console.error(
-                  '[MERGE FROM FILL CANDIDATE]',
-                  {
-                    rectangle: normalizeRect(rectangle),
-                    span,
-                  }
-                );
+                const span = getRectGridSpan(rectangle);
 
                 if (!span) {
                   continue;
                 }
 
-                const rowSpan =
-                  span.rowEnd - span.rowStart;
-
-                const colSpan =
-                  span.colEnd - span.colStart;
+                const rowSpan = span.rowEnd - span.rowStart;
+                const colSpan = span.colEnd - span.colStart;
 
                 if (
                   rowSpan <= 1 &&
@@ -6619,10 +6584,9 @@ export function init({
                 );
 
                 /*
-                 * У merged rectangle должен быть один anchor-content.
-                 *
-                 * Это отсекает обычные большие фоновые rectangles.
-                 */
+                * The merged rectangle must have one anchor-content.
+                * This cuts off the usual large background rectangles.
+                */
                 if (
                   occupiedCells.length !== 1
                 ) {
@@ -6639,20 +6603,15 @@ export function init({
                   continue;
                 }
 
-                /*
-                 * Проверяем реальные внутренние
-                 * горизонтальные границы.
-                 */
-                let hasInternalHorizontalEdge =
-                  false;
+                //Check the actual internal horizontal boundaries.
+                let hasInternalHorizontalEdge = false;
 
                 for (
                   let row = span.rowStart + 1;
                   row < span.rowEnd;
                   row++
                 ) {
-                  const y =
-                    getHorizontalCoordinate(row);
+                  const y = getHorizontalCoordinate(row);
 
                   if (
                     hasHorizontalEdge(
@@ -6661,8 +6620,7 @@ export function init({
                       span.x2
                     )
                   ) {
-                    hasInternalHorizontalEdge =
-                      true;
+                    hasInternalHorizontalEdge = true;
                     break;
                   }
                 }
@@ -6671,20 +6629,15 @@ export function init({
                   continue;
                 }
 
-                /*
-                 * Проверяем реальные внутренние
-                 * вертикальные границы.
-                 */
-                let hasInternalVerticalEdge =
-                  false;
+                // Check the actual internal vertical boundaries.
+                let hasInternalVerticalEdge = false;
 
                 for (
                   let col = span.colStart + 1;
                   col < span.colEnd;
                   col++
                 ) {
-                  const x =
-                    getVerticalCoordinate(col);
+                  const x = getVerticalCoordinate(col);
 
                   if (
                     hasVerticalEdge(
@@ -6693,8 +6646,7 @@ export function init({
                       span.y2
                     )
                   ) {
-                    hasInternalVerticalEdge =
-                      true;
+                    hasInternalVerticalEdge = true;
                     break;
                   }
                 }
@@ -6735,7 +6687,7 @@ export function init({
 
               Object.keys(merges).forEach(rootKey => {
                 let merge = merges[rootKey];
-                if (merge.width <= 1) return; // не colspan — не трогаем
+                if (merge.width <= 1) return; // not colspan — don’t touch
 
                 let colFrom = merge.col;
                 let colTo = merge.col + merge.width;
@@ -6755,7 +6707,7 @@ export function init({
                   let cx1 = c.x, cx2 = c.x + c.width;
                   return cx1 >= xFrom - 1 && cx2 <= xTo + 1 && c.y <= yTop + 1 && c.y > yBottom - 1;
                 });
-                if (itemsInSpan.length < 2) return; // делить нечего
+                if (itemsInSpan.length < 2) return; // There’s nothing to divide.
 
                 let subColumnsUsed = new Set<number>();
                 let anyItemSpansMultipleColumns = false;
@@ -6772,11 +6724,11 @@ export function init({
                   touchedCols.forEach(c => subColumnsUsed.add(c));
                 });
 
-                // ни один текстовый блок реально не пересекает границу между
-                // колонками, при этом блоки лежат в разных колонках — значит
-                // это НЕ единая объединённая ячейка, а просто отсутствующий
-                // разделитель. Разбиваем colspan-merge на отдельные
-                // rowspan-only merge'и по каждой колонке.
+                // not a single text block actually crosses the border between
+                // columns, while the blocks are in different columns, which means
+                // this is NOT a single merged cell, but just a missing one
+                // separator. Splitting the colspan-merge into separate ones
+                // rowspan-only merge for each column.
                 if (!anyItemSpansMultipleColumns && subColumnsUsed.size > 1) {
                   delete merges[rootKey];
                   (merge.arr || []).forEach((cellKey: string) => {
@@ -7290,9 +7242,9 @@ export function init({
                   let allEdges = uniqueArr([...groupEdges, ...pageEdgesFiltered], ['x', 'y', 'width', 'height']);
                   let hasAnyBorders = groupEdges.length > 0 || pageEdgesFiltered.length > 0;
 
-                  // Тонкие полоски заливки (артефакты отрисовки поверх линий, толщиной ~0.03)
-                  // не должны участвовать в выборе модального цвета рамки таблицы —
-                  // иначе белые «крышки» ячеек перебивают реальный цвет границы.
+                  // Thin fill stripes (rendering artifacts over lines, thickness ~0.03)
+                  // should not be taken into account when selecting the modal table frame color —
+                  // otherwise, the white “covers” of the cells override the actual border color.
                   const minCarrierThickness = 0.1;
                   let tableBorderColor = hasAnyBorders ? findMod(
                     allEdges
@@ -7339,9 +7291,9 @@ export function init({
                       let overlap = Math.max(0, overlapEnd - overlapStart);
                       if (overlap <= 0) continue;
 
-                      // вырожденный (0pt) сегмент — гораздо менее надёжное доказательство
-                      // реальной границы, чем сегмент с настоящей толщиной, даже если
-                      // он тоже залит цветом (часто это дубль того же контура)
+                      // a degenerate (0pt) segment is a much less reliable proof
+                      // a real border than a segment with a real thickness, even if
+                      // it is also filled with color (often it is a duplicate of the same contour)
                       let thickness = isHorizontalIdeal ? edge.height : edge.width;
                       if (thickness > 0.3) { // old: > 0.01
                         realOverlapMap[edgeColor] = (realOverlapMap[edgeColor] || 0) + overlap;
@@ -7359,7 +7311,7 @@ export function init({
 
                       let bestColor: any = sortedColors[0][0];
                       let bestOverlap: any = sortedColors[0][1];
-                      // Порог: 5% длины или минимум 1px
+                      // Threshold: 5% of the length or a minimum of 1px.
                       let threshold = Math.min(idealLength * 0.05, 1);
 
                       if (bestOverlap >= threshold) {

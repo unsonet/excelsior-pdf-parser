@@ -8,7 +8,7 @@ import * as ExcelsiorPdf from '../lib/excelsior-pdf-parser/excelsior-pdf-parser'
     try {
         const pdfjs = await import('pdfjs-dist/legacy/build/pdf.min.mjs');
 
-        const pdfFile = Path.resolve(__dirname, '../../assets/sample-tables-3.pdf');
+        const pdfFile = Path.resolve(__dirname, '../../assets/three_tables_2.pdf');
         const dataBuffer = Fs.readFileSync(pdfFile);
         const dataArray = new Uint8Array(dataBuffer);
 
