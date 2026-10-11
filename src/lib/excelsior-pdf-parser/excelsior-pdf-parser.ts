@@ -2,7 +2,7 @@
 // import * as Path from 'path';
 // import { fileURLToPath } from 'url';
 // import { dirname } from 'path';
-import { getTextDirection, findClosestIndex, parseRGB, getMergedArray, uniqueArr, findMod, findAverage, caseIndependentCompare, splitByIndex, checkRectangleRanges, removeByIndexes, getSplitEdgeRange, getOnePercentOfAbsoluteDifference, typeValue, sortArrayOfObjects, deepSet } from '@unsonet/js-utils'
+import { getTextDirection, findClosestIndex, parseRGB, getMergedArray, uniqueArr, findMod, findAverage, caseIndependentCompare, splitByIndex, checkRectangleRanges, removeByIndexes, getSplitEdgeRange, getOnePercentOfAbsoluteDifference, typeValue, sortArrayOfObjects, deepSet, stringifyPseudoJson, isSequentialIndexRow } from '@unsonet/js-utils'
 
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = dirname(__filename);
@@ -139,12 +139,50 @@ export function init({
 
         console.error(`[DEBUG Page ${pageNum}] filtered items:`, pageTextContent.items.length);
 
+        // Converts an element's (transform, width, height) into a true
+        // axis-aligned bounding box in device coordinates—by projecting onto
+        // the element's actual reading/rising directions (the same logic we
+        // have already applied in extractCoordinates/buildSegment). This is necessary because
+        // both `width` and `height` for ANY text element (including
+        // native elements from `pageTextContent.items` in pdf.js itself)
+        // are measured along the element’s READING direction, not along
+        // the device’s fixed X/Y axes—for horizontal text, this
+        // is the same, but for rotated text (as in rotated.pdf), it is not.
+        function getDeviceBBox(transform, width, height) {
+          const [a, b, c, d, e, f] = transform;
+          const readingLen = Math.hypot(a, b) || 1;
+          const ascentLen = Math.hypot(c, d) || 1;
+          const readingUnit = [a / readingLen, b / readingLen];
+          const ascentUnit = [c / ascentLen, d / ascentLen];
+
+          const corners = [];
+          for (const t of [0, width]) {
+            for (const s of [0, height]) {
+              corners.push([
+                e + readingUnit[0] * t + ascentUnit[0] * s,
+                f + readingUnit[1] * t + ascentUnit[1] * s,
+              ]);
+            }
+          }
+
+          const xs = corners.map(p => p[0]);
+          const ys = corners.map(p => p[1]);
+
+          return {
+            x: Math.min(...xs),
+            y: Math.min(...ys),
+            width: Math.max(...xs) - Math.min(...xs),
+            height: Math.max(...ys) - Math.min(...ys),
+          };
+        }
+
         function getRelatedTextContentItems(element) {
           return pageTextContent.items.filter((item, index) => {
             if (!item) return false;
+            const candidateBox = getDeviceBBox(item.transform, item.width, item.height);
             return (checkRectangleRanges(
               element,
-              { x: item.transform[4], y: item.transform[5], height: item.height, width: item.width },
+              candidateBox,
               { axis: ['x', 'y'], strict: false, strictIntersecting: false }
             ) as Array<any>).every(item => item.inRange)
           });
@@ -269,10 +307,12 @@ export function init({
             fontName: null,
             fontSize: null,
             colorType: null,
+            leading: 0, // string offset for T* in units of text space (= -TL)
           };
 
           let rectangles = [];
           let rectanglesEdges = [];
+          let filledRectangles = [];
 
           function getTextColor() {
             const mode = Number(
@@ -514,6 +554,73 @@ export function init({
               }
             }
             return { ops: outOps, coords: outCoords };
+          }
+
+          // Rectangular paths drawn with both fill and stroke (fillStroke / closeFillStroke).
+          // They are not included in the rectangles (which are fill-only), so we copy them separately:
+          // They are needed only to fill the cells in the output and do not affect the grid in any way.
+          function collectFilledRectangles(
+            ops: number[],
+            coords: number[],
+            fillColor: string | null,
+            strokeColor: string | null
+          ) {
+            if (!fillColor) {
+              return;
+            }
+
+            const coordCountFor = (op: number): number => {
+              if (op === OPS.rectangle) return 4;
+              if (op === OPS.moveTo || op === OPS.lineTo) return 2;
+              if (op === OPS.curveTo) return 6;
+              if (op === OPS.curveTo2 || op === OPS.curveTo3) return 4;
+              return 0;
+            };
+
+            const extracted = extractClosedSubpathRectangles(ops, coords);
+            let coordIdx = 0;
+
+            for (const op of extracted.ops) {
+              if (op !== OPS.rectangle) {
+                coordIdx += coordCountFor(op);
+                continue;
+              }
+
+              let rx = extracted.coords[coordIdx++];
+              let ry = extracted.coords[coordIdx++];
+              const rwidth = extracted.coords[coordIdx++];
+              const rheight = extracted.coords[coordIdx++];
+
+              let x2 = rx + rwidth;
+              let y2 = ry + rheight;
+
+              if (!isDefaultTransformMatrix(transformMatrix)) {
+                [rx, ry] = applyTransformFn([rx, ry], transformMatrix);
+                [x2, y2] = applyTransformFn([x2, y2], transformMatrix);
+              }
+
+              const x = Math.min(rx, x2);
+              const y = Math.min(ry, y2);
+              const width = Math.abs(x2 - rx);
+              const height = Math.abs(y2 - ry);
+
+              // Thin stripes are lines, not fills
+              if (Math.min(width, height) < lineMaxWidth) {
+                continue;
+              }
+
+              // We do not consider the background of the entire page to be a cell fill
+              const isFullPageRect =
+                Math.abs(width - pageWidth) < 1 &&
+                Math.abs(height - pageHeight) < 1 &&
+                Math.abs(x) < 1 &&
+                Math.abs(y) < 1;
+              if (isFullPageRect) {
+                continue;
+              }
+
+              filledRectangles.push({ x, y, width, height, fillColor, strokeColor });
+            }
           }
 
           function normalizeShowTextArgs(args: any): any[] {
@@ -798,6 +905,15 @@ export function init({
               }
 
               let coordIdx = 0;
+              // The path is drawn with a stroke -> the closing segment (closePath) is also visible
+              const strokesPath =
+                isNewFormat &&
+                (paintType === OPS.stroke ||
+                  paintType === OPS.closeStroke ||
+                  paintType === OPS.fillStroke ||
+                  paintType === OPS.eoFillStroke ||
+                  paintType === OPS.closeFillStroke ||
+                  paintType === OPS.closeEOFillStroke);
               for (let j = 0; j < pathOps.length; j++) {
                 const op = pathOps[j];
                 if (op === OPS.rectangle) {
@@ -862,7 +978,10 @@ export function init({
                   let vector = { x: mx, y: my };
                   current['vectorCache'] = vector;
                   current['x'] = mx;
+                  current['x'] = mx;
                   current['y'] = my;
+                  current['subpathStartX'] = mx;
+                  current['subpathStartY'] = my;
                 } else if (op === OPS.lineTo) {
                   if (coordIdx + 1 >= pathCoords.length) break;
                   let lx = pathCoords[coordIdx++];
@@ -931,6 +1050,69 @@ export function init({
                   if (coordIdx + 3 >= pathCoords.length) break;
                   coordIdx += 4; // skipping 4 coordinates
                 } else if (op === OPS.closePath) {
+                  // The closing segment of a subpath, drawn with a dashed line.
+                  // Only horizontal/vertical segments; we leave fill-only paths untouched.
+                  if (
+                    strokesPath &&
+                    Number.isFinite(current['subpathStartX']) &&
+                    Number.isFinite(current['x'])
+                  ) {
+                    const startX = current['subpathStartX'];
+                    const startY = current['subpathStartY'];
+                    const lineWidth = current['lineWidth'];
+                    let closingVector: any = null;
+
+                    if (current['x'] == startX && current['y'] != startY) {
+                      closingVector = {
+                        y: Math.min(startY, current['y']),
+                        x: startX - lineWidth / 2,
+                        width: lineWidth,
+                        height: Math.abs(startY - current['y']),
+                        transform: transformMatrix,
+                      };
+                    } else if (current['y'] == startY && current['x'] != startX) {
+                      closingVector = {
+                        x: Math.min(startX, current['x']),
+                        y: startY - lineWidth / 2,
+                        height: lineWidth,
+                        width: Math.abs(startX - current['x']),
+                        transform: transformMatrix,
+                      };
+                    }
+
+                    if (closingVector) {
+                      // The same protection against lines at the edge of the page as in `lineTo`
+                      const boundaryTolerance = 1.0;
+                      let isPageBoundary = false;
+
+                      if (closingVector.height < lineMaxWidth && closingVector.width > pageWidth * 0.9) {
+                        const centerY = closingVector.y + closingVector.height / 2;
+                        if (
+                          Math.abs(centerY) < boundaryTolerance ||
+                          Math.abs(centerY - pageHeight) < boundaryTolerance
+                        ) {
+                          isPageBoundary = true;
+                        }
+                      }
+                      if (closingVector.width < lineMaxWidth && closingVector.height > pageHeight * 0.9) {
+                        const centerX = closingVector.x + closingVector.width / 2;
+                        if (
+                          Math.abs(centerX) < boundaryTolerance ||
+                          Math.abs(centerX - pageWidth) < boundaryTolerance
+                        ) {
+                          isPageBoundary = true;
+                        }
+                      }
+
+                      if (!isPageBoundary) {
+                        edges.push(closingVector);
+                      }
+
+                      current['x'] = startX;
+                      current['y'] = startY;
+                    }
+                  }
+
                   current['vectorCache'] = null;
                 }
               }
@@ -974,6 +1156,15 @@ export function init({
                       if (!rectangles[vi].strokeColor) rectangles[vi].strokeColor = color;
                     }
                   }
+                }
+                // Closed rectangular path with fill and stroke
+                if (shouldFill && shouldStroke) {
+                  collectFilledRectangles(
+                    pathOps,
+                    pathCoords,
+                    getColor('fill'),
+                    getColor('stroke')
+                  );
                 }
               }
 
@@ -1338,6 +1529,7 @@ export function init({
               // coordinates for any text passing through the TD chain
               // (wrapped/rotated multi-line headings—this is exactly that case).
               var normLeadArgs = normalizeNumericArgs(args);
+              current.leading = normLeadArgs[1] ?? 0;
 
               let textMatrixChanged = textMatrix.toString() != _defaultTransformMatrix.toString();//!BUG without OPS.beginText watermark.pdf (no table)
               if (textMatrixChanged) {
@@ -1364,6 +1556,31 @@ export function init({
               }
               let contentItem = current.contentItem;
               Object.assign(contentItem, { transform: [...contentItem.transform.slice(0, 4), ...(textMatrixChanged ? [textMatrix[4], textMatrix[5]] : normMoveArgs)] });
+            } else if (fn === OPS.setLeading) {
+              // TL: pdf.js stores leading with a “downward shift” sign
+              current.leading = -(normalizeNumericArgs(args)[0] ?? 0);
+
+            } else if (fn === OPS.nextLine) {
+              // T* (as well as “line breaks” in ' and “ statements”): the same as TD(0, -TL),
+              // but the leading value does not change.
+              const lineShift = [0, current.leading || 0];
+              let textMatrixChanged =
+                textMatrix.toString() != _defaultTransformMatrix.toString();
+
+              if (textMatrixChanged) {
+                textMatrix = [
+                  ...textMatrix.slice(0, 4),
+                  ...applyTransformFn(lineShift, textMatrix),
+                ];
+              }
+
+              let contentItem = current.contentItem;
+              Object.assign(contentItem, {
+                transform: [
+                  ...contentItem.transform.slice(0, 4),
+                  ...(textMatrixChanged ? [textMatrix[4], textMatrix[5]] : lineShift),
+                ],
+              });
             } else if (OPS.showText === fn) {
               var fontName = current.fontName;
               var fontSize = current.fontSize;
@@ -1591,18 +1808,26 @@ export function init({
               const tailsMatch = textMatrixTail === contentItemTail;
 
               if (!tailsMatch) {
-                console.error('[FINAL TRANSFORM MISMATCH]', {
+                console.error('[ROTATED FINAL TRANSFORM MISMATCH]', {
                   fontName: current.fontName,
                   textMatrix: [...textMatrix],
                   contentItemTransform: [...preliminaryItem.transform],
-                  textMatrixTail,
-                  contentItemTail,
                 });
               }
 
               let finalTransform = tailsMatch
                 ? preliminaryItem.transform
                 : transformFn(textMatrix, preliminaryItem.transform);
+
+              // Text must be converted to page coordinates in the same way as lines and
+              // rectangles (Trm = Tm × CTM). Previously, CTM was not
+              // applied to text at all. In background_lines_2.pdf, the first page operation
+              // `1 0 0 1 0 792 cm` shifts the entire coordinate system: lines and fills
+              // (CTM applied) ended up at y ≈ 297–719, while text (CTM not applied)
+              // at y≈-534...-31—they never overlapped.
+              if (!isDefaultTransformMatrix(transformMatrix)) {
+                finalTransform = transformFn(transformMatrix, finalTransform);
+              }
 
               // pdfjs 6.x sometimes reports fontSize=1 while the actual scale is stored in textMatrix
               // matrixScaleY used to only look at finalTransform[3], which
@@ -1667,12 +1892,9 @@ export function init({
                 //hasEOL: hasEOL(str)//BUGFIX there are no line breaks in the text
               });
 
-              let relatedTextContentItems = getRelatedTextContentItems({
-                x: preliminaryItem.transform[4],
-                y: preliminaryItem.transform[5],
-                height: preliminaryItem.height,
-                width: preliminaryItem.width
-              }).filter(item => {
+              let relatedTextContentItems = getRelatedTextContentItems(
+                getDeviceBBox(preliminaryItem.transform, preliminaryItem.width, preliminaryItem.height)
+              ).filter(item => {
                 if (!item) return false;
 
                 // 1. String matching
@@ -1739,6 +1961,22 @@ export function init({
                 const endX = glyphs[glyphs.length - 1].x + (glyphs[glyphs.length - 1].charWidth || 0);
                 const width = Math.max(0, endX - startX);
                 const str = glyphs.map((g: any) => g.unicode).join('');
+
+                // startX/endX are measured along the glyph accumulation axis — handleCharsArgs
+                // always writes the distance traveled to the `x` field, as if
+                // the reading direction were always the device’s X-axis. For
+                // horizontal text, this is true, but for rotated text (matrix
+                // of the form [0,s,-s,0]), the actual reading direction is a different axis.
+                // Previously, the offset was unconditionally written to transform[4], which is why
+                // different “words” in a single rotated line received the SAME
+                // X value instead of the same Y value (this is exactly why the subtitles
+                // “1975-79”/“1988-90”/“2011-12” and the line numbers in rotated.pdf were broken).
+                // We project the offset onto the element’s actual reading direction.
+                const [ba, bb] = baseItem.transform;
+                const readingLength = Math.hypot(ba, bb) || 1;
+                const readingUnit = [ba / readingLength, bb / readingLength];
+                const offset = startX - (baseItem.transform[4] ?? 0);
+
                 return {
                   ...baseItem,
                   str,
@@ -1749,8 +1987,8 @@ export function init({
                     baseItem.transform[1],
                     baseItem.transform[2],
                     baseItem.transform[3],
-                    startX,
-                    baseItem.transform[5]
+                    baseItem.transform[4] + offset * readingUnit[0],
+                    baseItem.transform[5] + offset * readingUnit[1]
                   ]
                 };
               }
@@ -2574,26 +2812,53 @@ export function init({
                         .map(char => char.x)
                     );
 
-                    let prevTransform = prev?.str ? prev.transform : _defaultTransformMatrix;
+                    let hasRealPrev = !!prev?.str;
+                    let prevTransform = hasRealPrev ? prev.transform : _defaultTransformMatrix;
 
-                    newPrev = handledValues.charsRangesArrays.flat().length ? {
+                    // chars[0].x is the accumulated distance along the READING DIRECTION
+                    // (handleCharsArgs always writes it to the `x` field, regardless of
+                    // which device axis it actually corresponds to). The old code definitely wrote
+                    // this value to transform[4] (X)—which is correct for horizontal
+                    // text, but for rotated text, the actual reading direction is on a different
+                    // axis. We project the offset onto the actual direction, taking it from
+                    // cur.transform (the same matrix already used in readingUnit
+                    // elsewhere in the file). We change the behavior ONLY when the text is actually
+                    // rotated—for horizontal text, the formula remains exactly
+                    // the same, so as not to alter the already-verified path.
+                    let firstMergedChar = mergedChars[0];
+                    let [readA, readB] = cur.transform;
+                    let readingLength = Math.hypot(readA, readB) || 1;
+                    let readingUnit = [readA / readingLength, readB / readingLength];
+                    let isRotatedReading = Math.abs(readingUnit[1]) > 0.5;
+
+                    let mergedAnchorX, mergedAnchorY;
+                    if (isRotatedReading && firstMergedChar && typeof firstMergedChar.x === 'number') {
+                      let offset = firstMergedChar.x - cur.transform[4];
+                      mergedAnchorX = cur.transform[4] + offset * readingUnit[0];
+                      mergedAnchorY = cur.transform[5] + offset * readingUnit[1];
+                    } else {
+                      mergedAnchorX = firstMergedChar?.x || (hasRealPrev ? Math.min(prevTransform[4], cur.transform[4]) : cur.transform[4]);
+                      mergedAnchorY = hasRealPrev ? Math.max(prevTransform[5], cur.transform[5]) : cur.transform[5];
+                    }
+
+                    newPrev = mergedChars.length ? {
                       str: handledValues?.str,
-                      chars: handledValues.charsRangesArrays.flat(),
+                      chars: mergedChars,
                       fontName: fontName,
                       textColor: prev?.textColor || cur?.textColor || null,
-                      height: Math.max(Math.abs(prevTransform[3]) || curEffectiveHeight, Math.abs(cur.transform[3]) || curEffectiveHeight), //old:cur.transform[3] BUG in (three_tables_2.pdf): old fontSize,
+                      height: Math.max(
+                        hasRealPrev ? (Math.abs(prevTransform[3]) || curEffectiveHeight) : curEffectiveHeight,
+                        Math.abs(cur.transform[3]) || curEffectiveHeight
+                      ),
                       dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(handledValues.str),
-                      width: Number.isFinite(actualRight) &&
-                        Number.isFinite(actualLeft)
-                        ? actualRight - actualLeft
-                        : Math.max(...handledValues.widthRanges),
+                      width: Number.isFinite(actualRight) && Number.isFinite(actualLeft) ? actualRight - actualLeft : Math.max(...handledValues.widthRanges),
                       transform: [
-                        Math.max(prevTransform[0], cur.transform[0]),
-                        Math.max(prevTransform[1], cur.transform[1]),
-                        Math.max(prevTransform[2], cur.transform[2]),
-                        Math.max(prevTransform[3], cur.transform[3]),
-                        handledValues.charsRangesArrays.flat()[0]?.x || Math.min(prevTransform[4], cur.transform[4]),
-                        Math.max(prevTransform[5], cur.transform[5]),
+                        hasRealPrev ? Math.max(prevTransform[0], cur.transform[0]) : cur.transform[0],
+                        hasRealPrev ? Math.max(prevTransform[1], cur.transform[1]) : cur.transform[1],
+                        hasRealPrev ? Math.max(prevTransform[2], cur.transform[2]) : cur.transform[2],
+                        hasRealPrev ? Math.max(prevTransform[3], cur.transform[3]) : cur.transform[3],
+                        mergedAnchorX,
+                        mergedAnchorY,
                       ],
                     } : null;
                     // } else {
@@ -3248,6 +3513,8 @@ export function init({
           // of text on the page before `endText`).
           flushStaleTableContentItemsCache();
 
+
+
           function isRotatedText(item) {
             const transform = item?.transform;
 
@@ -3462,6 +3729,149 @@ export function init({
             return true;
           }
 
+          // === Support for fully rotated (landscape, “sideways”) pages ===
+          //
+          // In agstat.pdf, the 90° rotation applied only to the column header text
+          // (to fit into a narrow column)—the table body remained as regular
+          // horizontal text. In rotated.pdf, the 90° rotation is applied to
+          // the ENTIRE table—headers, body, and numbers—because the table
+          // is physically wider than the page and the document’s author rotated it sideways.
+          //
+          // Instead of rewriting every function for constructing
+          // grid, we “unrotate” the entire page geometry back to
+          // its normal orientation BEFORE it enters the rest of the pipeline—
+          // then all subsequent logic (which already works perfectly for
+          // normal orientation) runs without any changes.
+
+          function isRotatedTextItem(item) {
+            const t = item?.transform;
+            if (!t || t.length < 4) return false;
+            return (
+              Math.abs(t[0]) < 0.01 &&
+              Math.abs(t[3]) < 0.01 &&
+              (Math.abs(t[1]) > 0.01 || Math.abs(t[2]) > 0.01)
+            );
+          }
+
+          function detectGlobalPageRotation() {
+            const realTextItems = tableContentItems.filter(
+              item => item && typeof item.str === 'string' && item.str.trim()
+            );
+
+            if (realTextItems.length < 5) return null;
+
+            const rotatedItems = realTextItems.filter(isRotatedTextItem);
+
+            if (rotatedItems.length < realTextItems.length * 0.9) {
+              // A standard page where only part of the text is rotated (such as
+              // the headings in agstat.pdf)—a global rotation isn't needed here.
+              return null;
+            }
+
+            // The sign b (transform[1]) determines the direction of rotation:
+            // [0, +s, -s, 0, ...] — a +90° rotation (counterclockwise),
+            // [0, -s, +s, 0, ...] — a -90° rotation (clockwise).
+            let positiveCount = 0;
+            let negativeCount = 0;
+            for (const item of rotatedItems) {
+              if (item.transform[1] > 0) positiveCount++;
+              else if (item.transform[1] < 0) negativeCount++;
+            }
+
+            const direction = positiveCount >= negativeCount ? 1 : -1;
+
+            console.error('[GLOBAL ROTATION DETECT]', {
+              totalRealTextItems: realTextItems.length,
+              rotatedItems: rotatedItems.length,
+              positiveCount,
+              negativeCount,
+              direction,
+            });
+
+            return direction;
+          }
+
+          const globalRotationDirection = detectGlobalPageRotation();
+
+          if (globalRotationDirection) {
+            // direction === 1  → the content is rotated by +90°; rotate it by -90°: (x,y) → (y,-x)
+            // direction === -1 → the content is rotated by -90°; rotate it by +90°: (x,y) → (-y,x)
+            const rotatePoint = (x, y) =>
+              globalRotationDirection === 1 ? [y, -x] : [-y, x];
+
+            // Calculate the bounding box AFTER rotation (but before translation), so that we can then
+            // translate everything into the usual positive coordinate range of the page.
+            let minX = Infinity, minY = Infinity;
+            const allRawPoints = [];
+
+            for (const e of edges) {
+              allRawPoints.push([e.x, e.y], [e.x + e.width, e.y + e.height]);
+            }
+            for (const r of rectangles) {
+              allRawPoints.push([r.x, r.y], [r.x + r.width, r.y + r.height]);
+            }
+            for (const item of tableContentItems) {
+              if (!item?.transform) continue;
+              allRawPoints.push([item.transform[4], item.transform[5]]);
+            }
+
+            for (const [x, y] of allRawPoints) {
+              const [rx, ry] = rotatePoint(x, y);
+              if (rx < minX) minX = rx;
+              if (ry < minY) minY = ry;
+            }
+
+            const shiftX = Number.isFinite(minX) ? -minX : 0;
+            const shiftY = Number.isFinite(minY) ? -minY : 0;
+
+            function transformPoint(x, y) {
+              const [rx, ry] = rotatePoint(x, y);
+              return [rx + shiftX, ry + shiftY];
+            }
+
+            function transformRect(rect) {
+              const [x1, y1] = transformPoint(rect.x, rect.y);
+              const [x2, y2] = transformPoint(rect.x + rect.width, rect.y + rect.height);
+              rect.x = Math.min(x1, x2);
+              rect.y = Math.min(y1, y2);
+              rect.width = Math.abs(x2 - x1);
+              rect.height = Math.abs(y2 - y1);
+            }
+
+            edges.forEach(transformRect);
+            rectangles.forEach(transformRect);
+
+            for (const item of tableContentItems) {
+              if (!item?.transform) continue;
+              const [a, b, c, d, e, f] = item.transform;
+
+              // Linear part: composition of the unfolding matrix with an
+              // existing text matrix (see the explanation for the formula).
+              let newA, newB, newC, newD;
+              if (globalRotationDirection === 1) {
+                newA = b; newB = -a;
+                newC = d; newD = -c;
+              } else {
+                newA = -b; newB = a;
+                newC = -d; newD = c;
+              }
+
+              const [newE, newF] = transformPoint(e, f);
+              item.transform = [newA, newB, newC, newD, newE, newF];
+            }
+
+            console.error('[GLOBAL ROTATION APPLIED]', {
+              direction: globalRotationDirection,
+              shiftX,
+              shiftY,
+              sampleTextItems: tableContentItems
+                .filter(i => i?.str?.trim())
+                .slice(0, 5)
+                .map(i => ({ str: i.str, transform: i.transform })),
+              sampleEdges: edges.slice(0, 3),
+            });
+          }
+
           for (let index = 1; index < tableContentItems.length; index++) {
             const previousItem = tableContentItems[index - 1];
             const currentItem = tableContentItems[index];
@@ -3639,19 +4049,171 @@ export function init({
                   1;
 
                 const lineTolerance = Math.max(Math.min(previousHeight, currentHeight) * 0.6, 2);
+                const isSameLine = lineDistance <= lineTolerance;
 
-                previousItem.hasEOT = false;
+                // For a pair on a SINGLE line, the overlap should be only
+                // a slight “touch” (due to measurement error in the width
+                // of the glyphs), not significant—otherwise it is almost certainly
+                // simply two adjacent cells in different columns with a slightly
+                // overestimated width (such as “8297 ” and “2161” in
+                // rotated.pdf, an overlap of 14pt out of a 24–27pt width), rather than
+                // a single logical unit broken into fragments. For a pair
+                // on DIFFERENT lines (a true line break within
+                // a single cell), a large overlap is normal: the column
+                // must align horizontally between its own
+                // wrapped lines, so we do not
+                // apply this condition there.
+                const narrowerWidth = Math.min(previousItem.width || 0, currentItem.width || 0);
+                const overlapIsSubstantial = narrowerWidth > 0 && xOverlap > narrowerWidth * 0.3;
 
-                if (lineDistance > lineTolerance) {
-                  previousItem.hasEOL = true;
+                if (isSameLine && overlapIsSubstantial) {
+                  // Different adjacent cells—we'll leave `hasEOT` as determined
+                  // by the main pipeline; we won't change it.
                 } else {
-                  previousItem.hasEOL = false;
+                  previousItem.hasEOT = false;
+                  previousItem.hasEOL = lineDistance > lineTolerance;
                 }
               }
             }
           }
 
-          console.log(`[DIAG T]`, tableContentItems);
+          const tableContentItemsStr = stringifyPseudoJson(tableContentItems, {
+            // 1. keyMap
+            keyMap: {
+              index: 'i',
+              str: 's',
+              width: 'w',
+              height: 'h',
+              fillColor: 'fc',
+              textColor: 'tc',
+              fontName: 'fn',
+              strokeColor: 'sc',
+              transform: 't',
+            },
+
+            // 2. valueMap
+            valueMap: {
+              textColor: {
+                'rgb(255,255,255)': '#fff',
+                'rgb(0,0,0)': '#000',
+              },
+
+              fillColor: {
+                'rgb(255,255,255)': '#fff',
+                'rgb(0,0,0)': '#000',
+              },
+            },
+
+            // 3. Quote only values of `str`
+            quoteValues: new Set([
+              'str',
+            ]),
+
+            // 4. Completely remove `chars`
+            exclude: new Set([
+              'chars', 'altStr', 'dir'
+            ]),
+
+            // 5. Keep at most 3 decimal digits
+            numberDigits: 3,
+          });
+
+          // Geometric cell boundary for horizontal text.
+          // Does not depend on drawn lines: two adjacent fragments cannot
+          // be a single cell if the space between them on the same line is greater than
+          // 1.5 times the font height, and the fragment on the new line does not have a horizontal
+          // overlap with the already accumulated block, or if there is an empty space between them
+          // greater than 1.25 times the font height.
+          {
+            const isPlainHorizontalText = (item) =>
+              !!item?.transform &&
+              !item.imageName &&
+              (item.str || '').trim().length > 0 &&
+              isHorizontalText(item) &&
+              !isRotatedText(item);
+
+            const getBox = (item) => {
+              const t = item.transform;
+              const h = Math.abs(t[3]) || item.height || 1;
+              return {
+                left: t[4],
+                right: t[4] + (item.width || 0),
+                bottom: t[5],
+                top: t[5] + h,
+                h
+              };
+            };
+
+            let chain = null; // combined bounding box of fragments with the last boundary hasEOT
+
+            for (let index = 1; index < tableContentItems.length; index++) {
+              const previousItem = tableContentItems[index - 1];
+              const currentItem = tableContentItems[index];
+
+              if (!isPlainHorizontalText(previousItem) || !isPlainHorizontalText(currentItem)) {
+                chain = null;
+                continue;
+              }
+
+              const previousBox = getBox(previousItem);
+              const currentBox = getBox(currentItem);
+
+              if (previousItem.hasEOT) {
+                chain = { ...currentBox };
+                continue;
+              }
+
+              if (!chain) {
+                chain = { ...previousBox };
+              }
+
+              const maxHeight = Math.max(previousBox.h, currentBox.h);
+              const sameLine =
+                Math.abs(currentBox.bottom - previousBox.bottom) <=
+                Math.max(Math.min(previousBox.h, currentBox.h) * 0.6, 2);
+
+              let isSeparateCell;
+
+              if (sameLine) {
+                const horizontalGap = Math.max(
+                  0,
+                  currentBox.left - previousBox.right,
+                  previousBox.left - currentBox.right
+                );
+                isSeparateCell = horizontalGap > maxHeight * 1.5;
+              } else {
+                const horizontalOverlap =
+                  Math.min(chain.right, currentBox.right) -
+                  Math.max(chain.left, currentBox.left);
+
+                const verticalGap =
+                  currentBox.bottom >= chain.top
+                    ? currentBox.bottom - chain.top
+                    : currentBox.top <= chain.bottom
+                      ? chain.bottom - currentBox.top
+                      : 0;
+
+                isSeparateCell =
+                  horizontalOverlap < 0 ||
+                  verticalGap > maxHeight * 1.25;
+              }
+
+              if (isSeparateCell) {
+                previousItem.hasEOT = true;
+                chain = { ...currentBox };
+              } else {
+                chain = {
+                  left: Math.min(chain.left, currentBox.left),
+                  right: Math.max(chain.right, currentBox.right),
+                  bottom: Math.min(chain.bottom, currentBox.bottom),
+                  top: Math.max(chain.top, currentBox.top),
+                  h: maxHeight
+                };
+              }
+            }
+          }
+
+          console.log(`[DIAG T]`, tableContentItems.length, tableContentItemsStr);
           console.error(`[DIAG Page ${pageNum}] constructPath hits:`, constructPathCount);
           console.error(`[DIAG Page ${pageNum}] edges after loop:`, edges.length, 'rectangles:', rectangles.length);
 
@@ -4057,12 +4619,37 @@ export function init({
                     x = Math.min(lastItem.x, x);
                   }
 
+                  // Sometimes the PDF renders several lines of a single logical cell NOT in
+                  // the visual top-to-bottom order (the narrow column “I”/‘UI’/“T” in
+                  // background_lines_2.pdf is rendered in the order “UI”, “T”, ‘I’, even though “I”
+                  // is physically located above “UI,” which is above “T”). Previously, a new
+                  // fragment was always appended to the END of the accumulated line—that is,
+                  // strictly in the order of appearance in the content stream, rather than in the order
+                  // of its actual position on the page. We track the topmost Y value
+                  // that has already been included in the accumulated cell, and if the new fragment is physically
+                  // above it—we insert it at the beginning rather than at the end.
+                  let accumulatedTopY = lastItem.__mergedTopY ?? lastItem.y;
+                  let newItemIsAboveAccumulated = y > accumulatedTopY + 0.5;
+
                   let lastStr = lastItem?.str || '';
-                  let needsSyntheticLineBreak = hasEOL && !lastStr.endsWith('\n');
-                  if (needsSyntheticLineBreak) { lastStr += '\n'; }
-                  let str = [lastStr, item?.str || ''].join('');
-                  let syntheticBreakChar = needsSyntheticLineBreak ? [{ originalCharCode: 10, fontChar: "\n", unicode: "\n", accent: null, width: 0, isSpace: false, isInFont: true, isLineBreak: true, }] : [];
-                  let chars = [...(lastItem.chars || []), ...syntheticBreakChar, ...(item.chars || [])];
+                  let itemStr = item?.str || '';
+                  let str, chars;
+
+                  if (newItemIsAboveAccumulated) {
+                    let needsLeadingBreak = hasEOL && !itemStr.endsWith('\n');
+                    if (needsLeadingBreak) { itemStr += '\n'; }
+                    str = itemStr + lastStr;
+                    let leadingBreakChar = needsLeadingBreak ? [{ originalCharCode: 10, fontChar: "\n", unicode: "\n", accent: null, width: 0, isSpace: false, isInFont: true, isLineBreak: true, }] : [];
+                    chars = [...(item.chars || []), ...leadingBreakChar, ...(lastItem.chars || [])];
+                  } else {
+                    let needsSyntheticLineBreak = hasEOL && !lastStr.endsWith('\n');
+                    if (needsSyntheticLineBreak) { lastStr += '\n'; }
+                    str = [lastStr, itemStr].join('');
+                    let syntheticBreakChar = needsSyntheticLineBreak ? [{ originalCharCode: 10, fontChar: "\n", unicode: "\n", accent: null, width: 0, isSpace: false, isInFont: true, isLineBreak: true, }] : [];
+                    chars = [...(lastItem.chars || []), ...syntheticBreakChar, ...(item.chars || [])];
+                  }
+
+                  lastItem.__mergedTopY = Math.max(accumulatedTopY, y);
                   x = Math.min(lastItem.x, x);
 
                   Object.assign(lastItem, {
@@ -4184,52 +4771,208 @@ export function init({
             return { ...item, transform: [t[0], t[1], t[2], t[3], t[5], t[4]] };
           }
 
+
           function isCaptionBlock(options) {
-            let { block, edges, coordinates, lineMaxWidth } = options;
+            const {
+              block,
+              edges,
+              coordinates,
+              lineMaxWidth,
+            } = options;
 
-            if (!block || !edges?.length || !coordinates?.length) return false;
+            if (!block || !edges?.length || !coordinates?.length) {
+              return false;
+            }
 
-            // Vertical table separators
-            let verticalEdges = edges.filter(e =>
-              isVisibleVector(e) && e.width < lineMaxWidth && e.height > lineMaxWidth
-            );
-
-            if (!verticalEdges.length) return false;
-
-            // Table boundaries along the Y axis
-            let tableYMin = Math.min(...coordinates.map(c => c.y));
-            let tableYMax = Math.max(...coordinates.map(c => c.y + c.height));
-
-            // If a block has a horizontal border at the top or bottom, it’s a cell, not a caption
-            let horizontalEdges = edges.filter(e =>
-              isVisibleVector(e) && e.height < lineMaxWidth && e.width > lineMaxWidth
-            );
-
-            let blockHasHorizontalBorder = horizontalEdges.some(e => {
-              let yMatchTop = Math.abs(e.y - block.y) < lineMaxWidth * 2;
-              let yMatchBottom = Math.abs(e.y - (block.y + block.height)) < lineMaxWidth * 2;
-              let xOverlap = !(e.x + e.width < block.x || e.x > block.x + block.width);
-              return (yMatchTop || yMatchBottom) && xOverlap;
+            const verticalEdges = edges.filter(edge => {
+              return (
+                isVisibleVector(edge) &&
+                edge.width < lineMaxWidth &&
+                edge.height > lineMaxWidth
+              );
             });
 
-            // If the block is bounded by horizontal lines, it is part of the table (merged header), not a caption.
-            if (blockHasHorizontalBorder) return false;
+            if (!verticalEdges.length) {
+              return false;
+            }
 
+            // Exclude the candidate itself when calculating the content bounds.
+            const otherCoordinates = coordinates.filter(item => {
+              if (!item?.str?.trim()) {
+                return false;
+              }
 
-            // Lines intersecting the interior of the block along X and the table along Y
-            let dividersInBlock = filterBlocks(verticalEdges, {
-              x: [block.x + 1, block.x + block.width - 1],
-              y: [tableYMin, tableYMax],
-              strictIntersecting: true
+              if (item === block) {
+                return false;
+              }
+
+              if (
+                block.index != null &&
+                item.index === block.index
+              ) {
+                return false;
+              }
+
+              return true;
             });
 
-            let uniqueY = [...new Set(dividersInBlock.map(item => item.y))];
+            if (!otherCoordinates.length) {
+              return false;
+            }
+
+            const getVerticalBounds = item => {
+              const y1 = item.y;
+              const y2 = item.y + item.height;
+
+              return {
+                minY: Math.min(y1, y2),
+                maxY: Math.max(y1, y2),
+              };
+            };
+
+            const otherBounds = otherCoordinates.map(getVerticalBounds);
+
+            const contentMinY = Math.min(
+              ...otherBounds.map(bounds => bounds.minY)
+            );
+
+            const contentMaxY = Math.max(
+              ...otherBounds.map(bounds => bounds.maxY)
+            );
+
+            const blockBounds = getVerticalBounds(block);
+            const verticalGapTolerance = Math.max(
+              lineMaxWidth * 0.5,
+              Math.min(Math.abs(block.height || 0), 10) * 0.5
+            );
+
+            // A caption below or above the table must be separated from
+            // the remaining text, not merely aligned with its outer border.
+            const outsideContentRange =
+              blockBounds.maxY < contentMinY - verticalGapTolerance ||
+              blockBounds.minY > contentMaxY + verticalGapTolerance;
+
+            const horizontalEdges = edges.filter(edge => {
+              return (
+                isVisibleVector(edge) &&
+                edge.height < lineMaxWidth &&
+                edge.width > lineMaxWidth
+              );
+            });
+
+            const overlapsBlockX = edge => {
+              return (
+                edge.x <= block.x + block.width &&
+                edge.x + edge.width >= block.x
+              );
+            };
+
+            // Preserve the previous behaviour for blocks inside the
+            // content range. A single nearby border must not, however,
+            // prevent an outside caption from being detected.
+            const blockHasHorizontalBorder = horizontalEdges.some(edge => {
+              const yMatchTop =
+                Math.abs(edge.y - block.y) < lineMaxWidth * 2;
+
+              const yMatchBottom =
+                Math.abs(
+                  edge.y - (block.y + block.height)
+                ) < lineMaxWidth * 2;
+
+              return (
+                (yMatchTop || yMatchBottom) &&
+                overlapsBlockX(edge)
+              );
+            });
+
+            const dividersInBlock = filterBlocks(
+              verticalEdges,
+              {
+                x: [
+                  block.x + 1,
+                  block.x + block.width - 1,
+                ],
+                y: [
+                  contentMinY,
+                  contentMaxY,
+                ],
+                strictIntersecting: true,
+              }
+            );
+
+            // Count distinct column separators, not their Y coordinates.
+            // Several line segments at the same X represent one separator.
+            const uniqueDividerXs = [
+              ...new Set(
+                dividersInBlock.map(edge => {
+                  return Math.round(edge.x * 10) / 10;
+                })
+              ),
+            ];
+
+            if (outsideContentRange) {
+              const blockCenterY =
+                (blockBounds.minY + blockBounds.maxY) / 2;
+
+              const borderSideTolerance = Math.max(
+                1,
+                Math.min(
+                  lineMaxWidth * 0.5,
+                  Math.abs(block.height || 0) * 0.25
+                )
+              );
+
+              const hasHorizontalBorderAbove = horizontalEdges.some(edge => {
+                const edgeCenterY = edge.y + edge.height / 2;
+
+                return (
+                  overlapsBlockX(edge) &&
+                  edgeCenterY > blockCenterY + borderSideTolerance
+                );
+              });
+
+              const hasHorizontalBorderBelow = horizontalEdges.some(edge => {
+                const edgeCenterY = edge.y + edge.height / 2;
+
+                return (
+                  overlapsBlockX(edge) &&
+                  edgeCenterY < blockCenterY - borderSideTolerance
+                );
+              });
+
+              // A genuine table cell is enclosed by boundaries on both
+              // sides. A caption outside the table usually has only the
+              // nearby outer table boundary on one side.
+              if (
+                hasHorizontalBorderAbove &&
+                hasHorizontalBorderBelow
+              ) {
+                return false;
+              }
+
+              // A detached text block crossing multiple columns is a
+              // caption, not content for the cell containing its left edge.
+              return uniqueDividerXs.length >= 2;
+            }
+
+            if (blockHasHorizontalBorder) {
+              return false;
+            }
+
+            // Keep the original heuristic for candidates within the content
+            // range to avoid changing existing table-header behaviour.
+            const uniqueY = [
+              ...new Set(
+                dividersInBlock.map(edge => edge.y)
+              ),
+            ];
 
             return uniqueY.length >= 2;
           }
 
+
           function determineHeaderRows(options) {
-            let { coordinates, rows, edges, rectangles, lineMaxWidth, customConditionFn } = options;
+            let { coordinates, rows, edges, rectangles, lineMaxWidth, customConditionFn, cols } = options;
 
             function isHeaderIndicator(str) {
               str = str?.trim() || '';
@@ -4287,6 +5030,26 @@ export function init({
               }
             };
 
+            function getOccupiedColumnBins(blocks, colsArr) {
+              const sortedCols = [...(colsArr || [])].sort((a, b) => a - b);
+              const bins = new Set();
+              (blocks || []).forEach(block => {
+                if (!block) return;
+                const centerX = (block.x ?? 0) + (block.width || 0) / 2;
+                for (let ci = 0; ci < sortedCols.length - 1; ci++) {
+                  if (centerX >= sortedCols[ci] && centerX < sortedCols[ci + 1]) {
+                    bins.add(ci);
+                    break;
+                  }
+                }
+              });
+              return bins;
+            }
+
+
+
+            let cumulativeOccupiedCols = new Set();
+
             let headerRows = rows.sort((a, b) => b - a).reduce((prev, item, index, arr) => {
               let nextItem = arr[index + 1];
               if (nextItem) {
@@ -4330,9 +5093,39 @@ export function init({
 
                 let currentHeaderCombo = headersCombo[headersCombo.length - 1];
                 let lastTruthHeaderCombo = headersCombo?.findLast(item => item.isHeader == true);
-                let hasDuplicateCopies = currentHeaderCombo ? textBlocks.some(item => currentHeaderCombo.textBlocks.map(item => JSON.stringify(item)).includes(JSON.stringify(item))) : false; //contains duplicate header values
+                let hasDuplicateCopies = currentHeaderCombo ? textBlocks.some(item => currentHeaderCombo.textBlocks.map(item => JSON.stringify(item)).includes(JSON.stringify(item))) : false;//contains duplicate header values
+
+                // The number of text blocks in a row is an unreliable indicator that the “header”
+                // has ended: a rowspan cell (e.g., “State”) may fall within
+                // the textBlocks of only ONE of its rows—depending on where
+                // the text is physically rendered within the tall merged cell.
+                // Therefore, adjacent header rows sometimes have FEWER raw elements
+                // than the data row following them, and the old “count
+                // is increasing” check erroneously continued to treat the data row as part of the header.
+                //
+                // Instead of the number of elements, we compare which GRID COLUMNS are occupied:
+                // if the already confirmed part of the header (cumulatively) covers ALL
+                // columns, and the next row BY ITSELF (without taking previous rows into account)
+                // also covers ALL columns—then there is nothing left to split; this is
+                // data. The exception is an enumeration row (1,2,3... / a,b,c... /
+                // i,ii,iii...), which is often used simply for navigating
+                // columns and should not conclude the header.
+                let hasColsInfo = Array.isArray(cols) && cols.length > 1;
+                let rowOccupiedCols = hasColsInfo ? getOccupiedColumnBins(textBlocks, cols) : null;
+                let fullColsCount = hasColsInfo ? (cols.length - 1) : 0;
+
+                let columnsSignalHeaderEnded = !!(
+                  hasColsInfo &&
+                  currentHeaderCombo != undefined &&
+                  lastTruthHeaderCombo &&
+                  (currentHeaderCombo == lastTruthHeaderCombo) &&
+                  cumulativeOccupiedCols.size >= fullColsCount &&
+                  rowOccupiedCols.size >= fullColsCount &&
+                  !isSequentialIndexRow(textBlocks.map(b => (b?.str || '').trim()).filter(Boolean))
+                );
+
                 if (
-                  textBlocks?.length &&
+                  textBlocks?.length && !columnsSignalHeaderEnded &&
                   (//The number of text items in the current row is greater than the number of items in the previous row (merged headings indicator)
                     currentHeaderCombo != undefined &&
                       lastTruthHeaderCombo &&
@@ -4341,6 +5134,8 @@ export function init({
                       : true
                   )
                 ) {
+
+
                   let propertiesCounter = countProperties(textBlocks);
                   let currentTargetProperties = targetProperties.filter(prop => Object.keys(propertiesCounter?.[prop] || {})?.length > 1);
                   let headerConditions = [];
@@ -4413,22 +5208,76 @@ export function init({
                     let spansBeyondThisRow = (textBlock?.height || 0) > rowRangeHeight * 1.1;
 
                     let hasMajorityStyle = true;
-                    if (currentTargetProperties.length && !spansBeyondThisRow) {
-                      hasMajorityStyle = currentTargetProperties.every(prop => {
-                        let weight = 1 - targetPropertiesWeight[prop];
-                        let total = Number(
-                          Object.values(propertiesCounter?.[prop] || {})
-                            .reduce((p, c) => Number(p) + Number(c), 0) || 0
+
+                    if (!spansBeyondThisRow) {
+                      if (currentTargetProperties.length) {
+                        hasMajorityStyle = currentTargetProperties.every(prop => {
+                          let weight = 1 - targetPropertiesWeight[prop];
+                          let total = Number(
+                            Object.values(propertiesCounter?.[prop] || {})
+                              .reduce((p, c) => Number(p) + Number(c), 0) || 0
+                          );
+                          let count = Number(propertiesCounter?.[prop]?.[textBlock?.[prop]] || 0);
+                          return count > (total * (weight || 1));//the number of cells with target properties exceeds the number of cells with other properties
+                        });
+                      } else if (targetProperties.length) {
+                        // currentTargetProperties is empty: within THIS line, none of the
+                        // globally variable properties (font/height/...) change—
+                        // the line is completely uniform. Previously, this left hasMajorityStyle
+                        // set to true “by default” (there was nothing to check), which meant
+                        // that ANY uniform line of DATA (and most of them are—one
+                        // font and one height for all its cells) automatically passed
+                        // this check, as if it were typical for a header. Instead of the default,
+                        // we compare the row’s single style against the GLOBAL trend across the
+                        // entire table: if the row’s style matches the most frequent style in
+                        // the entire table—this is a sign of regular data, not a header.
+                        hasMajorityStyle = targetProperties.some(
+                          prop => textBlock?.[prop] !== modeProperties[prop]
                         );
-                        let count = Number(propertiesCounter?.[prop]?.[textBlock?.[prop]] || 0);
-                        return count > (total * (weight || 1));//the number of cells with target properties exceeds the number of cells with other properties
-                      });
+                      }
                     }
 
                     let hasBottomBorder = true;
                     if (edges || rectangles) {
-                      hasBottomBorder = [bottomElements[0], bottomElements[1]]
-                        .some(item => ['rectangle', 'edge'].includes(item?.vectorType));
+                      hasBottomBorder = [bottomElements[0], bottomElements[1]].some(item =>
+                        ['rectangle', 'edge'].includes(item?.vectorType)
+                      );
+
+                      // Multi-line header cell. The second line of this
+                      // cell appears below the first line (text within the current table row), and the border follows it.
+                      if (!hasBottomBorder) {
+                        const rowBottom = range[1] - medianBorderWidth * 2;
+
+                        const isCurrentRowText = (item: any) =>
+                          item?.vectorType === 'coordinate' &&
+                          (item.index === textBlock.index || item.y >= rowBottom);
+
+                        const hasStackedLines = bottomElements.some(
+                          (item: any) => isCurrentRowText(item) && item.index !== textBlock.index
+                        );
+
+                        if (hasStackedLines) {
+                          const firstOutsideRow = bottomElements.find(
+                            (item: any) => !isCurrentRowText(item)
+                          );
+                          hasBottomBorder = ['rectangle', 'edge'].includes(firstOutsideRow?.vectorType);
+                        }
+                      }
+                    }
+                    if (range && range[0] >= 408 && range[0] <= 431) {
+                      console.error('[HASBOTTOMBORDER TRACE]', {
+                        range: range.join('-'),
+                        textBlockStr: textBlock?.str,
+                        textBlockY: textBlock?.y,
+                        hasBottomBorder,
+                        bottomElements: bottomElements.slice(0, 2).map(e => e && ({
+                          vectorType: e.vectorType,
+                          x: e.x,
+                          y: e.y,
+                          width: e.width,
+                          height: e.height
+                        })),
+                      });
                     }
 
                     let isIndicator = isHeaderIndicator(textBlock?.['str']);//cell value corresponds to a word in the indicator
@@ -4465,18 +5314,20 @@ export function init({
                   if (isHeader) {
                     prev[rangeStr] = textBlocks;
                     if (headersCombo.length) {
-                      headersCombo.forEach(item => {
-                        prev[item.rangeStr] = item.textBlocks;
-                        item.isHeader = true;
-                      });
+                      headersCombo.forEach(item => { prev[item.rangeStr] = item.textBlocks; item.isHeader = true; });
                     }
                     headersCombo.push({ rangeStr, textBlocks, isHeader });
+                    if (hasColsInfo && rowOccupiedCols) {
+                      rowOccupiedCols.forEach(c => cumulativeOccupiedCols.add(c));
+                    }
                   }
+
                   //old:headersCombo.push({ rangeStr, textBlocks, isHeader });//BUG 06-sales-order
                 } else {
                   if (!textBlocks?.length) {
                     setDefaultHeaderRows(headersCombo);
                     headersCombo = [];
+                    cumulativeOccupiedCols = new Set();
                   }
                 }
               }
@@ -4596,9 +5447,14 @@ export function init({
             group.coordinates = (group.coordinates || []).filter(c => c.y >= cutoffY - 1);
             group.edges = (group.edges || []).filter(e => e.y >= cutoffY - 1);
             group.rectangles = (group.rectangles || []).filter(r => r.y >= cutoffY - 1);
+
             group.headerRows = determineHeaderRows({
-              coordinates: group.coordinates || [], edges: group.edges || [],
-              rectangles: group.rectangles || [], rows: group.rows || [], lineMaxWidth,
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: group.rows || [],
+              cols: group.cols || [],
+              lineMaxWidth,
             });
             return group;
           }
@@ -4946,7 +5802,7 @@ export function init({
 
             let pageGroups = createGroup({ edges, rectangles, coordinates, tolerance: Infinity });
             let tableGroups = createGroup({ edges, rectangles, coordinates, tolerance });
-
+            console.error('[GROUPS BEFORE SPLIT]', tableGroups.length, tolerance);
             tableGroups = splitGroups({ groups: tableGroups, globalGroup: pageGroups[0], downcheck: true });
 
             // Reconstruct missing row boundaries
@@ -5612,6 +6468,86 @@ export function init({
                   return prev;
                 }, []);
 
+
+
+                // A row containing a single block of text is considered a table separator. But
+                // in background_lines_2.pdf, the subheading lines (colspan,
+                // yellow fill “MARGINAL (BELOW 1.0)”, etc.) appear inside
+                // the grid, and the table was split into pieces along each of them.
+                // If a vertical border (drawn with separate, adjoining
+                // segments) extends nearly the entire height of the group’s edges, this is a single
+                // continuous grid. In that case, we retain a single range of rows within this
+                // line. At the same time, text lines above and below the grid are trimmed off.
+                if (rowsRanges.length > 1) {
+                  const gridTolerance = 1.5;
+
+                  const verticalSegments = (group.edges || [])
+                    .filter(edge =>
+                      isVisibleVector(edge) &&
+                      !edge['_isFakeLine'] &&
+                      edge.width < lineMaxWidth &&
+                      edge.height > lineMaxWidth
+                    )
+                    .map(edge => ({
+                      x: edge.x + edge.width / 2,
+                      from: edge.y,
+                      to: edge.y + edge.height
+                    }))
+                    .sort((a, b) => a.x - b.x);
+
+                  // The lines of a single border may differ by fractions of a point along the X-axis
+                  // (47.25 in the header and 46.5 in the blocks).
+                  const xClusters: Array<{ x: number; segments: any[] }> = [];
+                  verticalSegments.forEach(segment => {
+                    const lastCluster = xClusters[xClusters.length - 1];
+                    if (lastCluster && Math.abs(segment.x - lastCluster.x) <= gridTolerance) {
+                      lastCluster.segments.push(segment);
+                    } else {
+                      xClusters.push({ x: segment.x, segments: [segment] });
+                    }
+                  });
+
+                  // Within the cluster, we join adjacent segments into continuous chains.
+                  let longestChain: any = null;
+                  xClusters.forEach(cluster => {
+                    const sortedSegments = [...cluster.segments].sort((a, b) => a.from - b.from);
+                    let currentChain: any = null;
+
+                    sortedSegments.forEach(segment => {
+                      if (currentChain && segment.from <= currentChain.to + gridTolerance) {
+                        currentChain.to = Math.max(currentChain.to, segment.to);
+                      } else {
+                        currentChain = { from: segment.from, to: segment.to };
+                      }
+
+                      if (
+                        !longestChain ||
+                        currentChain.to - currentChain.from > longestChain.to - longestChain.from
+                      ) {
+                        longestChain = { ...currentChain };
+                      }
+                    });
+                  });
+
+                  const gridEdgeRows = group.edgesRows || [];
+
+                  if (longestChain && gridEdgeRows.length >= 3) {
+                    const gridExtent = Math.max(...gridEdgeRows) - Math.min(...gridEdgeRows);
+                    const chainLength = longestChain.to - longestChain.from;
+
+                    if (gridExtent > 0 && chainLength >= gridExtent * 0.95) {
+                      const wholeGridRows = groupRows.filter(row =>
+                        row >= longestChain.from - gridTolerance &&
+                        row <= longestChain.to + gridTolerance
+                      );
+
+                      if (wholeGridRows.length > 2) {
+                        rowsRanges = [wholeGridRows];
+                      }
+                    }
+                  }
+                }
+
                 let colsRangesGroups = [...Array(rowsRanges.length)].map(() => []);
                 let groupCols = group.cols.sort((a, b) => b - a);
                 for (let rowRangeIndex = 0; rowRangeIndex < rowsRanges.length; rowRangeIndex++) {
@@ -5884,6 +6820,7 @@ export function init({
                   edges: group['edges'] || [],
                   rectangles: group['rectangles'] || [],
                   rows: group['rows'] || [],
+                  cols: group['assuredCols'] || [],
                   lineMaxWidth: lineMaxWidth,
                   customConditionFn: ({
                     textBlock, item, nextItem
@@ -5935,6 +6872,16 @@ export function init({
 
                 const hasExcludedNestedRectangles = (group['rectangles'] || [])
                   .some(rect => nestedRectangles.has(rect));
+
+                console.error('[GROUP CANDIDATE]', {
+                  tolerance,
+                  x: group['x'],
+                  y: group['y'],
+                  rows: group['rows']?.length,
+                  cols: group['cols']?.length,
+                  coordinates: group['coordinates']?.length,
+                  headerRanges,
+                });
 
                 if (headerRanges.length || (tolerance == Infinity) || hasExcludedNestedRectangles) {
                   prev.push(group);
@@ -6578,64 +7525,152 @@ export function init({
               return res;
             }
 
+            // ---------------------------------------------------------------------
+            // Validating a virtual edge with a real line.
+            // getRelatedAssuredEdge does not detect hairline lines (lineWidth = 0) or lines
+            // whose edges are shifted by ~1pt due to cols/rows averaging. Therefore, we additionally
+            // calculate what proportion of the virtual edge is actually covered by the drawn lines.
+            // --------- ------------------------------------------------------------
+            const REAL_LINE_BACKED_RATIO = 0.85;   // >= 85% of the edge’s length is covered by an actual line
+            const REAL_LINE_MARGINAL_RATIO = 0.15; // < 15% – the line merely “touches” the edge with its tip
+            const realLineAxisTolerance = Math.max(borderSize * 3, 1.5);
+
+            function measureRealLineCoverage(edge: any, isHorizontal: boolean): number {
+              const pool = isHorizontal ? horizontalAssuredEdges : verticalAssuredEdges;
+
+              const edgeStart = isHorizontal ? edge.x : edge.y;
+              const edgeLength = isHorizontal ? edge.width : edge.height;
+              const edgeEnd = edgeStart + edgeLength;
+              const edgeAxis = isHorizontal
+                ? edge.y + edge.height / 2
+                : edge.x + edge.width / 2;
+
+              if (!(edgeLength > 0)) {
+                return 0;
+              }
+
+              const intervals: Array<[number, number]> = [];
+
+              for (const candidate of pool) {
+                const candidateAxis = isHorizontal
+                  ? candidate.y + candidate.height / 2
+                  : candidate.x + candidate.width / 2;
+
+                if (Math.abs(candidateAxis - edgeAxis) > realLineAxisTolerance) {
+                  continue;
+                }
+
+                const candidateStart = isHorizontal ? candidate.x : candidate.y;
+                const candidateEnd =
+                  candidateStart + (isHorizontal ? candidate.width : candidate.height);
+
+                const from = Math.max(edgeStart, candidateStart);
+                const to = Math.min(edgeEnd, candidateEnd);
+
+                if (to > from) {
+                  intervals.push([from, to]);
+                }
+              }
+
+              if (!intervals.length) {
+                return 0;
+              }
+
+              intervals.sort((a, b) => a[0] - b[0]);
+
+              let covered = 0;
+              let [currentFrom, currentTo] = intervals[0];
+
+              for (let index = 1; index < intervals.length; index++) {
+                const [from, to] = intervals[index];
+
+                if (from <= currentTo) {
+                  currentTo = Math.max(currentTo, to);
+                } else {
+                  covered += currentTo - currentFrom;
+                  currentFrom = from;
+                  currentTo = to;
+                }
+              }
+              covered += currentTo - currentFrom;
+
+              return covered / edgeLength;
+            }
+
+            function isEdgeBackedByRealLine(
+              edge: any,
+              relatedAssuredEdge: any,
+              isHorizontal: boolean
+            ): boolean {
+              const coverage = measureRealLineCoverage(edge, isHorizontal);
+
+              // 1. The actual lines cover (almost) the entire edge.
+              if (coverage >= REAL_LINE_BACKED_RATIO) {
+                return true;
+              }
+
+              // 2. The old logic didn't find anything.
+              if (!relatedAssuredEdge) {
+                return false;
+              }
+
+              // 3. The old logic found a “connected” edge. We retain this behavior,
+              //    except when a long line merely touches the edge with its tip
+              //    (for example, label 46.6..594.4 and column 18.5..47.5 intersected by 0.9pt).
+              const edgeLength = isHorizontal ? edge.width : edge.height;
+              const relatedLength = isHorizontal
+                ? relatedAssuredEdge.width
+                : relatedAssuredEdge.height;
+
+              const isMarginalTouch =
+                coverage < REAL_LINE_MARGINAL_RATIO && relatedLength >= edgeLength;
+
+              return !isMarginalTouch;
+            }
+
             let verticalEdges = [];
             for (let i = 0; i < cols.length; i++) {
+              // The left and right boundaries of the table are not suppressed
+              // (same as isOuterBoundary for the first/last row)
+              const isOuterBoundary = (i === 0 || i === cols.length - 1);
+
               for (let j = 0; j < rows.length - 1; j++) {
                 let x = cols[i];
                 let nextY = rows[j + 1];
                 let y = rows[j];
-                let edge = {
-                  x: x,
-                  y: y,
-                  width: borderSize,
-                  height: nextY - y
-                };
-
+                let edge = { x: x, y: y, width: borderSize, height: nextY - y };
                 let isIntersectingTextBlock = false;
-                // let foundAssuredEdges = sortArrayOfObjects(
-                //     verticalAssuredEdges?.filter(item=>isIntersecting(item, edge)),
-                //     { field: ['y', 'height'], order: 'asc' }
-                // );
-                // let foundAssuredEdge = foundAssuredEdges?.[0] || null;
-                // //adjust the values of the found edge
-                // if(foundAssuredEdge){
-                //     let rowIndex = findClosestIndex(rows, foundAssuredEdge.y + foundAssuredEdge.height);
-                //     let height = rows[rowIndex] - y;
-                //     Object.assign(foundAssuredEdge, {x, y, height, used:true});
-                // }
-                for (let k = 0; k < coordinates.length; k++) {
+
+                // Does not depend on textBlock; count once per edge
+                let relatedAssuredEdge = getRelatedAssuredEdge(edge, verticalAssuredEdges);
+                if (relatedAssuredEdge) {
+                  if (!edge['strokeColor']) {
+                    edge['strokeColor'] = relatedAssuredEdge.strokeColor || relatedAssuredEdge.fillColor;
+                    edge['_isFakeLine'] = true;
+                  }
+                }
+
+                let isProtectedEdge =
+                  isOuterBoundary ||
+                  isEdgeBackedByRealLine(edge, relatedAssuredEdge, false);
+
+                for (let k = 0; k < coordinates.length && !isProtectedEdge; k++) {
                   let textBlock = coordinates[k];
                   let intersectingElements = verticalIntersectorsByCoordinate[k];
-                  //old:
-                  // let intersectingElements = verticalAssuredEdges?.filter(vector => {
-                  //   let res: any = checkRectangleRanges(vector, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true });
-                  //   return res.isContained || !res.biggestArgument && res.isIntersecting;
-                  // }) || [];
-
-                  let relatedAssuredEdge = getRelatedAssuredEdge(edge, verticalAssuredEdges);
-                  if (relatedAssuredEdge) {
-                    if (!edge['strokeColor']) {
-                      edge['strokeColor'] = relatedAssuredEdge.strokeColor || relatedAssuredEdge.fillColor;
-                      edge['_isFakeLine'] = true;
-                    }
-                  }
-                  //let rowIndex = verticalAssuredEdges.length ? findClosestIndex(intersectingElements.map(item => item.x), edge.x, paddingSize * 2) : getGridIndex(rows, edge.y);
-                  //rowIndex = rowIndex == -1 ? getGridIndex(rows, edge.y) : rowIndex;//wrong
 
                   let edgeOnSameAxis = (() => {
-                    let res: any = checkRectangleRanges(edge, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true })
-                    return res.isIntersecting;//old: res.isContained || !res.biggestArgument && res.isIntersecting; //BUGFIX if the text block is located in a merged cell and crosses two edges
+                    let res: any = checkRectangleRanges(
+                      edge,
+                      { y: [textBlock.y, textBlock.y + textBlock.height] },
+                      { axis: 'y', strict: true, strictIntersecting: true }
+                    );
+                    return res.isIntersecting;
                   })();
+
                   let intersectingGridItems = uniqueArr(intersectingElements, 'x');
 
-                  if (
-                    //intersectingElements.length == cols.length && //BUG
-                    intersectingGridItems.length > 2 && //threshold of number of edges for corrective detection of merged cells
-                    //rowIndex == -1 &&
-                    edgeOnSameAxis &&
-                    //(!isHeader(textBlock) ? true : isIntersecting(edge, textBlock)) &&
-                    !relatedAssuredEdge
-                  ) { //edge crosses the text or is missing
+                  // old: ... && !relatedAssuredEdge  (This is now taken into account in `isProtectedEdge`)
+                  if (intersectingGridItems.length > 2 && edgeOnSameAxis) {
                     isIntersectingTextBlock = true;
                     deletedEdges.push(edge);
                     break;
@@ -6643,13 +7678,12 @@ export function init({
                 }
 
                 if (!isIntersectingTextBlock) {
-                  let newEdge: any = edge;//foundAssuredEdge || edge;
+                  let newEdge: any = edge;
                   if (!newEdge.used) {
                     newEdge.used = true;
                     verticalEdges.push(newEdge);
                   }
                 }
-
               }
             }
 
@@ -6659,92 +7693,66 @@ export function init({
             let yProximityTolerance = modalRowHeightForSuppression * 1.5;
 
             let horizontalEdges = [];
-
             for (let i = 0; i < rows.length; i++) {
               for (let j = 0; j < cols.length - 1; j++) {
                 let x = cols[j];
                 let nextX = cols[j + 1];
                 let y = rows[i];
-                let edge = {
-                  x: x,
-                  y: y,
-                  width: nextX - x,
-                  height: borderSize
-                };
-
-                let isIntersectingTextBlock = false;
-
-                //if (!isOuterBoundary) {//!BUG
-                // let foundAssuredEdges = sortArrayOfObjects(
-                //     horizontalAssuredEdges?.filter(item=>isIntersecting(item, edge)),
-                //     { field: ['x', 'width'], order: 'asc' }
-                // );
-                // let foundAssuredEdge = foundAssuredEdges?.[0] || null;
-                // //adjust the values of the found edge
-                // if(foundAssuredEdge){
-                //     let colIndex = findClosestIndex(cols, foundAssuredEdge.x + foundAssuredEdge.width);
-                //     let width = cols[colIndex] - x;
-                //     Object.assign(foundAssuredEdge, {x, y, width});
-                // }
-
+                let edge = { x: x, y: y, width: nextX - x, height: borderSize };
+                let isIntersectingTextBlock: any = false;
                 let isOuterBoundary = (i === 0 || i === rows.length - 1);
-                for (let k = 0; k < coordinates.length; k++) {
-                  let textBlock = coordinates[k];
 
-                  // let textBlockCenterY = textBlock.y - (textBlock.height || 0) / 2;//!BUG breaks cell merging in twotables_1.pdf and table.pdf
-                  // if (Math.abs(textBlockCenterY - y) > yProximityTolerance) {
-                  //   continue;
-                  // }
-
-                  let intersectingElements = horizontalIntersectorsByCoordinate[k];
-                  //old:
-                  // let intersectingElements = horizontalAssuredEdges?.filter(vector => {
-                  //   let res: any = checkRectangleRanges(vector, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true });
-                  //   return res.isContained || !res.biggestArgument && res.isIntersecting;
-                  // }) || [];
-
-                  let relatedAssuredEdge = getRelatedAssuredEdge(edge, horizontalAssuredEdges);
-                  if (relatedAssuredEdge) {
-                    if (!edge['strokeColor']) {
-                      edge['strokeColor'] = relatedAssuredEdge.strokeColor || relatedAssuredEdge.fillColor;
-                      edge['_isFakeLine'] = true;
-                    }
+                // Count once per edge
+                let relatedAssuredEdge = getRelatedAssuredEdge(edge, horizontalAssuredEdges);
+                if (relatedAssuredEdge) {
+                  if (!edge['strokeColor']) {
+                    edge['strokeColor'] = relatedAssuredEdge.strokeColor || relatedAssuredEdge.fillColor;
+                    edge['_isFakeLine'] = true;
                   }
-                  //let colIndex = horizontalAssuredEdges.length ? findClosestIndex(intersectingElements.map(item => item.y), edge.y, paddingSize * 2) : getGridIndex(cols, edge.x);
-                  //colIndex = colIndex == -1 ? getGridIndex(cols, edge.x) : colIndex; //wrong
+                }
+
+                // NEW
+                let isProtectedEdge =
+                  isOuterBoundary ||
+                  isEdgeBackedByRealLine(edge, relatedAssuredEdge, true);
+
+                for (let k = 0; k < coordinates.length && !isProtectedEdge; k++) {
+                  let textBlock = coordinates[k];
+                  let intersectingElements = horizontalIntersectorsByCoordinate[k];
 
                   let edgeOnSameAxis = (() => {
-                    let res: any = checkRectangleRanges(edge, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true })
-                    return res.isIntersecting;//old: res.isContained || !res.biggestArgument && res.isIntersecting; //BUGFIX if the text block is located in a merged cell and crosses two edges
+                    let res: any = checkRectangleRanges(
+                      edge,
+                      { x: [textBlock.x, textBlock.x + textBlock.width] },
+                      { axis: 'x', strict: true, strictIntersecting: true }
+                    );
+                    return res.isIntersecting;
                   })();
 
                   let intersectingGridItems = uniqueArr(intersectingElements, 'y');
 
-                  //exclude header edges for correct definition of table type
                   if (!isHeader(textBlock)) {
-                    intersectingGridItems = intersectingGridItems
-                      .filter(item => {
-                        return !headerRowsKeys.some(key => (checkRectangleRanges({ y: item.y }, { y: key }, { axis: ['y'], strictIntersecting: true, tolerance: 1 }) as Array<any>).every(item => item.isIntersecting))
-                      })
+                    intersectingGridItems = intersectingGridItems.filter(item => {
+                      return !headerRowsKeys.some(key =>
+                        (checkRectangleRanges(
+                          { y: item.y },
+                          { y: key },
+                          { axis: ['y'], strictIntersecting: true, tolerance: 1 }
+                        ) as Array<any>).every(res => res.isIntersecting)
+                      );
+                    });
                   }
 
-                  if (
-                    !isOuterBoundary &&
-                    //intersectingElements.length == rows.length && //BUG
-                    intersectingGridItems.length > 3 && //threshold of number of edges for corrective detection of merged cells
-                    //colIndex == -1 &&
-                    edgeOnSameAxis &&
-                    //(!isHeader(textBlock) ? true : isIntersecting(edge, textBlock)) && 
-                    !relatedAssuredEdge
-                  ) {//edge crosses the text or is missing
+                  // было: !isOuterBoundary && ... && !relatedAssuredEdge
+                  if (intersectingGridItems.length > 3 && edgeOnSameAxis) {
                     isIntersectingTextBlock = textBlock;
                     deletedEdges.push(edge);
                     break;
                   }
                 }
-                //}
+
                 if (!isIntersectingTextBlock) {
-                  let newEdge: any = edge;//foundAssuredEdge || edge;
+                  let newEdge: any = edge;
                   if (!newEdge.used) {
                     newEdge.used = true;
                     horizontalEdges.push(newEdge);
@@ -7057,6 +8065,17 @@ export function init({
             //overwrite the default boundaries
             edges = virtualEdges;
 
+            // Detection and protection against non-numeric edges
+            const badVirtualEdges = virtualEdges.filter(
+              edge => ![edge.x, edge.y, edge.width, edge.height].every(Number.isFinite)
+            );
+            if (badVirtualEdges.length) {
+              console.error('[BAD VIRTUAL EDGES]', badVirtualEdges.slice(0, 5));
+            }
+            edges = virtualEdges.filter(
+              edge => [edge.x, edge.y, edge.width, edge.height].every(Number.isFinite)
+            );
+
             // merge rectangle to verticle lines and horizon lines
             let edges1 = JSON.parse(JSON.stringify(edges));
             let edges2 = JSON.parse(JSON.stringify(edges));
@@ -7077,124 +8096,68 @@ export function init({
             var linesAddVerticle = function (lines, top, bottom) {
               var hit = false;
               for (var i = 0; i < lines.length; i++) {
-                if (lines[i].bottom < top || lines[i].top > bottom) {
-                  continue;
-                }
+                if (lines[i].bottom < top || lines[i].top > bottom) { continue; }
                 hit = true;
-
                 top = Math.min(lines[i].top, top);
                 bottom = Math.max(lines[i].bottom, bottom);
-
-                lines.splice(i, 1); // Delete the current line
-                i--; // Correcting the index after removal
+                lines.splice(i, 1);
+                i--;
               }
-              if (!hit) {
-                lines.push({ top: top, bottom: bottom });
-              } else {
-                lines.push({ top: top, bottom: bottom }); // Adding a merged line
-              }
+              if (!hit) { lines.push({ top: top, bottom: bottom }); }
+              else { lines.push({ top: top, bottom: bottom }); }
               return lines;
             };
-            var edge;
-            while (edge = edges1.shift()) {
-              // skip horizon lines
-              if (edge.width > lineMaxWidth) {
-                continue;
-              }
-
-              // new verticle lines
-              if (null === current['x'] || edge.x - current['x'] > lineMaxWidth) {
-                if (current['height'] > lineMaxWidth) {
-                  lines = linesAddVerticle(lines, current['y'], current['y'] + current['height']);
-                }
-                if (null !== current['x'] && lines.length) {
-                  verticles.push({ x: current['x'], lines: lines });
-                }
-                current['x'] = edge.x;
-                current['y'] = edge.y;
-                current['height'] = 0;
-                lines = [];
-              }
-
-              if (Math.abs(current['y'] + current['height'] - edge.y) < 10) {
-                current['height'] = edge.height + edge.y - current['y'];
-              } else {
-                if (current['height'] > lineMaxWidth) {
-                  lines = linesAddVerticle(lines, current['y'], current['y'] + current['height']);
-                }
-                current['y'] = edge.y;
-                current['height'] = edge.height;
-              }
-            }
-            if (current['height'] > lineMaxWidth) {
-              lines = linesAddVerticle(lines, current['y'], current['y'] + current['height']);
-            }
-
-            // no table
-            if (current['x'] === null || lines.length == 0) {
-              return {};
-            }
-            verticles.push({ x: current['x'], lines: lines });
-
-            // Get horizon lines
-            current['x'] = null;
-            current['y'] = null;
-            current['width'] = 0;
 
             var linesAddHorizon = function (lines, left, right) {
               var hit = false;
               for (var i = 0; i < lines.length; i++) {
-                if (lines[i].right < left || lines[i].left > right) {
-                  continue;
-                }
+                if (lines[i].right < left || lines[i].left > right) { continue; }
                 hit = true;
-
                 left = Math.min(lines[i].left, left);
                 right = Math.max(lines[i].right, right);
-                lines.splice(i, 1); // Delete the current line
-                i--; // Correcting the index after removal
+                lines.splice(i, 1);
+                i--;
               }
-              if (!hit) {
-                lines.push({ left: left, right: right });
-              } else {
-                lines.push({ left: left, right: right }); // Adding a merged line
-              }
+              if (!hit) { lines.push({ left: left, right: right }); }
+              else { lines.push({ left: left, right: right }); }
               return lines;
             };
 
-            while (edge = edges2.shift()) {
-              if (edge.height > lineMaxWidth) {
-                continue;
+            var verticlesMap = {};
+            for (const edge of edges1) {
+              if (edge.width > lineMaxWidth) continue;
+              let bestX = null;
+              let minDist = Infinity;
+              for (const vx of Object.keys(verticlesMap)) {
+                let dist = Math.abs(+vx - edge.x);
+                if (dist < minDist) { minDist = dist; bestX = vx; }
               }
-
-              if (null === current['y'] || edge.y - current['y'] > lineMaxWidth) {
-                if (current['width'] > lineMaxWidth) {
-                  lines = linesAddHorizon(lines, current['x'], current['x'] + current['width']);
-                }
-                if (null !== current['y'] && lines.length) {
-                  horizons.push({ y: current['y'], lines: lines });
-                }
-                current['x'] = edge.x;
-                current['y'] = edge.y;
-                current['width'] = 0;
-                lines = [];
+              if (!bestX || minDist > lineMaxWidth) {
+                bestX = edge.x;
+                verticlesMap[bestX] = [];
               }
-
-              if (Math.abs(current['x'] + current['width'] - edge.x) < 10) {
-                current['width'] = edge.width + edge.x - current['x'];
-              } else {
-                if (current['width'] > lineMaxWidth) {
-                  lines = linesAddHorizon(lines, current['x'], current['x'] + current['width']);
-                }
-                current['x'] = edge.x;
-                current['width'] = edge.width;
-              }
+              verticlesMap[bestX] = linesAddVerticle(verticlesMap[bestX], edge.y, edge.y + edge.height);
             }
-            if (current['width'] > lineMaxWidth) {
-              lines = linesAddHorizon(lines, current['x'], current['x'] + current['width']);
+            verticles = Object.keys(verticlesMap).map(vx => ({ x: +vx, lines: verticlesMap[vx] })).sort((a, b) => a.x - b.x);
+
+            var horizonsMap = {};
+            for (const edge of edges2) {
+              if (edge.height > lineMaxWidth) continue;
+              let bestY = null;
+              let minDist = Infinity;
+              for (const hy of Object.keys(horizonsMap)) {
+                let dist = Math.abs(+hy - edge.y);
+                if (dist < minDist) { minDist = dist; bestY = hy; }
+              }
+              if (!bestY || minDist > lineMaxWidth) {
+                bestY = edge.y;
+                horizonsMap[bestY] = [];
+              }
+              horizonsMap[bestY] = linesAddHorizon(horizonsMap[bestY], edge.x, edge.x + edge.width);
             }
-            // no table
-            if (current['y'] === null || lines.length == 0) {
+            horizons = Object.keys(horizonsMap).map(hy => ({ y: +hy, lines: horizonsMap[hy] })).sort((a, b) => b.y - a.y);
+
+            if (verticles.length === 0 || horizons.length === 0) {
               return {};
             }
             horizons.push({ y: current['y'], lines: lines });
@@ -8043,6 +9006,19 @@ export function init({
                   let isVerticleBorder = !(v % 2);
                   if (isVerticleBorder || isHorizonBorder) {
                     let hasLine = (() => {
+                      // The outer border is always present so that the absence of a line at the edge
+                      // does not result in a merge with a nonexistent cell
+                      const isOuterVerticleBorder =
+                        isVerticleBorder && !isHorizonBorder &&
+                        (v === 0 || v === matrix[h].length - 1);
+                      const isOuterHorizonBorder =
+                        !isVerticleBorder && isHorizonBorder &&
+                        (h === 0 || h === matrix.length - 1);
+
+                      if (isOuterVerticleBorder || isOuterHorizonBorder) {
+                        return 1;
+                      }
+
                       let hCondition = (isVerticleBorder && [xList[0], xList[xList.length - 1]].includes(currentVerticle.x)) || currentHorizon.lines.some(item => {
                         return (checkRectangleRanges(
                           { x: [item.left, item.right] },
@@ -8073,22 +9049,29 @@ export function init({
                     let previousCells;
                     let previousMatrixItems;
                     (() => {
-                      if (isVerticleBorder && isHorizonBorder) { //horizontal and vertical border
-                        previousCells = [[horizonIndex - 1, verticleIndex], [horizonIndex, verticleIndex - 1]];
-                        previousMatrixItems = [[h - 1, v], [h, v - 1]];
-                        //closedIndexes = [0,1];
+                      if (isVerticleBorder && isHorizonBorder) {
+                        previousCells = [];
+                        if (horizonIndex > 0) previousCells.push([horizonIndex - 1, verticleIndex]);
+                        if (verticleIndex > 0) previousCells.push([horizonIndex, verticleIndex - 1]);
+
+                        previousMatrixItems = [];
+                        if (h > 0) previousMatrixItems.push([h - 1, v]);
+                        if (v > 0) previousMatrixItems.push([h, v - 1]);
                       } else if (isVerticleBorder && !isHorizonBorder) {
-                        previousCells = [[horizonIndex, verticleIndex - 1]];
-                        previousMatrixItems = [[h, v - 1]];
-                        //closedIndexes = [1];
+                        previousCells = [];
+                        if (verticleIndex > 0) previousCells.push([horizonIndex, verticleIndex - 1]);
+
+                        previousMatrixItems = [];
+                        if (v > 0) previousMatrixItems.push([h, v - 1]);
                       } else if (!isVerticleBorder && isHorizonBorder) {
-                        previousCells = [[horizonIndex - 1, verticleIndex]];
-                        previousMatrixItems = [[h - 1, v]];
-                        //closedIndexes = [0]
+                        previousCells = [];
+                        if (horizonIndex > 0) previousCells.push([horizonIndex - 1, verticleIndex]);
+
+                        previousMatrixItems = [];
+                        if (h > 0) previousMatrixItems.push([h - 1, v]);
                       } else {
-                        previousCells = [[horizonIndex, verticleIndex]]
+                        previousCells = [[horizonIndex, verticleIndex]];
                         previousMatrixItems = [[h, v]];
-                        //closedIndexes = [];
                       }
                     })();
 
@@ -8140,6 +9123,9 @@ export function init({
                         //currentMergeArray.closed = [...Array(2)].map((item,index)=>currentMergeArray?.closed?.[index] || false);
                         mergesArrays.push(currentMergeArray);
                       }
+
+
+
                       if (currentMergeArray) { //&& (closedIndexes.length ? closedIndexes.every(i=>currentMergeArray.closed[i] == false): true)
                         if (!mergeMatrixNeighborValue || needFilteringAgain) {
                           if (previousMatrixItems.every(arr => matrix[arr[0]][arr[1]] == 0)) {
@@ -8157,6 +9143,104 @@ export function init({
                     }
                   }
                 }
+              }
+
+              // Creates merges from a matrix: adjacent cells are merged if there is no line between them.
+              // Returns null if any group of cells is not a rectangle.
+              function buildMergesFromMatrix(
+                matrix: number[][],
+                rowsCount: number,
+                colsCount: number
+              ): Record<string, any> | null {
+                const parent = Array.from({ length: rowsCount * colsCount }, (_, index) => index);
+                const cellId = (row: number, col: number) => row * colsCount + col;
+
+                const find = (id: number): number => {
+                  while (parent[id] !== id) {
+                    parent[id] = parent[parent[id]];
+                    id = parent[id];
+                  }
+                  return id;
+                };
+
+                const union = (first: number, second: number) => {
+                  const firstRoot = find(first);
+                  const secondRoot = find(second);
+                  if (firstRoot !== secondRoot) {
+                    parent[Math.max(firstRoot, secondRoot)] = Math.min(firstRoot, secondRoot);
+                  }
+                };
+
+                for (let row = 0; row < rowsCount; row++) {
+                  for (let col = 0; col < colsCount; col++) {
+                    // right boundary: matrix[2*row+1][2*(col+1)]
+                    if (col + 1 < colsCount && !matrix[2 * row + 1][2 * (col + 1)]) {
+                      union(cellId(row, col), cellId(row, col + 1));
+                    }
+                    // bottom boundary: matrix[2*(row+1)][2*col+1]
+                    if (row + 1 < rowsCount && !matrix[2 * (row + 1)][2 * col + 1]) {
+                      union(cellId(row, col), cellId(row + 1, col));
+                    }
+                  }
+                }
+
+                const groups: Record<number, number[][]> = {};
+                for (let row = 0; row < rowsCount; row++) {
+                  for (let col = 0; col < colsCount; col++) {
+                    const root = find(cellId(row, col));
+                    (groups[root] = groups[root] || []).push([row, col]);
+                  }
+                }
+
+                const merges: Record<string, any> = {};
+
+                for (const cells of Object.values(groups)) {
+                  if (cells.length < 2) {
+                    continue;
+                  }
+
+                  const rowStart = Math.min(...cells.map((cell) => cell[0]));
+                  const rowEnd = Math.max(...cells.map((cell) => cell[0]));
+                  const colStart = Math.min(...cells.map((cell) => cell[1]));
+                  const colEnd = Math.max(...cells.map((cell) => cell[1]));
+
+                  const height = rowEnd - rowStart + 1;
+                  const width = colEnd - colStart + 1;
+
+                  // Non-rectangular areas cannot be combined
+                  if (height * width !== cells.length) {
+                    return null;
+                  }
+
+                  const arr: string[] = [];
+                  for (let row = rowStart; row <= rowEnd; row++) {
+                    for (let col = colStart; col <= colEnd; col++) {
+                      arr.push(`${row}-${col}`);
+                    }
+                  }
+
+                  const widthArr: string[] = [];
+                  for (let col = colStart; col <= colEnd; col++) {
+                    widthArr.push(`${rowStart}-${col}`);
+                  }
+
+                  const heightArr: string[] = [];
+                  for (let row = rowStart; row <= rowEnd; row++) {
+                    heightArr.push(`${row}-${colStart}`);
+                  }
+
+                  merges[`${rowStart}-${colStart}`] = {
+                    row: rowStart,
+                    col: colStart,
+                    arr,
+                    widthArr,
+                    heightArr,
+                    width,
+                    height,
+                  };
+                }
+
+                return merges;
               }
 
               let merges = mergesArrays.reduce((prev, cur) => {
@@ -8193,15 +9277,56 @@ export function init({
                 return prev;
               }, {})
 
+              // Non-rectangular merges (arr.length != width * height) always result in broken HTML
+              // (cells are lost or duplicated). We rebuild them directly from the matrix.
+              const hasBrokenMerge = Object.keys(merges).some((key) => {
+                const merge = merges[key];
+                return merge.arr.length !== merge.width * merge.height;
+              });
+
+              if (hasBrokenMerge) {
+                const rebuiltMerges = buildMergesFromMatrix(
+                  matrix,
+                  yList.length - 1,
+                  xList.length - 1
+                );
+
+                if (rebuiltMerges) {
+                  merges = rebuiltMerges;
+                  mergeAlias = Object.keys(merges).reduce((prev, cur) => {
+                    merges[cur].arr.forEach((item) => {
+                      if (cur != item) {
+                        prev[item] = cur;
+                      }
+                    });
+                    return prev;
+                  }, {} as Record<string, string>);
+                }
+              }
+
               return { matrix, merges, mergeAlias };
             }
 
             console.error('[DIAG all horizons]', horizons.map(h => ({ y: h.y, lines: h.lines })));
-
+            // The grid must not contain lines with non-numeric coordinates
+            if (horizons.some(item => !Number.isFinite(item.y))) {
+              console.error(
+                '[BAD HORIZON]',
+                horizons.filter(item => !Number.isFinite(item.y))
+              );
+            }
+            horizons = horizons.filter(item => Number.isFinite(item.y));
+            verticles = verticles.filter(item => Number.isFinite(item.x));
             let matrixData = createMatrix(
               verticles,
               horizons
             );
+            console.error('[GRID CHECK]', {
+              horizons: horizons.length,
+              verticles: verticles.length,
+              horizonsY: horizons.map(item => +item?.y?.toFixed(2)),
+              verticlesX: verticles.map(item => +item?.x?.toFixed(2)),
+            });
 
             console.error('[DIAG raw matrix merges]', JSON.parse(JSON.stringify(matrixData.merges)));
             console.error('[DIAG raw matrix mergeAlias]', JSON.parse(JSON.stringify(matrixData.mergeAlias)));
@@ -8228,7 +9353,8 @@ export function init({
               horizons,
               merges: matrixData.merges,
               mergeAlias: matrixData.mergeAlias,
-              matrix: matrixData.matrix
+              matrix: matrixData.matrix,
+              filledRectangles,
             });
           }
 
@@ -8265,10 +9391,20 @@ export function init({
                   const y = item.transform[5];
 
                   // Looking for the column
+                  // Column boundaries are averaged values of several actual lines and may be
+                  // shifted by ~1pt from the actual line. Text that starts slightly to the left of the border
+                  // (zero padding; for example, a caption in a 46.6-point box with a 47.5-point border)
+                  // is assigned to the right-hand column. Set this to 0 to disable it.
+                  const columnSnapTolerance = 1.5;
+
                   let col = -1;
                   for (let i = 0; i < verticles.length - 1; i++) {
                     if (x >= verticles[i].x && x < verticles[i + 1].x) {
-                      col = i;
+                      const hasNextColumn = i + 1 < verticles.length - 1;
+                      const isJustBeforeNextBorder =
+                        verticles[i + 1].x - x <= columnSnapTolerance;
+
+                      col = hasNextColumn && isJustBeforeNextBorder ? i + 1 : i;
                       break;
                     }
                   }
@@ -8291,7 +9427,9 @@ export function init({
                   // Check for merged cells
                   const mergeKey = `${row}-${col}`;
                   if (mergeAlias[mergeKey]) {
-                    const [mergedRow, mergedCol] = mergeAlias[mergeKey].split("-").map(Number);
+                    const aliasMatch = /^(-?\d+)-(-?\d+)$/.exec(mergeAlias[mergeKey]);
+                    const mergedRow = aliasMatch ? Number(aliasMatch[1]) : NaN;
+                    const mergedCol = aliasMatch ? Number(aliasMatch[2]) : NaN;
                     row = mergedRow;
                     col = mergedCol;
                   }
@@ -8464,10 +9602,104 @@ export function init({
                 throw err;
               }
 
+              // A cell without its own fill inherits the fill of the rectangle
+              // that completely encloses it (header background: fill + stroke path).
+              {
+                const filledRectangles = tableGroup?.filledRectangles || [];
+                const containTolerance = lineMaxWidth / 2;
+
+                if (filledRectangles.length) {
+                  for (let r = 0; r < rowsCount; r++) {
+                    for (let c = 0; c < colsCount; c++) {
+                      const key = `${r}-${c}`;
+                      if (mergeAlias[key]) {
+                        continue;
+                      }
+
+                      const cell = table.array[r]?.[c];
+                      if (!cell || cell['fillColor'] != null) {
+                        continue;
+                      }
+
+                      const mergeInfo = merges[key];
+                      const rowSpan = mergeInfo?.height || 1;
+                      const colSpan = mergeInfo?.width || 1;
+
+                      const left = verticles[c]?.x;
+                      const right = verticles[c + colSpan]?.x;
+                      const top = horizons[r]?.y;
+                      const bottom = horizons[r + rowSpan]?.y;
+
+                      if (![left, right, top, bottom].every(Number.isFinite)) {
+                        continue;
+                      }
+
+                      const cellX1 = Math.min(left, right);
+                      const cellX2 = Math.max(left, right);
+                      const cellY1 = Math.min(top, bottom);
+                      const cellY2 = Math.max(top, bottom);
+
+                      // The last rectangle drawn (the top one) wins
+                      let container = null;
+                      for (const rect of filledRectangles) {
+                        const isInside =
+                          cellX1 >= rect.x - containTolerance &&
+                          cellX2 <= rect.x + rect.width + containTolerance &&
+                          cellY1 >= rect.y - containTolerance &&
+                          cellY2 <= rect.y + rect.height + containTolerance;
+
+                        if (isInside) {
+                          container = rect;
+                        }
+                      }
+
+                      if (container) {
+                        cell['fillColor'] = container.fillColor;
+                      }
+                    }
+                  }
+                }
+              }
+
+              // We consider only the sequence of ranges starting at the top of the table to be headers.
+              // False “headers” in the middle of the table should not cause the first N rows to be converted to <th>.
+              const topHeaderRowCount = (() => {
+                const tolerance = lineMaxWidth;
+
+                const ranges = Object.keys(headerRows)
+                  .map((key) => {
+                    const match = /^(-?\d+(?:\.\d+)?)-(-?\d+(?:\.\d+)?)$/.exec(key);
+                    if (!match) {
+                      return null;
+                    }
+                    const first = Number(match[1]);
+                    const second = Number(match[2]);
+                    return {
+                      top: Math.max(first, second),
+                      bottom: Math.min(first, second),
+                    };
+                  })
+                  .filter(Boolean)
+                  .sort((a, b) => b.top - a.top);
+
+                let chainEdge = horizons[0]?.y;
+                let count = 0;
+
+                for (const range of ranges) {
+                  if (!Number.isFinite(chainEdge) || Math.abs(range.top - chainEdge) > tolerance) {
+                    break;
+                  }
+                  chainEdge = range.bottom;
+                  count++;
+                }
+
+                return count;
+              })();
+
               // Generate HTML table
               table.html = (() => {
                 try {
-                  const headerRowCount = Object.keys(headerRows).length;
+                  const headerRowCount = topHeaderRowCount; //Object.keys(headerRows).length;
 
                   // --- EDGES LOGIC ---
 
@@ -8557,13 +9789,20 @@ export function init({
                       // of an actual boundary than a segment with a real thickness, even if
                       // it is also filled with color (often a duplicate of the same outline)
                       let thickness = isHorizontalIdeal ? edge.height : edge.width;
-                      if (thickness > 0.3) { // old: > 0.01
+
+                      // A line with `lineWidth = 0` is the thinnest line the device can draw,
+                      // that is, the actual visible boundary. We distinguish it from garbage zero fills
+                      // (which do not have a `strokeColor`).
+                      let isHairlineStroke = thickness === 0 && !!edge.strokeColor;
+
+                      if (thickness > 0.3 || isHairlineStroke) {// old: > 0.01
                         realOverlapMap[edgeColor] = (realOverlapMap[edgeColor] || 0) + overlap;
                         realTotal += overlap;
                       } else {
                         degenerateOverlapMap[edgeColor] = (degenerateOverlapMap[edgeColor] || 0) + overlap;
                         degenerateTotal += overlap;
                       }
+
                       //let weight = thickness > 0.01 ? 1 : 0.05;
                     }
 
@@ -8585,7 +9824,7 @@ export function init({
                   }
 
                   function getSegmentBorderColor(idealLine) {
-                    const cacheKey = `${idealLine.x1.toFixed(2)},${idealLine.y1.toFixed(2)},${idealLine.x2.toFixed(2)},${idealLine.y2.toFixed(2)}`;
+                    const cacheKey = `${idealLine?.x1?.toFixed(2)},${idealLine?.y1?.toFixed(2)},${idealLine?.x2?.toFixed(2)},${idealLine?.y2?.toFixed(2)}`;
                     if (borderColorCache[cacheKey] !== undefined) {
                       return borderColorCache[cacheKey];
                     }
@@ -8710,7 +9949,7 @@ export function init({
               // Generate JSON table
               table.json = (() => {
                 try {
-                  const headerRowCount = Object.keys(headerRows).length;
+                  const headerRowCount = topHeaderRowCount;//Object.keys(headerRows).length;
                   let headerRowsKeys = Object.keys(tableGroup.headerRows).sort((a: any, b: any) => b - a);
                   let clonedArray = JSON.parse(JSON.stringify(table.array));
 
@@ -8742,6 +9981,16 @@ export function init({
                   const PATH_SPLIT_RE = /[^>]+/g;
 
                   function generateHeaderPaths(headers) {
+                    // If no header rows were found at all (headerRowCount === 0),
+                    // headers[0] does not exist—previously, this would cause the entire
+                    // extractTableData() function to crash. Instead of crashing, we simply do not construct the
+                    // header paths; the code below is now capable of handling an empty headerPaths
+                    // (`!headerPaths[colIndex]`—it won’t crash; it just won’t set
+                    // a value for that column).
+                    if (!headers.length || !headers[0]?.length) {
+                      return [];
+                    }
+
                     let paths = [];
                     for (let i = 0; i < headers[0].length; i++) {
                       let path = formatHeader(headers[0][i]?.str);
@@ -8757,7 +10006,7 @@ export function init({
                     return paths;
                   }
 
-                  let headerPaths = generateHeaderPaths(clonedArray.slice(0, headerRowsKeys.length));
+                  let headerPaths = generateHeaderPaths(clonedArray.slice(0, topHeaderRowCount));//generateHeaderPaths(clonedArray.slice(0, headerRowsKeys.length));
 
                   let jsonData = clonedArray.slice(headerRowCount).map((row, rowIdx) => {
                     let obj = {};
