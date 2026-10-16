@@ -6,7 +6,7 @@
     "strict": false,
     "importHelpers": true,
     "noImplicitOverride": true,
-    "noImplicitReturns": true,
+    "noImplicitReturns": false,
     "noFallthroughCasesInSwitch": true,
     "noPropertyAccessFromIndexSignature": false
   },

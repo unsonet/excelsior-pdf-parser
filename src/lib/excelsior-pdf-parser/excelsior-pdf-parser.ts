@@ -3,6 +3,7 @@
 // import { fileURLToPath } from 'url';
 // import { dirname } from 'path';
 import { getTextDirection, findClosestIndex, parseRGB, getMergedArray, uniqueArr, findMod, findAverage, caseIndependentCompare, splitByIndex, checkRectangleRanges, removeByIndexes, getSplitEdgeRange, getOnePercentOfAbsoluteDifference, typeValue, sortArrayOfObjects, deepSet, stringifyPseudoJson, isSequentialIndexRow } from '@unsonet/js-utils'
+import { buildDebugReport, DebugOptions } from '../pdftrace-debug-kit/pdf-debug';
 
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = dirname(__filename);
@@ -63,7 +64,9 @@ export function init({
     return arr;
   }
 
-  function extractor(doc, onProgress?, pages?: number[] | { from?: number; to?: number }) {
+  function extractor(extractorOptions: { doc, onProgress?, pages?: number[] | { from?: number; to?: number }, debugOptions?: DebugOptions }) {
+    const { doc, onProgress, pages, debugOptions } = extractorOptions || {};
+    const debugEnabled = typeof debugOptions?.onReport === 'function';
     var numPages = doc.numPages;
     var result: { pageTables: Array<any>, numPages: number, currentPage: number } = { pageTables: [], numPages: numPages, currentPage: 0, };
     var lineMaxWidth = 5;//old:2.5;
@@ -117,6 +120,15 @@ export function init({
       return doc.getPage(pageNum).then(async function (page) {
         const _defaultTransformMatrix = [1, 0, 0, 1, 0, 0];
         const _fontIdentityMatrix = [0.001, 0, 0, 0.001, 0, 0];
+        const debugTrace: Record<string, any> | undefined = debugEnabled
+          ? {
+            pageNumber: pageNum,
+            pdfjsOps: pdfjs.OPS,
+            lineMaxWidth,
+            options: debugOptions,
+            cleanupRoots: [] as unknown[],
+          }
+          : undefined;
         var transformMatrix = JSON.parse(JSON.stringify(_defaultTransformMatrix));
         var textMatrix = JSON.parse(JSON.stringify(_defaultTransformMatrix));
         var transformStack = [];
@@ -127,6 +139,24 @@ export function init({
 
         console.error(`[DEBUG Page ${pageNum}] getTextContent items:`, pageTextContent.items.length);
         console.error(`[DEBUG Page ${pageNum}] first 3 items:`, pageTextContent.items.slice(0, 3).map(i => i ? { str: i.str, hasEOL: i.hasEOL, width: i.width, height: i.height } : 'NULL'));
+
+        if (debugTrace) {
+          debugTrace.pageSize = {
+            width: pageViewport.width,
+            height: pageViewport.height,
+            rotation: pageViewport.rotation,
+          };
+
+          debugTrace.pdfjsItems = pageTextContent.items.map((item: any) => item ? ({
+            str: item.str,
+            transform: item.transform ? Array.from(item.transform) : item.transform,
+            width: item.width,
+            height: item.height,
+            fontName: item.fontName,
+            dir: item.dir,
+            hasEOL: item.hasEOL,
+          }) : item);
+        }
 
         pageTextContent.items = pageTextContent.items.reduce((prev, cur, index) => {
           if (cur && typeof cur.str === 'string' && cur.str.trim()) {
@@ -228,11 +258,20 @@ export function init({
         }
 
         return page.getOperatorList().then(async function (opList) {
+
+          if (debugTrace) {
+            debugTrace.opList = opList;
+          }
+
           // Get rectangle first
           var edges = [];
           var tableContentItems = [];
           var tableContentItemsCache = {};
           var lastActiveCacheKey = null;
+
+          if (debugTrace) {
+            debugTrace.cleanupRoots.push(edges, tableContentItems, tableContentItemsCache);
+          }
 
           // Fallback: if the showText chain (for example, a
           // multi-line rotated column header) fails to
@@ -313,6 +352,12 @@ export function init({
           let rectangles = [];
           let rectanglesEdges = [];
           let filledRectangles = [];
+          // Column boundaries determined by text alignment (tables without vertical lines)
+          let pageColumnBorders: Array<{ x: number; yFrom: number; yTo: number }> = [];
+
+          if (debugTrace) {
+            debugTrace.cleanupRoots.push(rectangles, rectanglesEdges);
+          }
 
           function getTextColor() {
             const mode = Number(
@@ -753,6 +798,15 @@ export function init({
               );
               let edgesStartIdx = edges.length;
               let rectsStartIdx = rectangles.length;
+
+              if (debugTrace) {
+                for (let edgeIndex = edgesStartIdx; edgeIndex < edges.length; edgeIndex++) {
+                  edges[edgeIndex].__pdfTraceOpIndex = i;
+                }
+                for (let rectIndex = rectsStartIdx; rectIndex < rectangles.length; rectIndex++) {
+                  rectangles[rectIndex].__pdfTraceOpIndex = i;
+                }
+              }
 
               if (isNewFormat) {
                 // Automatic detection of the constructPath format
@@ -1601,11 +1655,13 @@ export function init({
                   y,
                   setCoordinates,
                   setCharWidth,
-
+                  pageTransform,
+                  setPageGeometry,
                   wordSpacing = current.wordSpacing,
                   charSpacing = current.charSpacing,
                   spacingDir = _spacingDir,
                   fontSize = current.fontSize,
+
                 } = options;
                 x = x || 0;
                 let currentX = x;
@@ -1638,6 +1694,18 @@ export function init({
                     if (setCharWidth) {
                       glyph['charWidth'] = charWidth;
                     }
+
+                    if (setPageGeometry && Array.isArray(pageTransform) && pageTransform.length >= 6) {
+                      const [a, b, , , e, f] = pageTransform;
+                      const axisLength = Math.hypot(a, b) || 1;
+                      const advance = currentX - x;
+
+                      // Actual glyph origin in the PDF page frame. `glyph.x` is an advance
+                      // coordinate; for rotated text it is not the page's X coordinate.
+                      glyph._pageX = e + advance * a / axisLength;
+                      glyph._pageY = f + advance * b / axisLength;
+                    }
+
                     // Add the width of the current character to the current line
                     acc.currentLineWidth += charWidth;
                     currentX += charWidth;
@@ -1872,6 +1940,8 @@ export function init({
                 setCoordinates: true,
                 setCharWidth: true,
                 fontSize: effectiveHeight,
+                pageTransform: preliminaryItem.transform,
+                setPageGeometry: true,
               });
               fontSpaceWidths = Object.assign(current.fontSpaceWidths, fontSpaceWidths);
 
@@ -1891,6 +1961,11 @@ export function init({
                 //transform: (textMatrix.slice(-2).toString() == preliminaryItem.transform.slice(-2).toString()) ? preliminaryItem.transform : transformFn(textMatrix, preliminaryItem.transform),
                 //hasEOL: hasEOL(str)//BUGFIX there are no line breaks in the text
               });
+
+              if (debugTrace) {
+                preliminaryItem.__pdfTraceOpIndex = i;
+                preliminaryItem.__pdfTraceOpIndexes = [i];
+              }
 
               let relatedTextContentItems = getRelatedTextContentItems(
                 getDeviceBBox(preliminaryItem.transform, preliminaryItem.width, preliminaryItem.height)
@@ -1928,33 +2003,104 @@ export function init({
               // FUNCTIONS OF SEGMENTATION preliminaryItem BASED ON GLYPH GEOMETRY
               // ============================================================
               function segmentPreliminaryItem(item: any): any[] {
-                if (!item?.chars?.length) return [item];
-                const glyphs = item.chars.filter((ch: any) =>
-                  ch && typeof ch === 'object' && typeof ch.unicode === 'string' && ch.x !== undefined
+                if (!item?.chars?.length) {
+                  return [item];
+                }
+
+                const glyphs = item.chars.filter(
+                  (ch: any) =>
+                    ch && typeof ch === 'object' && typeof ch.unicode === 'string' && ch.x !== undefined
                 );
-                if (glyphs.length <= 1) return [item];
+                if (glyphs.length <= 1) {
+                  return [item];
+                }
+
                 const threshold = Math.max(item.height * 0.6, 2);
+                // A sequence of >= 2 spaces wider than half the font height separates the cells
+                const spaceRunThreshold = Math.max(item.height * 0.5, 2);
+                const isSpace = (glyph: any) => !glyph.unicode.trim();
+
                 const segments: any[] = [];
                 let currentGlyphs: any[] = [glyphs[0]];
                 let currentStartX = glyphs[0].x;
                 let lastEndX = glyphs[0].x + (glyphs[0].charWidth || item.height * 0.5);
+                let spaceRunCount = isSpace(glyphs[0]) ? 1 : 0;
+                let spaceRunWidth = isSpace(glyphs[0]) ? glyphs[0].charWidth || 0 : 0;
 
                 for (let i = 1; i < glyphs.length; i++) {
                   const g = glyphs[i];
                   const gap = g.x - lastEndX;
-                  if (gap > threshold) {
-                    segments.push(buildSegment(item, currentGlyphs, currentStartX));
+
+                  const hasTextBeforeRun =
+                    currentGlyphs.length > spaceRunCount &&
+                    currentGlyphs
+                      .slice(0, currentGlyphs.length - spaceRunCount)
+                      .some((ch: any) => !isSpace(ch));
+
+                  const isCellGapBySpaces =
+                    !isSpace(g) &&
+                    spaceRunCount >= 2 &&
+                    spaceRunWidth >= spaceRunThreshold &&
+                    hasTextBeforeRun;
+
+                  if (isCellGapBySpaces || gap > threshold) {
+                    // The spaces between cells are not included in the segment
+                    const body = isCellGapBySpaces
+                      ? currentGlyphs.slice(0, currentGlyphs.length - spaceRunCount)
+                      : currentGlyphs;
+                    segments.push(buildSegment(item, body, currentStartX));
                     currentGlyphs = [g];
                     currentStartX = g.x;
+                    spaceRunCount = 0;
+                    spaceRunWidth = 0;
                   } else {
                     currentGlyphs.push(g);
                   }
+
                   lastEndX = g.x + (g.charWidth || item.height * 0.5);
+
+                  if (isSpace(g)) {
+                    spaceRunCount++;
+                    spaceRunWidth += g.charWidth || 0;
+                  } else {
+                    spaceRunCount = 0;
+                    spaceRunWidth = 0;
+                  }
                 }
+
                 if (currentGlyphs.length) {
                   segments.push(buildSegment(item, currentGlyphs, currentStartX));
                 }
                 return segments.length > 0 ? segments : [item];
+              }
+
+              // Splits the fragments of a single element in pdf.js into cells: on a single line, with a spacing of at least 0.5 times the font height.
+              function splitFragmentsIntoCells(fragments: any[]): any[][] {
+                if (fragments.length < 2) {
+                  return [fragments];
+                }
+                const [a, b] = fragments[0].transform;
+                const length = Math.hypot(a, b) || 1;
+                const ux = a / length;
+                const uy = b / length;
+                const along = (item: any) => item.transform[4] * ux + item.transform[5] * uy;
+                const across = (item: any) => -item.transform[4] * uy + item.transform[5] * ux;
+
+                const runs: any[][] = [[fragments[0]]];
+                for (let i = 1; i < fragments.length; i++) {
+                  const previous = fragments[i - 1];
+                  const current = fragments[i];
+                  const height = Math.max(previous.height || 0, current.height || 0, 1);
+                  const sameLine = Math.abs(across(current) - across(previous)) < height * 0.5;
+                  const gap = along(current) - (along(previous) + (previous.width || 0));
+
+                  if (sameLine && gap >= Math.max(height * 0.5, 2)) {
+                    runs.push([current]);
+                  } else {
+                    runs[runs.length - 1].push(current);
+                  }
+                }
+                return runs;
               }
 
               function buildSegment(baseItem: any, glyphs: any[], startX: number): any {
@@ -2680,192 +2826,240 @@ export function init({
                       !tableContentItemsCache[relatedTextContentId]
                     ) ? [segment] : [...(tableContentItemsCache[relatedTextContentId] || []), segment];
 
-                  newItem = currentCacheItems.reduce((prev, cur) => {
-                    let newPrev;
-                    // We take the actual scale from the transform element (fallback to fontSize).
-                    let curEffectiveHeight = Math.abs(cur.transform[3]) || fontSize;
+                  const mergeFragments = (fragments: any[]) => {
+                    return fragments.reduce((prev, cur) => {
+                      let newPrev;
+                      // Get the actual scale from the `transform` property (using `fontSize` as a fallback).
+                      // 1) Height: use `cur.height` instead of `fontSize` (=1)
+                      // Previously: let curEffectiveHeight = Math.abs(cur.transform[3]) || fontSize;
+                      let curEffectiveHeight = Math.abs(cur.transform[3]) || cur.height || fontSize;
 
-                    if (prev?.str) {
-                      let symbolsBetween = getSymbolsBetween(
-                        relatedTextContentItem.str,
-                        prev.str,
-                        cur.str
-                      );
-                      updateChars({
-                        item: cur,
-                        spaceNeeded: symbolsBetween ? spaceNeeded(cur, prev) : false,
-                        fontSpaceWidth: fontSpaceWidths[fontName]
-                      });
-                      updateChars({
-                        item: prev,
-                        lineBreakNeeded: prev.transform[5] != cur.transform[5],
-                        fontSpaceWidth: fontSpaceWidths[fontName]
-                      });
-                    }
+                      if (prev?.str) {
+                        let symbolsBetween = getSymbolsBetween(
+                          relatedTextContentItem.str,
+                          prev.str,
+                          cur.str
+                        );
+                        updateChars({
+                          item: cur,
+                          spaceNeeded: symbolsBetween ? spaceNeeded(cur, prev) : false,
+                          fontSpaceWidth: fontSpaceWidths[fontName]
+                        });
+                        updateChars({
+                          item: prev,
+                          lineBreakNeeded: prev.transform[5] != cur.transform[5],
+                          fontSpaceWidth: fontSpaceWidths[fontName]
+                        });
+                      }
 
-                    /*
-                    * Preliminary glyph geometry is the primary source of truth.
-                    *
-                    * A textContentItem may correspond to only a fragment of the
-                    * preliminary item in N:N matching, therefore its horizontal
-                    * range must not be used to clip glyphs unless the relationship
-                    * range must not be used to clip glyphs unless the relationship
-                    * is unambiguously 1:1.
-                    */
-                    const useRelatedRange =
-                      relatedTextContentItems.length === 1 &&
-                      isSegmentContainedByRelatedItem(
-                        cur,
-                        relatedTextContentItem
-                      );
+                      /*
+                      * Preliminary glyph geometry is the primary source of truth.
+                      *
+                      * A textContentItem may correspond to only a fragment of the
+                      * preliminary item in N:N matching, therefore its horizontal
+                      * range must not be used to clip glyphs unless the relationship
+                      * range must not be used to clip glyphs unless the relationship
+                      * is unambiguously 1:1.
+                      */
+                      const useRelatedRange =
+                        relatedTextContentItems.length === 1 &&
+                        isSegmentContainedByRelatedItem(
+                          cur,
+                          relatedTextContentItem
+                        );
 
-                    let {
-                      str,
-                      charsRangesArrays
-                    } = handleCharsArgs({
-                      charsArr: cur.chars,
-                      x: cur.transform[4],
-                      rangeArr: useRelatedRange
-                        ? [
-                          relatedTextContentItem.transform[4],
-                          relatedTextContentItem.transform[4] +
-                          relatedTextContentItem.width
-                        ]
-                        : undefined,
-                      fontSize: curEffectiveHeight
-                    });
-
-                    const normalizeText = (value: string) =>
-                      (value || '').replace(/\s+/g, ' ').trim();
-
-                    const range1Str = charsRangesArrays[1]
-                      ?.map(g => g?.unicode || '')
-                      .join('');
-
-                    const range2Str = charsRangesArrays[2]
-                      ?.map(g => g?.unicode || '')
-                      .join('');
-
-                    const recoverRange2 =
-                      useRelatedRange &&
-                      !!range2Str &&
-                      normalizeText(`${range1Str}${range2Str}`) ===
-                      normalizeText(cur.str) &&
-                      normalizeText(cur.str) ===
-                      normalizeText(relatedTextContentItem.str);
-
-                    let chars = [
-                      ...(prev?.['chars'] || []),
-                      ...charsRangesArrays[1],
-                      ...(recoverRange2 ? charsRangesArrays[2] : [])
-                    ];
-
-                    let handledValues = handleCharsArgs({
-                      charsArr: chars,
-                      fontSize: curEffectiveHeight
-                    });
-
-                    console.error('[MERGE RANGE DEBUG]', {
-                      related: relatedTextContentItem?.str,
-                      cur: cur.str,
-                      useRelatedRange,
-                      curX: cur.transform[4],
-                      curRight:
-                        cur.transform[4] + cur.width,
-                      relatedX:
-                        relatedTextContentItem?.transform?.[4],
-                      relatedRight:
-                        relatedTextContentItem
-                          ? relatedTextContentItem.transform[4] +
-                          relatedTextContentItem.width
+                      let {
+                        str,
+                        charsRangesArrays
+                      } = handleCharsArgs({
+                        charsArr: cur.chars,
+                        x: cur.transform[4],
+                        rangeArr: useRelatedRange
+                          ? [
+                            relatedTextContentItem.transform[4],
+                            relatedTextContentItem.transform[4] +
+                            relatedTextContentItem.width
+                          ]
                           : undefined,
-                      beforeClear:
-                        handledValues.charsRangesArrays[1]
-                          ?.map(g => g?.unicode || '')
-                          .join(''),
-                    });
+                        fontSize: curEffectiveHeight
+                      });
 
-                    chars = clearChars({
-                      chars: handledValues.charsRangesArrays[1],
-                      fullClear: false,
-                      clearStart: true
-                    });
+                      const normalizeText = (value: string) =>
+                        (value || '').replace(/\s+/g, ' ').trim();
 
-                    console.error('[MERGE CLEAR DEBUG]', {
-                      afterClear:
-                        chars
-                          ?.map(g => g?.unicode || '')
-                          .join(''),
-                    });
+                      const range1Str = charsRangesArrays[1]
+                        ?.map(g => g?.unicode || '')
+                        .join('');
 
-                    let mergedChars = handledValues.charsRangesArrays.flat();
+                      const range2Str = charsRangesArrays[2]
+                        ?.map(g => g?.unicode || '')
+                        .join('');
 
-                    let actualRight = Math.max(
-                      ...mergedChars
-                        .filter(char => char && typeof char === 'object' && Number.isFinite(char.x))
-                        .map(char => char.x + (char.charWidth || 0))
-                    );
+                      const recoverRange2 =
+                        useRelatedRange &&
+                        !!range2Str &&
+                        normalizeText(`${range1Str}${range2Str}`) ===
+                        normalizeText(cur.str) &&
+                        normalizeText(cur.str) ===
+                        normalizeText(relatedTextContentItem.str);
 
-                    let actualLeft = Math.min(
-                      ...mergedChars
-                        .filter(char => char && typeof char === 'object' && Number.isFinite(char.x))
-                        .map(char => char.x)
-                    );
+                      let chars = [
+                        ...(prev?.['chars'] || []),
+                        ...charsRangesArrays[1],
+                        ...(recoverRange2 ? charsRangesArrays[2] : [])
+                      ];
 
-                    let hasRealPrev = !!prev?.str;
-                    let prevTransform = hasRealPrev ? prev.transform : _defaultTransformMatrix;
+                      let handledValues = handleCharsArgs({
+                        charsArr: chars,
+                        fontSize: curEffectiveHeight
+                      });
 
-                    // chars[0].x is the accumulated distance along the READING DIRECTION
-                    // (handleCharsArgs always writes it to the `x` field, regardless of
-                    // which device axis it actually corresponds to). The old code definitely wrote
-                    // this value to transform[4] (X)—which is correct for horizontal
-                    // text, but for rotated text, the actual reading direction is on a different
-                    // axis. We project the offset onto the actual direction, taking it from
-                    // cur.transform (the same matrix already used in readingUnit
-                    // elsewhere in the file). We change the behavior ONLY when the text is actually
-                    // rotated—for horizontal text, the formula remains exactly
-                    // the same, so as not to alter the already-verified path.
-                    let firstMergedChar = mergedChars[0];
-                    let [readA, readB] = cur.transform;
-                    let readingLength = Math.hypot(readA, readB) || 1;
-                    let readingUnit = [readA / readingLength, readB / readingLength];
-                    let isRotatedReading = Math.abs(readingUnit[1]) > 0.5;
+                      console.error('[MERGE RANGE DEBUG]', {
+                        related: relatedTextContentItem?.str,
+                        cur: cur.str,
+                        useRelatedRange,
+                        curX: cur.transform[4],
+                        curRight:
+                          cur.transform[4] + cur.width,
+                        relatedX:
+                          relatedTextContentItem?.transform?.[4],
+                        relatedRight:
+                          relatedTextContentItem
+                            ? relatedTextContentItem.transform[4] +
+                            relatedTextContentItem.width
+                            : undefined,
+                        beforeClear:
+                          handledValues.charsRangesArrays[1]
+                            ?.map(g => g?.unicode || '')
+                            .join(''),
+                      });
 
-                    let mergedAnchorX, mergedAnchorY;
-                    if (isRotatedReading && firstMergedChar && typeof firstMergedChar.x === 'number') {
-                      let offset = firstMergedChar.x - cur.transform[4];
-                      mergedAnchorX = cur.transform[4] + offset * readingUnit[0];
-                      mergedAnchorY = cur.transform[5] + offset * readingUnit[1];
-                    } else {
-                      mergedAnchorX = firstMergedChar?.x || (hasRealPrev ? Math.min(prevTransform[4], cur.transform[4]) : cur.transform[4]);
-                      mergedAnchorY = hasRealPrev ? Math.max(prevTransform[5], cur.transform[5]) : cur.transform[5];
+                      chars = clearChars({
+                        chars: handledValues.charsRangesArrays[1],
+                        fullClear: false,
+                        clearStart: true
+                      });
+
+                      console.error('[MERGE CLEAR DEBUG]', {
+                        afterClear:
+                          chars
+                            ?.map(g => g?.unicode || '')
+                            .join(''),
+                      });
+
+                      let mergedChars = handledValues.charsRangesArrays.flat();
+
+                      let actualRight = Math.max(
+                        ...mergedChars
+                          .filter(char => char && typeof char === 'object' && Number.isFinite(char.x))
+                          .map(char => char.x + (char.charWidth || 0))
+                      );
+
+                      let actualLeft = Math.min(
+                        ...mergedChars
+                          .filter(char => char && typeof char === 'object' && Number.isFinite(char.x))
+                          .map(char => char.x)
+                      );
+
+                      let hasRealPrev = !!prev?.str;
+                      let prevTransform = hasRealPrev ? prev.transform : _defaultTransformMatrix;
+
+                      // chars[0].x is the accumulated distance along the READING DIRECTION
+                      // (handleCharsArgs always writes it to the `x` field, regardless of
+                      // which device axis it actually corresponds to). The old code definitely wrote
+                      // this value to transform[4] (X)—which is correct for horizontal
+                      // text, but for rotated text, the actual reading direction is on a different
+                      // axis. We project the offset onto the actual direction, taking it from
+                      // cur.transform (the same matrix already used in readingUnit
+                      // elsewhere in the file). We change the behavior ONLY when the text is actually
+                      // rotated—for horizontal text, the formula remains exactly
+                      // the same, so as not to alter the already-verified path.
+                      let firstMergedChar = mergedChars[0];
+                      let [readA, readB] = cur.transform;
+                      let readingLength = Math.hypot(readA, readB) || 1;
+                      let readingUnit = [readA / readingLength, readB / readingLength];
+                      let isRotatedReading = Math.abs(readingUnit[1]) > 0.5;
+
+                      let mergedAnchorX, mergedAnchorY;
+                      let rotatedWidth: number | null = null;
+                      // if (isRotatedReading && firstMergedChar && typeof firstMergedChar.x === 'number') {
+                      //   let offset = firstMergedChar.x - cur.transform[4];
+                      //   mergedAnchorX = cur.transform[4] + offset * readingUnit[0];
+                      //   mergedAnchorY = cur.transform[5] + offset * readingUnit[1];
+                      // } 
+                      if (isRotatedReading) {
+                        // position on the reading axis = projection of the fragment's origin onto the reading direction
+                        const readingPosition = (matrix: number[]) =>
+                          matrix[4] * readingUnit[0] + matrix[5] * readingUnit[1];
+
+                        const curStart = readingPosition(cur.transform);
+                        const prevStart = hasRealPrev ? readingPosition(prevTransform) : curStart;
+
+                        // start of the concatenated element = start of the EARLIEST fragment
+                        const anchorSource = hasRealPrev && prevStart <= curStart ? prevTransform : cur.transform;
+                        mergedAnchorX = anchorSource[4];
+                        mergedAnchorY = anchorSource[5];
+
+                        const start = Math.min(prevStart, curStart);
+                        const end = Math.max(
+                          hasRealPrev ? prevStart + (prev.width || 0) : -Infinity,
+                          curStart + (cur.width || 0)
+                        );
+                        rotatedWidth = end - start;
+                      } else {
+                        mergedAnchorX = firstMergedChar?.x || (hasRealPrev ? Math.min(prevTransform[4], cur.transform[4]) : cur.transform[4]);
+                        mergedAnchorY = hasRealPrev ? Math.max(prevTransform[5], cur.transform[5]) : cur.transform[5];
+                      }
+
+                      newPrev = mergedChars.length ? {
+                        str: handledValues?.str,
+                        chars: mergedChars,
+                        fontName: fontName,
+                        textColor: prev?.textColor || cur?.textColor || null,
+                        height: Math.max(
+                          hasRealPrev ? (Math.abs(prevTransform[3]) || prev.height || curEffectiveHeight) : curEffectiveHeight,
+                          Math.abs(cur.transform[3]) || cur.height || curEffectiveHeight,
+                        ),
+                        dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(handledValues.str),
+                        width: rotatedWidth !== null
+                          ? rotatedWidth
+                          : (Number.isFinite(actualRight) && Number.isFinite(actualLeft)
+                            ? actualRight - actualLeft
+                            : Math.max(...handledValues.widthRanges)),
+                        transform: [
+                          hasRealPrev ? Math.max(prevTransform[0], cur.transform[0]) : cur.transform[0],
+                          hasRealPrev ? Math.max(prevTransform[1], cur.transform[1]) : cur.transform[1],
+                          hasRealPrev ? Math.max(prevTransform[2], cur.transform[2]) : cur.transform[2],
+                          hasRealPrev ? Math.max(prevTransform[3], cur.transform[3]) : cur.transform[3],
+                          mergedAnchorX,
+                          mergedAnchorY,
+                        ],
+                      } : null;
+                      // } else {
+                      //     newPrev = cur;
+                      // }
+                      return newPrev;
+                    }, null);
+                  }
+
+
+                  const cellRuns = splitFragmentsIntoCells(currentCacheItems);
+
+                  // All cells except the last one are complete
+                  cellRuns.slice(0, -1).forEach((run) => {
+                    const cellItem = mergeFragments(run);
+                    if (cellItem) {
+                      cellItem['hasEOT'] = true;
+                      cellItem['hasEOL'] = false;
+                      cellItem['altStr'] = relatedTextContentItem?.str;
+                      tableContentItems.push(cellItem);
                     }
+                  });
 
-                    newPrev = mergedChars.length ? {
-                      str: handledValues?.str,
-                      chars: mergedChars,
-                      fontName: fontName,
-                      textColor: prev?.textColor || cur?.textColor || null,
-                      height: Math.max(
-                        hasRealPrev ? (Math.abs(prevTransform[3]) || curEffectiveHeight) : curEffectiveHeight,
-                        Math.abs(cur.transform[3]) || curEffectiveHeight
-                      ),
-                      dir: ['rtl', 'ltr'][fontDirection] || getTextDirection(handledValues.str),
-                      width: Number.isFinite(actualRight) && Number.isFinite(actualLeft) ? actualRight - actualLeft : Math.max(...handledValues.widthRanges),
-                      transform: [
-                        hasRealPrev ? Math.max(prevTransform[0], cur.transform[0]) : cur.transform[0],
-                        hasRealPrev ? Math.max(prevTransform[1], cur.transform[1]) : cur.transform[1],
-                        hasRealPrev ? Math.max(prevTransform[2], cur.transform[2]) : cur.transform[2],
-                        hasRealPrev ? Math.max(prevTransform[3], cur.transform[3]) : cur.transform[3],
-                        mergedAnchorX,
-                        mergedAnchorY,
-                      ],
-                    } : null;
-                    // } else {
-                    //     newPrev = cur;
-                    // }
-                    return newPrev;
-                  }, null);
+                  newItem = mergeFragments(cellRuns[cellRuns.length - 1]);
+
+
+
                 } else {
                   newItem = segment;
                 }
@@ -3513,8 +3707,6 @@ export function init({
           // of text on the page before `endText`).
           flushStaleTableContentItemsCache();
 
-
-
           function isRotatedText(item) {
             const transform = item?.transform;
 
@@ -3694,6 +3886,7 @@ export function init({
               );
             });
           }
+
           function isHorizontalText(item: any) {
             const transform = item?.transform;
 
@@ -3708,7 +3901,6 @@ export function init({
               Math.abs(c) <= Math.abs(d) * 0.2
             );
           }
-
 
           function areInSameRotatedCell(firstItem, secondItem) {
             if (
@@ -3791,6 +3983,8 @@ export function init({
             return direction;
           }
 
+
+
           const globalRotationDirection = detectGlobalPageRotation();
 
           if (globalRotationDirection) {
@@ -3813,6 +4007,12 @@ export function init({
             for (const item of tableContentItems) {
               if (!item?.transform) continue;
               allRawPoints.push([item.transform[4], item.transform[5]]);
+
+              for (const glyph of item.chars || []) {
+                if (Number.isFinite(glyph?._pageX) && Number.isFinite(glyph?._pageY)) {
+                  allRawPoints.push([glyph._pageX, glyph._pageY]);
+                }
+              }
             }
 
             for (const [x, y] of allRawPoints) {
@@ -3843,21 +4043,68 @@ export function init({
 
             for (const item of tableContentItems) {
               if (!item?.transform) continue;
+
               const [a, b, c, d, e, f] = item.transform;
 
-              // Linear part: composition of the unfolding matrix with an
-              // existing text matrix (see the explanation for the formula).
-              let newA, newB, newC, newD;
-              if (globalRotationDirection === 1) {
-                newA = b; newB = -a;
-                newC = d; newD = -c;
-              } else {
-                newA = -b; newB = a;
-                newC = -d; newD = c;
+              // Transform each character from its own source fragment. This matters
+              // when one extractor item was merged from multiple PDF.js text operations.
+              let firstGlyphPoint: [number, number] | undefined;
+
+              for (const glyph of item.chars || []) {
+                if (!Number.isFinite(glyph?._pageX) || !Number.isFinite(glyph?._pageY)) {
+                  continue;
+                }
+
+                const [gx, gy] = transformPoint(glyph._pageX, glyph._pageY);
+                glyph.x = gx;
+                glyph.y = gy;
+
+                if (!firstGlyphPoint && typeof glyph.unicode === 'string' && glyph.unicode.trim()) {
+                  firstGlyphPoint = [gx, gy];
+                }
+
+                delete glyph._pageX;
+                delete glyph._pageY;
               }
 
-              const [newE, newF] = transformPoint(e, f);
+              let newA: number;
+              let newB: number;
+              let newC: number;
+              let newD: number;
+
+              if (globalRotationDirection === 1) {
+                newA = b;
+                newB = -a;
+                newC = d;
+                newD = -c;
+              } else {
+                newA = -b;
+                newB = a;
+                newC = -d;
+                newD = c;
+              }
+
+              // Use the actual first glyph position, not the merged item's possibly
+              // incorrect anchor (which may have come from a later fragment).
+              const [newE, newF] = firstGlyphPoint || transformPoint(e, f);
+
               item.transform = [newA, newB, newC, newD, newE, newF];
+
+              const positioned = (item.chars || []).filter((glyph: any) =>
+                glyph &&
+                typeof glyph === 'object' &&
+                typeof glyph.unicode === 'string' &&
+                glyph.unicode.trim() &&
+                Number.isFinite(glyph.x) &&
+                Number.isFinite(glyph.charWidth)
+              );
+
+              if (positioned.length) {
+                const left = Math.min(...positioned.map((glyph: any) => glyph.x));
+                const right = Math.max(...positioned.map((glyph: any) => glyph.x + (glyph.charWidth || 0)));
+                item.width = Math.max(0, right - left);
+                item.height = Math.max(item.height || 0, Math.hypot(newC, newD) || 0, 1);
+              }
             }
 
             console.error('[GLOBAL ROTATION APPLIED]', {
@@ -3870,7 +4117,18 @@ export function init({
                 .map(i => ({ str: i.str, transform: i.transform })),
               sampleEdges: edges.slice(0, 3),
             });
+          } else if (!globalRotationDirection) {
+            for (const item of tableContentItems) {
+              for (const glyph of item.chars || []) {
+                if (glyph && typeof glyph === 'object') {
+                  delete glyph._pageX;
+                  delete glyph._pageY;
+                }
+              }
+            }
           }
+
+          tableContentItems = separateBorderlessColumns(tableContentItems);
 
           for (let index = 1; index < tableContentItems.length; index++) {
             const previousItem = tableContentItems[index - 1];
@@ -4077,46 +4335,51 @@ export function init({
             }
           }
 
-          const tableContentItemsStr = stringifyPseudoJson(tableContentItems, {
-            // 1. keyMap
-            keyMap: {
-              index: 'i',
-              str: 's',
-              width: 'w',
-              height: 'h',
-              fillColor: 'fc',
-              textColor: 'tc',
-              fontName: 'fn',
-              strokeColor: 'sc',
-              transform: 't',
-            },
-
-            // 2. valueMap
-            valueMap: {
-              textColor: {
-                'rgb(255,255,255)': '#fff',
-                'rgb(0,0,0)': '#000',
+          const tableContentItemsStr = stringifyPseudoJson(
+            tableContentItems,
+            {
+              // 1. Property mapping
+              keyMap: {
+                index: 'i',
+                str: 's',
+                width: 'w',
+                height: 'h',
+                fillColor: 'fc',
+                textColor: 'tc',
+                fontName: 'fn',
+                strokeColor: 'sc',
+                transform: 't',
               },
 
-              fillColor: {
-                'rgb(255,255,255)': '#fff',
-                'rgb(0,0,0)': '#000',
+              // 3. Value mapping by property path
+              valueMap: {
+                textColor: {
+                  'rgb(255,255,255)': '#fff',
+                  'rgb(0,0,0)': '#000',
+                },
+
+                fillColor: {
+                  'rgb(255,255,255)': '#fff',
+                  'rgb(0,0,0)': '#000',
+                },
               },
-            },
 
-            // 3. Quote only values of `str`
-            quoteValues: new Set([
-              'str',
-            ]),
+              // 4. Quote only values of `str`
+              quoteValues: new Set([
+                'str',
+              ]),
 
-            // 4. Completely remove `chars`
-            exclude: new Set([
-              'chars', 'altStr', 'dir'
-            ]),
+              // 5. Remove properties at any nesting depth
+              exclude: new Set([
+                'chars',
+                'altStr',
+                'dir',
+              ]),
 
-            // 5. Keep at most 3 decimal digits
-            numberDigits: 3,
-          });
+              // 6. Truncate decimal digits without rounding
+              numberDigits: 3,
+            }
+          );
 
           // Geometric cell boundary for horizontal text.
           // Does not depend on drawn lines: two adjacent fragments cannot
@@ -4308,6 +4571,363 @@ export function init({
               }
             }
             return false;
+          }
+
+          // Columns without lines. We consider the start of a cell to be the column boundary if it is located at the same x
+          // in at least 6 rows and almost no text crosses this x. Elements are split exactly there,
+          // and adjacent elements on the same row are assigned hasEOT = true if the second one starts at that x.
+          function separateBorderlessColumns(items: any[]): any[] {
+            const MIN_ROWS = 6;
+            const MIN_RATIO = 0.7;           // proportion of lines in which the column is intact
+            const START_TOLERANCE = 0.6;     // x-axis drift between lines (≈0.0085 per line)
+            const BASELINE_TOLERANCE = 0.6;
+            const MIN_INNER_GAP_EM = 0.15;   // gap without spaces inside an element
+            const MIN_SPACE_RUN = 2;         // two or more consecutive spaces also mark the start of a cell
+            const MAX_ITEMS = 6000;
+            const ROW_TOLERANCE = 1.5;
+            const MAX_CANDIDATES = 3000;
+            pageColumnBorders = [];
+
+            if (!items?.length || items.length > MAX_ITEMS) {
+              return items;
+            }
+
+            const analyse = (item: any) => {
+              if (!item?.transform || item.imageName || !Array.isArray(item.chars)) return null;
+
+              const [a, b] = item.transform;
+              // This pass runs after global page rotation. Leave separately rotated
+              // text alone; it must not influence the horizontal table-column model.
+              if (!(a > 0) || Math.abs(b) > Math.abs(a) * 0.2) return null;
+
+              const glyphs = item.chars
+                .map((glyph: any, sourceIndex: number) => ({ glyph, sourceIndex }))
+                .filter(({ glyph }: any) =>
+                  glyph &&
+                  typeof glyph === 'object' &&
+                  typeof glyph.unicode === 'string' &&
+                  Number.isFinite(glyph.x)
+                )
+                .map((ref: any, glyphIndex: number) => ({ ...ref, glyphIndex }));
+
+              if (!glyphs.some(({ glyph }: any) => glyph.unicode.trim())) return null;
+
+              const em = Math.max(Math.hypot(a, b), item.height || 0, 1);
+              const lines: any[] = [];
+
+              for (const ref of glyphs) {
+                const y = Number.isFinite(ref.glyph.y) ? ref.glyph.y : item.transform[5];
+                let line = lines[lines.length - 1];
+
+                if (!line || Math.abs(y - line.baseline) > BASELINE_TOLERANCE) {
+                  line = { baseline: y, refs: [], left: Infinity, right: -Infinity, innerStarts: [] };
+                  lines.push(line);
+                }
+
+                line.refs.push(ref);
+              }
+
+              const innerStarts: any[] = [];
+
+              for (const line of lines) {
+                let previous: any = null;
+                let spaceCount = 0;
+                let spaceWidth = 0;
+                let firstTextRef: any;
+
+                for (const ref of line.refs) {
+                  const glyph = ref.glyph;
+                  const value = glyph.unicode;
+
+                  if (glyph.isLineBreak || value === '\n') {
+                    previous = null;
+                    spaceCount = 0;
+                    spaceWidth = 0;
+                    continue;
+                  }
+
+                  if (!value.trim()) {
+                    if (previous) {
+                      spaceCount++;
+                      spaceWidth += Math.abs(glyph.charWidth || 0);
+                    }
+                    continue;
+                  }
+
+                  if (!firstTextRef) firstTextRef = ref;
+                  line.left = Math.min(line.left, glyph.x);
+                  line.right = Math.max(line.right, glyph.x + (glyph.charWidth || em * 0.5));
+
+                  if (previous) {
+                    const gap = glyph.x - (previous.glyph.x + (previous.glyph.charWidth || em * 0.5));
+                    const gapWithoutSpaces = spaceCount === 0 && gap >= em * MIN_INNER_GAP_EM;
+                    // 0.45 em deliberately covers the ~4.24 pt two-space gap in m27
+                    // (0.5 em was 4.26 pt and missed it by about 0.02 pt).
+                    const gapBySpaces = spaceCount >= MIN_SPACE_RUN && spaceWidth >= Math.max(em * 0.45, 2);
+
+                    if (gapWithoutSpaces || gapBySpaces) {
+                      const boundary = {
+                        glyphIndex: ref.glyphIndex,
+                        sourceIndex: ref.sourceIndex,
+                        x: glyph.x,
+                        y: line.baseline,
+                      };
+                      line.innerStarts.push(boundary);
+                      innerStarts.push(boundary);
+                    }
+                  }
+
+                  previous = ref;
+                  spaceCount = 0;
+                  spaceWidth = 0;
+                }
+
+                if (firstTextRef) {
+                  line.startGlyphIndex = firstTextRef.glyphIndex;
+                  line.startSourceIndex = firstTextRef.sourceIndex;
+                  line.left = Math.min(line.left, firstTextRef.glyph.x);
+                }
+              }
+
+              return {
+                item,
+                glyphs,
+                lines: lines.filter((line: any) => Number.isFinite(line.left) && Number.isFinite(line.right)),
+                innerStarts,
+                em,
+              };
+            };
+
+            const runs: any[] = items.map(analyse);
+            const valid = runs.filter(Boolean);
+            if (!valid.length) return items;
+
+            const baselines = [...new Set<number>(valid.flatMap((info: any) =>
+              info.lines.map((line: any) => line.baseline)
+            ))].sort((a, b) => a - b);
+
+            const rowOf = new Map<number, number>();
+            let rowId = -1;
+            let rowStart = -Infinity;
+            for (const baseline of baselines) {
+              if (baseline - rowStart > ROW_TOLERANCE) {
+                rowId++;
+                rowStart = baseline;
+              }
+              rowOf.set(baseline, rowId);
+            }
+
+            const candidates: Array<{ x: number; row: number; y: number }> = [];
+            for (const info of valid) {
+              for (const line of info.lines) {
+                const row = rowOf.get(line.baseline);
+                if (row === undefined) continue;
+                candidates.push({ x: line.left, row, y: line.baseline });
+                for (const boundary of line.innerStarts) {
+                  candidates.push({ x: boundary.x, row, y: boundary.y });
+                }
+              }
+            }
+
+            if (!candidates.length || candidates.length > MAX_CANDIDATES) return items;
+            candidates.sort((a, b) => a.x - b.x);
+
+            const clusters: Array<{ xs: number[]; rows: Set<number>; ys: number[] }> = [];
+            for (const candidate of candidates) {
+              const last = clusters[clusters.length - 1];
+              if (last && candidate.x - last.xs[0] <= START_TOLERANCE) {
+                last.xs.push(candidate.x);
+                last.rows.add(candidate.row);
+                last.ys.push(candidate.y);
+              } else {
+                clusters.push({ xs: [candidate.x], rows: new Set([candidate.row]), ys: [candidate.y] });
+              }
+            }
+
+            const starts: Array<{ x: number; yFrom: number; yTo: number }> = [];
+            for (const cluster of clusters) {
+              if (cluster.rows.size < MIN_ROWS) continue;
+              const xs = [...cluster.xs].sort((a, b) => a - b);
+              const center = xs[Math.floor(xs.length / 2)];
+              const crossingRows = new Set<number>();
+
+              for (const info of valid) {
+                for (const line of info.lines) {
+                  const row = rowOf.get(line.baseline);
+                  if (row === undefined) continue;
+
+                  const startsHere =
+                    Math.abs(line.left - center) <= START_TOLERANCE ||
+                    line.innerStarts.some((boundary: any) => Math.abs(boundary.x - center) <= START_TOLERANCE);
+                  const crosses = line.left < center - START_TOLERANCE && line.right > center + START_TOLERANCE;
+
+                  if (crosses && !startsHere) crossingRows.add(row);
+                }
+              }
+
+              // A row with a confirmed start is not also counted as a conflicting row.
+              const conflictingRows = [...crossingRows].filter(row => !cluster.rows.has(row));
+              const ratio = cluster.rows.size / Math.max(cluster.rows.size + conflictingRows.length, 1);
+
+              if (ratio >= MIN_RATIO) {
+                starts.push({
+                  x: center,
+                  yFrom: Math.min(...cluster.ys),
+                  yTo: Math.max(...cluster.ys),
+                });
+              }
+            }
+
+            starts.sort((a, b) => a.x - b.x);
+            console.error('[COLUMN STARTS]', starts.map(start => +start.x.toFixed(1)));
+            if (!starts.length) return items;
+
+            const isColumnStart = (x: number) => starts.some(start => Math.abs(start.x - x) <= START_TOLERANCE);
+
+            const result: any[] = [];
+            for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+              const item = items[itemIndex];
+              const info = runs[itemIndex];
+              if (!info) {
+                result.push(item);
+                continue;
+              }
+
+              const cutMap = new Map<number, number>(); // sourceIndex -> geometric X
+              for (const boundary of info.innerStarts) {
+                if (isColumnStart(boundary.x)) cutMap.set(boundary.sourceIndex, boundary.x);
+              }
+
+              // A source text item can encode different cells separated by a PDF line move.
+              // Split at a repeated column start when the next visual line starts in another column;
+              // do not split ordinary multiline cell content whose lines start at the same X.
+              for (let lineIndex = 1; lineIndex < info.lines.length; lineIndex++) {
+                const line = info.lines[lineIndex];
+                const previousLine = info.lines[lineIndex - 1];
+                if (
+                  line.startGlyphIndex > 0 &&
+                  isColumnStart(line.left) &&
+                  Math.abs(line.left - previousLine.left) > START_TOLERANCE
+                ) {
+                  const ref = info.glyphs[line.startGlyphIndex];
+                  if (ref) cutMap.set(ref.sourceIndex, line.left);
+                }
+              }
+
+              const cuts = [...cutMap.keys()].filter(index => index > 0 && index < item.chars.length).sort((a, b) => a - b);
+              const uniqueCuts = cuts.filter((cut, index) => index === 0 || cut !== cuts[index - 1]);
+              if (!uniqueCuts.length) {
+                result.push(item);
+                continue;
+              }
+
+              const pieceStarts = [0, ...uniqueCuts];
+              const pieceEnds = [...uniqueCuts, item.chars.length];
+
+              for (let pieceIndex = 0; pieceIndex < pieceStarts.length; pieceIndex++) {
+                const isFirst = pieceIndex === 0;
+                const isLast = pieceIndex === pieceStarts.length - 1;
+                let chars = item.chars.slice(pieceStarts[pieceIndex], pieceEnds[pieceIndex]);
+
+                while (!isFirst && chars.length && typeof chars[0]?.unicode === 'string' && !chars[0].unicode.trim()) {
+                  chars = chars.slice(1);
+                }
+                while (!isLast && chars.length && typeof chars[chars.length - 1]?.unicode === 'string' && !chars[chars.length - 1].unicode.trim()) {
+                  chars = chars.slice(0, -1);
+                }
+                while (!isLast && chars.length && chars[chars.length - 1]?.isLineBreak) {
+                  chars = chars.slice(0, -1);
+                }
+
+                const solid = chars.filter((glyph: any) =>
+                  glyph && typeof glyph === 'object' &&
+                  typeof glyph.unicode === 'string' && glyph.unicode.trim() &&
+                  Number.isFinite(glyph.x) && Number.isFinite(glyph.y)
+                );
+                if (!solid.length) continue;
+
+                const first = solid[0];
+                const left = Math.min(...solid.map((glyph: any) => glyph.x));
+                const right = Math.max(...solid.map((glyph: any) => glyph.x + (glyph.charWidth || 0)));
+                const str = chars.map((glyph: any) =>
+                  typeof glyph === 'object' ? glyph.unicode || '' : ''
+                ).join('');
+
+                result.push({
+                  ...item,
+                  chars,
+                  str,
+                  width: Math.max(0, right - left),
+                  transform: [item.transform[0], item.transform[1], item.transform[2], item.transform[3], first.x, first.y],
+                  hasEOT: isLast ? item.hasEOT : true,
+                  hasEOL: isLast ? item.hasEOL : false,
+                });
+              }
+            }
+
+            const getExtent = (item: any) => {
+              const solid = (item.chars || []).filter((glyph: any) =>
+                glyph && typeof glyph === 'object' &&
+                typeof glyph.unicode === 'string' && glyph.unicode.trim() &&
+                Number.isFinite(glyph.x) && Number.isFinite(glyph.charWidth)
+              );
+              if (!solid.length) {
+                return item.transform
+                  ? { left: item.transform[4], right: item.transform[4] + (item.width || 0) }
+                  : null;
+              }
+              return {
+                left: Math.min(...solid.map((glyph: any) => glyph.x)),
+                right: Math.max(...solid.map((glyph: any) => glyph.x + (glyph.charWidth || 0))),
+              };
+            };
+
+            for (let i = 1; i < result.length; i++) {
+              const previous = result[i - 1];
+              const current = result[i];
+              if (!previous?.transform || !current?.transform || previous.hasEOT) continue;
+
+              const previousExtent = getExtent(previous);
+              const currentExtent = getExtent(current);
+              if (!previousExtent || !currentExtent) continue;
+
+              const sameLine = Math.abs(previous.transform[5] - current.transform[5]) <= BASELINE_TOLERANCE;
+              if (
+                sameLine &&
+                previousExtent.right <= currentExtent.left + START_TOLERANCE &&
+                isColumnStart(currentExtent.left)
+              ) {
+                previous.hasEOT = true;
+              }
+            }
+
+            const sortedStarts = [...starts].sort((a, b) => a.x - b.x);
+            const extents = result.map(getExtent);
+            pageColumnBorders = sortedStarts.map((start, index) => {
+              const previousStart = index > 0 ? sortedStarts[index - 1].x : -Infinity;
+              let previousRight = -Infinity;
+
+              extents.forEach(extent => {
+                if (
+                  extent &&
+                  extent.left >= previousStart - START_TOLERANCE &&
+                  extent.left < start.x - START_TOLERANCE &&
+                  extent.right <= start.x + START_TOLERANCE
+                ) {
+                  previousRight = Math.max(previousRight, extent.right);
+                }
+              });
+
+              const limit = start.x - 0.3;
+              return {
+                x: Number.isFinite(previousRight) ? Math.min(limit, previousRight + 0.3) : limit,
+                yFrom: start.yFrom,
+                yTo: start.yTo,
+              };
+            });
+
+            console.error('[COLUMN BORDERS]', pageColumnBorders.map(border => +border.x.toFixed(1)));
+            return result;
           }
 
           function clearChars(options) {
@@ -4972,7 +5592,16 @@ export function init({
 
 
           function determineHeaderRows(options) {
-            let { coordinates, rows, edges, rectangles, lineMaxWidth, customConditionFn, cols } = options;
+            let {
+              coordinates,
+              rows,
+              edges,
+              rectangles,
+              lineMaxWidth,
+              customConditionFn,
+              cols,
+              separatorRows = [],
+            } = options;
 
             function isHeaderIndicator(str) {
               str = str?.trim() || '';
@@ -5066,10 +5695,10 @@ export function init({
                   return res;
                 });
 
+                const rangeMargin = Math.max(medianBorderWidth * 2, 0.5);//old:(medianBorderWidth * 2)
                 let textBlocks = filterBlocks(coordinates.filter(item => item?.str), {
-                  'y': range.map((r, i) => {
-                    return i == 0 ? r - (medianBorderWidth * 2) : r + (medianBorderWidth * 2)
-                  }), strictIntersecting: true
+                  'y': range.map((r, i) => (i == 0 ? r - rangeMargin : r + rangeMargin)),
+                  strictIntersecting: true
                 });
                 console.error('[HEADER ROW TRACE] range', range.join('-'), 'textBlocks:', textBlocks.map(tb => tb.str));
 
@@ -5161,13 +5790,18 @@ export function init({
 
                   textBlocks?.forEach(textBlock => {
 
+                    const boundaryY = (element: any) =>
+                      element.vectorType === 'rectangle' && element.y + element.height <= textBlock.y + 0.5
+                        ? element.y + element.height
+                        : element.y;
+
                     let bottomElements = filterBlocks([
                       ...(coordinates || [])?.map(item => Object.assign({}, item, { vectorType: 'coordinate' })),
                       ...(edges || [])?.map(item => Object.assign({}, item, { vectorType: 'edge' })),
                       ...(rectangles || [])?.map(item => Object.assign({}, item, { vectorType: 'rectangle' })),
                     ], { 'x': [textBlock.x, textBlock.x + textBlock.width], 'y': [textBlock.y, 0], strictIntersecting: true })
                       ?.filter(item => item.vectorType == 'coordinate' ? true : isVisibleVector(item))//old:item.strokeColor || item.fillColor
-                      ?.sort(function (a, b) { return (b.y - a.y) }) || [];
+                      ?.sort((a, b) => boundaryY(b) - boundaryY(a)) || [];//old:  (b.y - a.y)
 
                     if (customConditionFn) {
                       let customCondition = customConditionFn({
@@ -5263,6 +5897,15 @@ export function init({
                           hasBottomBorder = ['rectangle', 'edge'].includes(firstOutsideRow?.vectorType);
                         }
                       }
+                    }
+
+                    // A row boundary synthesized from a full-width text gap separates this row
+                    // from the one below as reliably as a drawn line, even though no line exists.
+                    if (
+                      !hasBottomBorder &&
+                      separatorRows.some(y => Math.abs(y - range[1]) < 0.01)
+                    ) {
+                      hasBottomBorder = true;
                     }
                     if (range && range[0] >= 408 && range[0] <= 431) {
                       console.error('[HASBOTTOMBORDER TRACE]', {
@@ -5549,6 +6192,153 @@ export function init({
             return group;
           }
 
+          /**
+ * For tables whose row structure comes ONLY from filled bands (no stroked
+ * lines), the area above the topmost band edge has no geometric evidence:
+ * its rows can only be derived from the text itself.
+ *
+ *  1. A lone text block separated from the rest by a clearly visible gap is
+ *     a caption (page title), not a table row -> cut it off.
+ *  2. Text bands separated by a full-width vertical gap are different rows
+ *     (typically: header row vs. first unbanded data row) -> add a row
+ *     boundary in the middle of that gap.
+ */
+          function refineTextOnlyTopRows(group, lineMaxWidth) {
+            if (!group?.rows?.length || !group?.cols?.length || group.cols.length < 3) {
+              return group;
+            }
+
+            const hasStrokedRows = (group.edgesRows || []).length > 0;
+            const bandRows: number[] = group.rectanglesRows || [];
+
+            if (hasStrokedRows || bandRows.length < 4) {
+              return group;
+            }
+
+            const topBandRow = Math.max(...bandRows);
+
+            const openAreaBlocks = (group.coordinates || []).filter(block =>
+              block?.str?.trim() &&
+              Number.isFinite(block.y) &&
+              Number.isFinite(block.height) &&
+              block.y >= topBandRow - 0.5
+            );
+
+            if (openAreaBlocks.length < 2) {
+              return group;
+            }
+
+            const modalTextHeight =
+              +findMod((group.coordinates || []).map(block => block.height)) || 1;
+
+            // Group the blocks of the open area into vertical text bands
+            const bandMergeTolerance = 0.25;
+            const bands: Array<{ bottom: number; top: number; blocks: any[] }> = [];
+
+            [...openAreaBlocks]
+              .sort((a, b) => a.y - b.y)
+              .forEach(block => {
+                const bottom = block.y;
+                const top = block.y + block.height;
+                const lastBand = bands[bands.length - 1];
+
+                if (lastBand && bottom <= lastBand.top + bandMergeTolerance) {
+                  lastBand.top = Math.max(lastBand.top, top);
+                  lastBand.blocks.push(block);
+                } else {
+                  bands.push({ bottom, top, blocks: [block] });
+                }
+              });
+
+            // 1. Caption trimming (top band = last one, bands are sorted bottom-up)
+            const headerBlockIndexes = new Set(
+              (Object.values(group.headerRows || {}) as any[][])
+                .flat()
+                .map(block => block?.index)
+            );
+            const captionBlocks = new Set<any>();
+
+            while (bands.length > 1) {
+              const upper = bands[bands.length - 1];
+              const lower = bands[bands.length - 2];
+              const gap = upper.bottom - lower.top;
+
+              const isCaption =
+                upper.blocks.length === 1 &&
+                lower.blocks.length >= 2 &&
+                gap >= modalTextHeight * 0.75 &&
+                upper.blocks.every(block => !headerBlockIndexes.has(block.index));
+
+              if (!isCaption) {
+                break;
+              }
+
+              upper.blocks.forEach(block => captionBlocks.add(block));
+              bands.pop();
+            }
+
+            // 2. Row boundaries between text bands separated by a full-width gap
+            const minGap = Math.max(group.borderSize || 0.57, 1);
+            const synthesizedRows: number[] = [];
+
+            for (let i = 0; i < bands.length - 1; i++) {
+              const lower = bands[i];
+              const upper = bands[i + 1];
+              const gap = upper.bottom - lower.top;
+
+              if (gap < minGap || lower.blocks.length < 2 || upper.blocks.length < 2) {
+                continue;
+              }
+
+              const alreadySeparated = group.rows.some(
+                y => y >= lower.top - 0.5 && y <= upper.bottom + 0.5
+              );
+
+              if (!alreadySeparated) {
+                synthesizedRows.push(lower.top + gap / 2);
+              }
+            }
+
+            if (!captionBlocks.size && !synthesizedRows.length) {
+              return group;
+            }
+
+            if (captionBlocks.size) {
+              const keptTop = bands[bands.length - 1].top;
+              const existingTopRow = group.rows.find(y => Math.abs(y - keptTop) < 0.5);
+              const topRow = existingTopRow !== undefined ? existingTopRow : keptTop;
+
+              group.rows = [...new Set([...group.rows.filter(y => y <= topRow + 1e-6), topRow])];
+              group.coordinates = (group.coordinates || []).filter(
+                block => !captionBlocks.has(block)
+              );
+            }
+
+            group.rows = [...new Set([...group.rows, ...synthesizedRows])]
+              .sort((a, b) => a - b);
+            group.synthesizedRows = [...(group.synthesizedRows || []), ...synthesizedRows];
+            group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: [...group.rows],
+              cols: group.cols || [],
+              lineMaxWidth,
+              separatorRows: group.synthesizedRows || [],
+            });
+
+            console.error('[TEXT-ONLY TOP ROWS]', {
+              removedCaptions: [...captionBlocks].map(block => block.str),
+              synthesizedRows,
+              rows: [...group.rows].sort((a, b) => b - a).slice(0, 4),
+              headerRows: Object.keys(group.headerRows),
+            });
+
+            return group;
+          }
+
           //Function for defining tables
           function defineGroups(options) {
             let { item, type, axis, tolerance, groups, lineMaxWidth, downcheck } = options;
@@ -5758,20 +6548,34 @@ export function init({
             //Find the modulus of text height
             let modeTextHeight = findMod(coordinates.map(item => item.height));
 
+            // The baseline of a single visual line may vary by tenths of a point
+            // (Td ty = ±0.014 em); this must be a SINGLE line key. Otherwise, the even/odd
+            // processing described below will measure the jitter instead of the spacing between lines.
+            const baselineJitter = Math.min(0.5, modeTextHeight * 0.1);
+            const sortedBaselines = [...new Set<number>(coordinates.map(item => item.y))].sort((a, b) => a - b);
+            const baselineKeys = new Map<number, number>();
+            let clusterStart = -Infinity;
+
+            for (const baseline of sortedBaselines) {
+              if (baseline - clusterStart > baselineJitter) {
+                clusterStart = baseline;
+              }
+              baselineKeys.set(baseline, clusterStart);
+            }
+
             //Create an object with y-coordinates grouping
             let obj = coordinates.reduce((prev, cur) => {
-              prev[cur.y] = [...(prev[cur.y] || []), cur.y + cur.height];
+              const key = baselineKeys.get(cur.y);
+              prev[key] = [...(prev[key] || []), cur.y + cur.height];
               return prev;
             }, {});
 
             //Sort object keys
             let sortedKeys = Object.keys(obj).sort((a: any, b: any) => a - b);
-
             //Create a data array by alternating keys and values
             let data = sortedKeys.reduce((prev, key: any, index) => {
               let value = +findMod(obj[key]);
               key = +key;
-
               if (index % 2) {
                 prev.push(key);
               } else {
@@ -5779,7 +6583,7 @@ export function init({
               }
               return prev;
             }, [])
-              .sort((a, b) => a - b);//Sort an array of data
+              .sort((a, b) => a - b);
 
             //Calculate distances between elements of a data array and filter them out
             let distances = data.slice(1).reduce((prev, cur, index) => {
@@ -5868,6 +6672,7 @@ export function init({
 
             tableGroups = tableGroups.map(group => extendGroupTopBorder(group, pageGroups[0], lineMaxWidth));
             tableGroups = tableGroups.map(group => trimUnsupportedTrailingRows(group, lineMaxWidth));//!BUG fpdf_example-1.pdf (the last row of the table is missing)
+            tableGroups = tableGroups.map(group => refineTextOnlyTopRows(group, lineMaxWidth));
 
             // The order of the tables in the result should correspond to the reading order (from top to bottom on the page), not the order in which they were randomly arranged by clustering.
             tableGroups = [...tableGroups].sort((a, b) => {
@@ -5888,6 +6693,14 @@ export function init({
                 coordinate.str.trim().length > 0;
               return groups.reduce((prev, group, index, arr) => {
                 const prevGroupsLength = prev.length;
+
+                const sourceGroup = {
+                  ...group,
+                  rows: [...(group.rows || [])],
+                  cols: [...(group.cols || [])],
+                  x: group.x ? [...group.x] : group.x,
+                  y: group.y ? [...group.y] : group.y,
+                };
 
                 let headerRanges = [];
                 const forcedRowSplits = new Set();
@@ -6647,6 +7460,14 @@ export function init({
                   return prev;
                 }, []);
 
+                console.error('[SPLIT]', {
+                  headerRows: Object.keys(group.headerRows),
+                  rows: group.rows.length,
+                  cols: group.cols.length,
+                  rowsRanges: rowsRanges.map((range) => range.length),
+                  colsRangesGroups: colsRangesGroups.map((ranges) => ranges?.map((range) => range.length)),
+                });
+
                 for (let rowsRangeIndex = 0; rowsRangeIndex < rowsRanges.length; rowsRangeIndex++) {// needs improvement?
                   const rowsRange = rowsRanges[rowsRangeIndex];
                   for (let colsRangeIndex = 0; colsRangeIndex < colsRangesGroups[rowsRangeIndex]?.length || 0; colsRangeIndex++) {
@@ -6699,6 +7520,153 @@ export function init({
                         })
                     ];
                   }
+                }
+
+                const generatedGroups = prev.slice(prevGroupsLength);
+
+                const getBounds = (values: number[] | undefined) => {
+                  if (!values?.length) {
+                    return null;
+                  }
+
+                  return [
+                    Math.min(...values),
+                    Math.max(...values),
+                  ] as const;
+                };
+
+                const sourceCols = [...(sourceGroup.cols || [])]
+                  .sort((a, b) => a - b);
+
+                const findColumn = (x: number) => {
+                  for (let i = 0; i < sourceCols.length - 1; i++) {
+                    if (x >= sourceCols[i] && x < sourceCols[i + 1]) {
+                      return i;
+                    }
+                  }
+
+                  return -1;
+                };
+
+                const sameSourceRowWasDuplicated = (
+                  first: any,
+                  second: any,
+                ): boolean => {
+                  const firstX = getBounds(first.x);
+                  const secondX = getBounds(second.x);
+                  const firstY = getBounds(first.y);
+                  const secondY = getBounds(second.y);
+
+                  if (!firstX || !secondX || !firstY || !secondY) {
+                    return false;
+                  }
+
+                  const xOverlap =
+                    Math.min(firstX[1], secondX[1]) -
+                    Math.max(firstX[0], secondX[0]);
+
+                  const smallerWidth = Math.min(
+                    firstX[1] - firstX[0],
+                    secondX[1] - secondX[0],
+                  );
+
+                  const yOverlap =
+                    Math.min(firstY[1], secondY[1]) -
+                    Math.max(firstY[0], secondY[0]);
+
+                  if (
+                    smallerWidth <= 0 ||
+                    xOverlap < smallerWidth * 0.8 ||
+                    yOverlap <= 0
+                  ) {
+                    return false;
+                  }
+
+                  const firstIndexes = new Set(
+                    (first.coordinates || [])
+                      .map((item: any) => item.index)
+                      .filter((index: any) => index != null),
+                  );
+
+                  const secondIndexes = new Set(
+                    (second.coordinates || [])
+                      .map((item: any) => item.index)
+                      .filter((index: any) => index != null),
+                  );
+
+                  const sharedCoordinates = (sourceGroup.coordinates || [])
+                    .filter((item: any) =>
+                      item.index != null &&
+                      firstIndexes.has(item.index) &&
+                      secondIndexes.has(item.index) &&
+                      typeof item.str === 'string' &&
+                      item.str.trim().length > 0
+                    );
+
+                  const rowTolerance = 1.5;
+                  const rowClusters: Array<{
+                    y: number;
+                    columns: Set<number>;
+                  }> = [];
+
+                  for (const item of sharedCoordinates) {
+                    const centerX = item.x + (item.width || 0) / 2;
+                    const column = findColumn(centerX);
+
+                    if (column < 0) {
+                      continue;
+                    }
+
+                    let cluster = rowClusters.find(row =>
+                      Math.abs(row.y - item.y) <= rowTolerance
+                    );
+
+                    if (!cluster) {
+                      cluster = {
+                        y: item.y,
+                        columns: new Set<number>(),
+                      };
+
+                      rowClusters.push(cluster);
+                    }
+
+                    cluster.columns.add(column);
+                  }
+
+                  return rowClusters.some(row => row.columns.size >= 2);
+                };
+
+                let duplicatedBoundaryRow = false;
+
+                for (
+                  let i = 0;
+                  i < generatedGroups.length && !duplicatedBoundaryRow;
+                  i++
+                ) {
+                  for (
+                    let j = i + 1;
+                    j < generatedGroups.length && !duplicatedBoundaryRow;
+                    j++
+                  ) {
+                    duplicatedBoundaryRow = sameSourceRowWasDuplicated(
+                      generatedGroups[i],
+                      generatedGroups[j],
+                    );
+                  }
+                }
+
+                if (generatedGroups.length > 1 && duplicatedBoundaryRow) {
+                  prev.splice(
+                    prevGroupsLength,
+                    generatedGroups.length,
+                    sourceGroup,
+                  );
+
+                  console.error('[SPLIT REJECTED: DUPLICATED SOURCE ROW]', {
+                    generatedGroups: generatedGroups.length,
+                    sourceRows: sourceGroup.rows.length,
+                    sourceCols: sourceGroup.cols.length,
+                  });
                 }
 
                 // --- Safety net for nested rectangles --------------------------------
@@ -6758,6 +7726,35 @@ export function init({
                 group['assuredRows'] = assuredRows || [...new Set(mergeCoordinates([...group['edgesRows'], ...group['rectanglesRows']].sort((a, b) => a - b), group['edgesRows'], { averageMerge: true, threshold: lineMaxWidth }))];
                 group['assuredCols'] = assuredCols || [...new Set(mergeCoordinates([...group['edgesCols'], ...group['rectanglesCols']].sort((a, b) => a - b), group['edgesCols'], { averageMerge: true, threshold: lineMaxWidth }))];
 
+                // A group without vertical lines—the columns found based on alignment act as vertical boundaries
+                if (
+                  !assuredCols &&
+                  !(group['edgesCols'] || []).length &&
+                  pageColumnBorders.length &&
+                  group['x'] &&
+                  group['y']
+                ) {
+                  const [groupX0, groupX1] = group['x'];
+                  const [groupY0, groupY1] = group['y'];
+
+                  const borders = pageColumnBorders
+                    .filter((border) => {
+                      const span = Math.max(border.yTo - border.yFrom, 1);
+                      const overlap = Math.min(border.yTo, groupY1) - Math.max(border.yFrom, groupY0);
+                      return (
+                        border.x > groupX0 + lineMaxWidth &&
+                        border.x < groupX1 - lineMaxWidth &&
+                        overlap / span >= 0.6 // The column should mostly fall within this group
+                      );
+                    })
+                    .map((border) => border.x);
+
+                  if (borders.length) {
+                    group['assuredCols'] = [...new Set([...group['assuredCols'], ...borders])]
+                      .sort((a: number, b: number) => a - b);
+                  }
+                }
+
                 let alias = group['alias'] = {};
                 group['rows'] = mergeCoordinates([...(group['rows'] || []), ...(group['assuredRows'] || [])].sort((a, b) => a - b), group['assuredRows'], { averageMerge: true, threshold: lineMaxWidth });
                 let handledRows = getHandledGridItems({
@@ -6766,6 +7763,19 @@ export function init({
                   coordinates: group['coordinates'] || [],
                   assuredGridItems: group['assuredRows'] || []
                 });
+                if (tolerance !== Infinity && !assuredRows) {
+                  const fmt = (values: number[] = []) => values.map(v => +v.toFixed(2));
+
+                  console.error('[M27 P2 CREATEGROUP ROWS]', {
+                    tolerance,
+                    x: fmt(group['x']),
+                    y: fmt(group['y']),
+                    assuredRows: fmt(group['assuredRows']),
+                    rowsBefore: fmt(group['rows']),
+                    rowsAfter: fmt(handledRows.gridItems),
+                    alias: handledRows.alias,
+                  });
+                }
                 alias['rows'] = handledRows.alias;
                 group['rows'] = handledRows.gridItems;
                 group['paddingSize'] = handledRows.paddingSize;
@@ -7312,13 +8322,9 @@ export function init({
           //Function for generating virtual edges
           function generateVirtualEdges(options) {
             let {
-              cols,
-              rows,
-              coordinates,
-              assuredEdges,
-              lineMaxWidth,
-              paddingSize,
-              headerRows
+              cols, rows, coordinates, assuredEdges, lineMaxWidth,
+              paddingSize, headerRows,
+              protectedRows = []
             } = options;
             cols = [...cols].sort((a, b) => a - b);
             rows = [...rows].sort((a, b) => a - b);
@@ -7628,6 +8634,125 @@ export function init({
               return !isMarginalTouch;
             }
 
+            // ---- Merged cells: virtual vertical edges that no real line backs --------
+            // Rows are assigned exactly as extractTableData() does: by text baseline.
+            const columnCount = cols.length - 1;
+            const MERGE_CROSS_TOLERANCE = Math.max(borderSize * 2, 1);
+            const MIN_NEIGHBOUR_COLUMN_COVERAGE = 0.8;
+            const ENABLE_EMPTY_NEIGHBOUR_MERGE = true;
+
+            const getColumnIndexByX = (x: number): number => {
+              for (let c = 0; c < columnCount; c++) {
+                if (x >= cols[c] && x < cols[c + 1]) {
+                  return c;
+                }
+              }
+
+              return -1;
+            };
+
+            const getBlockLeft = (block: any): number =>
+              Number(block?.transform?.[4] ?? block?.x);
+
+            // rows are sorted ascending here, so mergeRowInfos[j] is the row
+            // between rows[j] (bottom) and rows[j + 1] (top)
+            const mergeRowInfos = rows.slice(1).map((topY, index) => {
+              const bottomY = rows[index];
+
+              const blocks = coordinates.filter(block => {
+                if (!block?.str?.trim()) {
+                  return false;
+                }
+
+                const baseline = Number(block?.transform?.[5] ?? block?.y);
+
+                return Number.isFinite(baseline)
+                  && baseline > bottomY
+                  && baseline <= topY;
+              });
+
+              const columns = new Set<number>(
+                blocks
+                  .map(block => getColumnIndexByX(getBlockLeft(block)))
+                  .filter(column => column >= 0)
+              );
+
+              return { blocks, columns };
+            });
+
+            const populatedRows = mergeRowInfos.filter(row => row.blocks.length > 0);
+
+            const columnCoverage = Array.from({ length: columnCount }, (_, column) =>
+              populatedRows.length
+                ? populatedRows.filter(row => row.columns.has(column)).length
+                / populatedRows.length
+                : 0
+            );
+
+            function getVirtualBoundaryMergeReason(
+              borderIndex: number,
+              rowIndex: number
+            ): string | null {
+              const row = mergeRowInfos[rowIndex];
+
+              if (!row || !row.blocks.length || borderIndex < 1 || borderIndex > columnCount - 1) {
+                return null;
+              }
+
+              const x = cols[borderIndex];
+              const leftColumn = borderIndex - 1;
+              const rightColumn = borderIndex;
+
+              // A block that starts in the right column means two separate cells.
+              if (row.columns.has(rightColumn)) {
+                return null;
+              }
+
+              // 1. Visible text runs across the separator.
+              //    block.width already excludes trailing spaces.
+              const crossesBoundary = row.blocks.some(block => {
+                const left = getBlockLeft(block);
+                const right = left + Number(block.width);
+
+                return Number.isFinite(left)
+                  && Number.isFinite(right)
+                  && left < x - MERGE_CROSS_TOLERANCE
+                  && right > x + MERGE_CROSS_TOLERANCE;
+              });
+
+              if (crossesBoundary) {
+                return 'text-crosses-boundary';
+              }
+
+              // 2. The only empty column of the row is the right neighbour of a
+              //    multiline cell, and that column is normally filled in other rows.
+              if (!ENABLE_EMPTY_NEIGHBOUR_MERGE) {
+                return null;
+              }
+
+              const emptyColumns: number[] = [];
+
+              for (let column = 0; column < columnCount; column++) {
+                if (!row.columns.has(column)) {
+                  emptyColumns.push(column);
+                }
+              }
+
+              if (emptyColumns.length !== 1 || emptyColumns[0] !== rightColumn) {
+                return null;
+              }
+
+              const hasMultilineLeftCell = row.blocks.some(block =>
+                getColumnIndexByX(getBlockLeft(block)) === leftColumn
+                && String(block.str || '').includes('\n')
+              );
+
+              return hasMultilineLeftCell
+                && columnCoverage[rightColumn] >= MIN_NEIGHBOUR_COLUMN_COVERAGE
+                ? 'empty-neighbour-of-multiline-cell'
+                : null;
+            }
+
             let verticalEdges = [];
             for (let i = 0; i < cols.length; i++) {
               // The left and right boundaries of the table are not suppressed
@@ -7654,6 +8779,21 @@ export function init({
                   isOuterBoundary ||
                   isEdgeBackedByRealLine(edge, relatedAssuredEdge, false);
 
+                const mergeReason = isProtectedEdge
+                  ? null
+                  : getVirtualBoundaryMergeReason(i, j);
+                const isSuppressedByMerge = mergeReason !== null;
+
+                if (isSuppressedByMerge) {
+                  deletedEdges.push(edge);
+                  console.error('[VIRTUAL EDGE MERGE]', {
+                    reason: mergeReason,
+                    col: i,
+                    rowFrom: +y.toFixed(2),
+                    rowTo: +nextY.toFixed(2),
+                  });
+                }
+
                 for (let k = 0; k < coordinates.length && !isProtectedEdge; k++) {
                   let textBlock = coordinates[k];
                   let intersectingElements = verticalIntersectorsByCoordinate[k];
@@ -7677,8 +8817,9 @@ export function init({
                   }
                 }
 
-                if (!isIntersectingTextBlock) {
+                if (!isIntersectingTextBlock && !isSuppressedByMerge) {
                   let newEdge: any = edge;
+
                   if (!newEdge.used) {
                     newEdge.used = true;
                     verticalEdges.push(newEdge);
@@ -7702,6 +8843,13 @@ export function init({
                 let isIntersectingTextBlock: any = false;
                 let isOuterBoundary = (i === 0 || i === rows.length - 1);
 
+                // A row boundary synthesized from a text gap has no line behind it by
+                // definition, so the "text crosses many lines" heuristic must not drop it.
+                const isSynthesizedBoundary = protectedRows.some(
+                  (y: number) => Math.abs(y - rows[i]) < 0.01
+                );
+
+
                 // Count once per edge
                 let relatedAssuredEdge = getRelatedAssuredEdge(edge, horizontalAssuredEdges);
                 if (relatedAssuredEdge) {
@@ -7711,10 +8859,9 @@ export function init({
                   }
                 }
 
-                // NEW
-                let isProtectedEdge =
-                  isOuterBoundary ||
-                  isEdgeBackedByRealLine(edge, relatedAssuredEdge, true);
+                let isProtectedEdge = isOuterBoundary
+                  || isSynthesizedBoundary
+                  || isEdgeBackedByRealLine(edge, relatedAssuredEdge, true);
 
                 for (let k = 0; k < coordinates.length && !isProtectedEdge; k++) {
                   let textBlock = coordinates[k];
@@ -7743,7 +8890,7 @@ export function init({
                     });
                   }
 
-                  // было: !isOuterBoundary && ... && !relatedAssuredEdge
+                  // old: !isOuterBoundary && ... && !relatedAssuredEdge
                   if (intersectingGridItems.length > 3 && edgeOnSameAxis) {
                     isIntersectingTextBlock = textBlock;
                     deletedEdges.push(edge);
@@ -8011,8 +9158,46 @@ export function init({
           },[])
           */
 
+          const m27Pattern =
+            /LICENSE|NUMBER|632426|ALPHABETIC|PREMISE|FRESCOS|19 INC|604941/i;
+
+          const m27ItemInfo = (item: any) => ({
+            index: item.index,
+            str: item.str,
+            x: item.x ?? item.transform?.[4],
+            y: item.y ?? item.transform?.[5],
+            width: item.width,
+            height: item.height,
+            hasEOT: item.hasEOT,
+            hasEOL: item.hasEOL,
+            chars: (item.chars || []).map((ch: any) => ({
+              unicode: ch.unicode,
+              fontChar: ch.fontChar,
+              charWidth: ch.charWidth,
+              width: ch.width,
+              x: ch.x,
+              transform: ch.transform,
+            })),
+          });
+
+          console.error(
+            '[M27 RAW TEXT]',
+            tableContentItems
+              .filter((item: any) => m27Pattern.test(item?.str || ''))
+              .map(m27ItemInfo)
+          );
+
           //Extracting text coordinates
           let coordinates = extractCoordinates(tableContentItems);
+
+          console.error(
+            '[M27 EXTRACTED TEXT]',
+            coordinates
+              .filter((item: any) => m27Pattern.test(item?.str || ''))
+              .map(m27ItemInfo)
+          );
+
+          console.error('[M27 COLUMN BORDERS]', pageColumnBorders);
 
           console.error(`[DEBUG Page ${pageNum}] coordinates:`, coordinates.length);
           if (coordinates.length > 0) {
@@ -8036,8 +9221,28 @@ export function init({
           }
           console.error(`[DEBUG Page ${pageNum}] nested rectangles:`, nestedRectangles.size);
 
+          if (debugTrace) {
+            // These are copies made before grouping and before replacing the edges with virtual edges.
+            debugTrace.items = tableContentItems.map((item: any) => item ? ({
+              ...item,
+              transform: item.transform ? Array.from(item.transform) : item.transform,
+              __pdfTraceOpIndexes: item.__pdfTraceOpIndexes
+                ? Array.from(item.__pdfTraceOpIndexes)
+                : item.__pdfTraceOpIndexes,
+            }) : item);
+
+            debugTrace.edges = edges.map((edge: any) => ({ ...edge }));
+            debugTrace.rectangles = rectangles.map((rect: any) => ({ ...rect }));
+          }
+
           //Defining cell boundaries
           let { tableGroups, pageGroups } = getGroups();
+
+          if (debugTrace) {
+            debugTrace.tableGroups = tableGroups;
+            debugTrace.pageGroups = pageGroups;
+            debugTrace.cleanupRoots.push(tableGroups, pageGroups);
+          }
 
           console.error(`[DEBUG Page ${pageNum}] tableGroups:`, tableGroups.length);
           tableGroups.forEach((g, i) => {
@@ -8059,6 +9264,7 @@ export function init({
               lineMaxWidth,
               paddingSize: tableGroup.paddingSize,
               headerRows: tableGroup.headerRows,
+              protectedRows: tableGroup.synthesizedRows || [],
               //threshold
             });
 
@@ -9401,21 +10607,64 @@ export function init({
                   for (let i = 0; i < verticles.length - 1; i++) {
                     if (x >= verticles[i].x && x < verticles[i + 1].x) {
                       const hasNextColumn = i + 1 < verticles.length - 1;
-                      const isJustBeforeNextBorder =
-                        verticles[i + 1].x - x <= columnSnapTolerance;
+                      const isJustBeforeNextBorder = verticles[i + 1].x - x <= columnSnapTolerance;
 
                       col = hasNextColumn && isJustBeforeNextBorder ? i + 1 : i;
                       break;
                     }
                   }
+
+                  // Fallback: the text origin is outside the grid, but most of its
+                  // horizontal extent belongs to a column.
+                  if (col === -1 && Number.isFinite(x)) {
+                    const itemWidth = Number(item?.width);
+
+                    if (Number.isFinite(itemWidth) && itemWidth > 0) {
+                      const itemLeft = Math.min(x, x + itemWidth);
+                      const itemRight = Math.max(x, x + itemWidth);
+                      const itemExtent = itemRight - itemLeft;
+
+                      let bestCol = -1;
+                      let bestOverlap = 0;
+
+                      for (let i = 0; i < verticles.length - 1; i++) {
+                        const overlap = Math.max(
+                          0,
+                          Math.min(itemRight, verticles[i + 1].x) -
+                          Math.max(itemLeft, verticles[i].x)
+                        );
+
+                        if (overlap > bestOverlap) {
+                          bestOverlap = overlap;
+                          bestCol = i;
+                        }
+                      }
+
+                      // Require most of the text extent to belong to one column.
+                      if (bestCol !== -1 && bestOverlap / itemExtent >= 0.5) {
+                        col = bestCol;
+                      }
+                    }
+                  }
+
                   if (col === -1) {
                     continue;
                   }
 
                   // Looking for the row
                   let row = -1;
+
+                  const lastRowIndex = horizons.length - 2;
+                  const lastRowBottomTolerance = 0.5;
+
                   for (let i = 0; i < horizons.length - 1; i++) {
-                    if (y <= horizons[i].y && y > horizons[i + 1].y) {
+                    const bottomBoundary = horizons[i + 1].y;
+
+                    const lowerLimit = i === lastRowIndex
+                      ? bottomBoundary - lastRowBottomTolerance
+                      : bottomBoundary;
+
+                    if (y <= horizons[i].y && y > lowerLimit) {
                       row = i;
                       break;
                     }
@@ -9541,50 +10790,63 @@ export function init({
                         });
                       }
 
-                      const fillRectangle = (rectangles || []).find(rectangle => {
-                        if (
-                          rectangle?.fillColor == null &&
-                          !Array.isArray(rectangle?.fillRGBColor)
-                        ) {
-                          return false;
-                        }
+                      const cellArea =
+                        (cellX2 - cellX1) * (cellY2 - cellY1);
 
-                        const rectX1 = Number(
-                          rectangle?.x ?? rectangle?.transform?.[4]
-                        );
-                        const rectY1 = Number(
-                          rectangle?.y ?? rectangle?.transform?.[5]
-                        );
+                      const fillRectangle = (rectangles || [])
+                        .map(rectangle => {
+                          const fillColor =
+                            rectangle?.fillColor ??
+                            (Array.isArray(rectangle?.fillRGBColor)
+                              ? `rgb(${rectangle.fillRGBColor.join(',')})`
+                              : null);
 
-                        const rectWidth = Math.abs(
-                          Number(rectangle?.width) || 0
-                        );
-                        const rectHeight = Math.abs(
-                          Number(rectangle?.height) || 0
-                        );
+                          if (!fillColor) {
+                            return null;
+                          }
 
-                        if (
-                          !Number.isFinite(rectX1) ||
-                          !Number.isFinite(rectY1) ||
-                          rectWidth <= 0 ||
-                          rectHeight <= 0
-                        ) {
-                          return false;
-                        }
+                          const x1 = Number(rectangle?.x ?? rectangle?.transform?.[4]);
+                          const y1 = Number(rectangle?.y ?? rectangle?.transform?.[5]);
+                          const width = Math.abs(Number(rectangle?.width) || 0);
+                          const height = Math.abs(Number(rectangle?.height) || 0);
 
-                        const rectX2 = rectX1 + rectWidth;
-                        const rectY2 = rectY1 + rectHeight;
+                          if (
+                            !Number.isFinite(x1) ||
+                            !Number.isFinite(y1) ||
+                            width <= 0 ||
+                            height <= 0 ||
+                            cellArea <= 0
+                          ) {
+                            return null;
+                          }
 
-                        return (
-                          Math.abs(rectX1 - cellX1) <= tolerance &&
-                          Math.abs(rectX2 - cellX2) <= tolerance &&
-                          Math.abs(rectY1 - cellY1) <= tolerance &&
-                          Math.abs(rectY2 - cellY2) <= tolerance
-                        );
-                      });
+                          const overlapWidth = Math.max(
+                            0,
+                            Math.min(cellX2, x1 + width) - Math.max(cellX1, x1)
+                          );
+
+                          const overlapHeight = Math.max(
+                            0,
+                            Math.min(cellY2, y1 + height) - Math.max(cellY1, y1)
+                          );
+
+                          const coverage =
+                            overlapWidth * overlapHeight / cellArea;
+
+                          return { fillColor, coverage };
+                        })
+                        .filter(
+                          (candidate): candidate is {
+                            fillColor: string;
+                            coverage: number;
+                          } => candidate !== null && candidate.coverage >= 0.75
+                        )
+                        .sort((a, b) => b.coverage - a.coverage)[0];
+
+
 
                       if (fillRectangle) {
-                        table.array[row][col]['fillColor'] =
+                        table.array[row][col]['fillColor'] = //old:fillRectangle.fillColor;
                           fillRectangle.fillColor ??
                           (
                             Array.isArray(fillRectangle.fillRGBColor)
@@ -9695,6 +10957,37 @@ export function init({
 
                 return count;
               })();
+
+              console.error('[M27 FINAL STRUCTURE]', {
+                headerRows,
+                topHeaderRowCount,
+                groupRows: tableGroup?.rows,
+                groupCols: tableGroup?.cols,
+                horizons: horizons.map((item: any) => item.y),
+                verticles: verticles.map((item: any) => item.x),
+                text: coordinates
+                  .filter((item: any) =>
+                    /LICENSE|NUMBER|632426|FRESCOS|19 INC|604941|PREMISE|ALPHABETIC/i
+                      .test(item?.str || '')
+                  )
+                  .map((item: any) => ({
+                    index: item.index,
+                    str: item.str,
+                    x: item.x,
+                    y: item.y,
+                    width: item.width,
+                    height: item.height,
+                    transform: item.transform,
+                  })),
+                topText: coordinates
+                  .filter((item: any) => item.y > 480)
+                  .map((item: any) => [
+                    (item.str || '').slice(0, 25),
+                    +item.x.toFixed(1),
+                    +item.y.toFixed(1),
+                    +item.height.toFixed(1),
+                  ]),
+              });
 
               // Generate HTML table
               table.html = (() => {
@@ -10015,8 +11308,9 @@ export function init({
                         console.error(`[WARN JSON] headerPaths[${colIndex}] undefined for row ${rowIdx}`);
                         return;
                       }
-                      if (row[colIndex]?.str) {
-                        deepSet(obj, headerPaths[colIndex], row[colIndex].str, {
+                      let str = row[colIndex]?.str?.trim() || '';
+                      if (str) {
+                        deepSet(obj, headerPaths[colIndex], str, {
                           create: true,
                           separator: PATH_SEP,
                           customSplitRegExp: PATH_SPLIT_RE
@@ -10058,6 +11352,64 @@ export function init({
             }
           }
 
+          if (debugTrace?.options?.onReport) {
+
+            function stripDebugMetadata(roots: unknown[]): void {
+              const seen = new WeakSet<object>();
+
+              const visit = (value: any): void => {
+                if (!value || typeof value !== 'object' || seen.has(value)) return;
+                seen.add(value);
+                delete value.__pdfTraceOpIndex;
+                delete value.__pdfTraceOpIndexes;
+                for (const key of Object.keys(value)) visit(value[key]);
+              };
+
+              for (const root of roots) visit(root);
+            }
+
+            const options = debugTrace.options;
+            const expectedHtml = typeof options.expectedHtml === 'string'
+              ? options.expectedHtml
+              : options.expectedHtml?.[debugTrace.pageNumber];
+
+            const groups = debugTrace.tableGroups || [];
+            const tables = groups
+              .filter((group: any) => !!group?.tableData?.table?.array)
+              .map((group: any) => ({
+                group,
+                array: group.tableData.table.array,
+              }));
+
+            const text = buildDebugReport({
+              pageNumber: debugTrace.pageNumber,
+              pageSize: debugTrace.pageSize,
+              opList: debugTrace.opList,
+              pdfjsOps: debugTrace.pdfjsOps,
+              pdfjsItems: debugTrace.pdfjsItems,
+              items: debugTrace.items,
+              edges: debugTrace.edges,
+              rectangles: debugTrace.rectangles,
+              lineMaxWidth: debugTrace.lineMaxWidth,
+              tableGroups: groups,
+              tables,
+              level: options.level,
+              region: options.region,
+              maxItems: options.maxItems,
+              numberDigits: options.numberDigits,
+              minify: options.minify,
+              opWindow: options.opWindow,
+              compareTextPositions: options.compareTextPositions,
+              expectedHtml,
+            });
+
+            try {
+              options.onReport({ page: debugTrace.pageNumber, text });
+            } finally {
+              stripDebugMetadata(debugTrace.cleanupRoots);
+            }
+          }
+
           result.pageTables.push({
             page: pageNum,
             tableGroups,
@@ -10082,7 +11434,7 @@ export function init({
   };
 
   async function extractorRun(options) {
-    let { dataArray, onProgress, onSuccess, onError, pages } = options;
+    let { dataArray, onProgress, onSuccess, onError, pages, debug } = options;
 
     let docParams: any = { data: dataArray };
     if (standardFontDataUrl) {
@@ -10107,7 +11459,7 @@ export function init({
       console.error('[DIAG] has restore (11)?', uniqueFns.includes(11));
       // ===================================
 
-      let extractorResults = await extractor(documentProxy, onProgress, pages);
+      let extractorResults = await extractor({ doc: documentProxy, onProgress, pages, debugOptions: debug });
       let results = { extractorResults, documentProxy };
       if (onSuccess) {
         onSuccess(results);
