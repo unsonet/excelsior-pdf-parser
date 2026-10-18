@@ -14,13 +14,18 @@ export type Region = { x1: number; y1: number; x2: number; y2: number };
 
 export type OperationWindow = { from: number; to: number };
 
+export type OperationWindowInput =
+    | OperationWindow
+    | number[]
+    | readonly [number, number];
+
 export interface DebugOptions {
     /** summary=L0, trace=L1, ops=L2, tables=L3. Defaults to summary. */
     level?: DebugLevel;
     /** Region in the extractor's page coordinate frame; affects extractor text and graphics. */
     region?: Region;
     /** Zero-based PDF.js OperatorList indices. Defaults to the first 48 operations at level ops. */
-    opWindow?: OperationWindow;
+    opWindow?: OperationWindowInput;
     onReport?: (report: DebugReport) => void;
     /** Maximum text/graphic/table items shown in detailed sections. Default: 80. */
     maxItems?: number;
@@ -29,7 +34,7 @@ export interface DebugOptions {
     /** Set true only when PDF.js and extractor text transforms are known to share a coordinate frame. */
     compareTextPositions?: boolean;
     /** Optional caller-supplied reference HTML, included only at level tables. */
-    expectedHtml?: string|  Record<number, string>;
+    expectedHtml?: string | Record<number, string>;
     /** Return compact pseudo-JSON text instead of a JavaScript object. Default: false. */
     minify?: boolean;
 }
@@ -70,6 +75,42 @@ export type DebugReport = { page: number; data: DebugReportData | string };
 const DEFAULT_MAX_ITEMS = 100;
 const DEFAULT_OP_WINDOW = 48;
 const NUMBER_DIGITS = 3;
+
+/**
+ * Normalize public opWindow syntax to the internal object representation.
+ */
+function normalizeOperationWindow(
+    requested?: OperationWindowInput,
+): OperationWindow | undefined {
+    if (requested == null) {
+        return undefined;
+    }
+
+    let from: number;
+    let to: number;
+
+    if (Array.isArray(requested)) {
+        if (requested.length !== 2) {
+            throw new TypeError(
+                'debug.opWindow must be { from, to } or [from, to].',
+            );
+        }
+
+        [from, to] = requested;
+    } else {
+        const window = requested as OperationWindow;
+        from = window.from;
+        to = window.to;
+    }
+
+    if (!Number.isFinite(from) || !Number.isFinite(to)) {
+        throw new TypeError(
+            'debug.opWindow indices must be finite numbers.',
+        );
+    }
+
+    return { from, to };
+}
 
 const MNEMONIC: Record<string, string> = {
     setLineWidth: 'w', setLineCap: 'J', setLineJoin: 'j', setMiterLimit: 'M', setDash: 'd',
@@ -1161,11 +1202,33 @@ export function buildDebugReport(input: DebugPageSnapshot & DebugOptions): Debug
             .map((entry) => Number(entry[2]))
             .filter(Number.isFinite)
             .sort((a, b) => a - b)[0];
-        const automaticWindow = options.opWindow ?? (firstUnhandled == null
-            ? { from: 0, to: Math.min(snapshot.opList.fnArray.length - 1, DEFAULT_OP_WINDOW - 1) }
-            : { from: Math.max(0, firstUnhandled - 8), to: Math.min(snapshot.opList.fnArray.length - 1, firstUnhandled + 12) });
-        report.opWindow = compactOps(snapshot, automaticWindow, maxItems, numberDigits);
-        if (!options.opWindow) {
+
+        const requestedWindow = normalizeOperationWindow(options.opWindow);
+
+        const selectedWindow = requestedWindow ?? (firstUnhandled == null
+            ? {
+                from: 0,
+                to: Math.min(
+                    snapshot.opList.fnArray.length - 1,
+                    DEFAULT_OP_WINDOW - 1,
+                ),
+            }
+            : {
+                from: Math.max(0, firstUnhandled - 8),
+                to: Math.min(
+                    snapshot.opList.fnArray.length - 1,
+                    firstUnhandled + 12,
+                ),
+            });
+
+        report.opWindow = compactOps(
+            snapshot,
+            selectedWindow,
+            maxItems,
+            numberDigits,
+        );
+
+        if (!requestedWindow) {
             (report.opWindow as any).automatic = true;
             (report.opWindow as any).automaticReason = firstUnhandled == null
                 ? 'firstOps'

@@ -774,6 +774,30 @@ export function init({
             const fn = _fnArray[i];
             const args: any = _argsArray[i];
 
+            // Temporary diagnostics: raw operators around the numbering row and the dash rows
+            if (i >= 118 && i <= 160) {
+              const opName = Object.keys(pdfjs.OPS).find(key => pdfjs.OPS[key] === fn);
+              let printable: any = args;
+
+              if (fn === OPS.showText) {
+                // TJ adjustments are printed as ⟨n⟩, spaces as ␣
+                printable = (Array.isArray(args?.[0]) ? args[0].flat() : [])
+                  .map((glyph: any) =>
+                    typeof glyph === 'number'
+                      ? `⟨${glyph}⟩`
+                      : (glyph?.isSpace ? '␣' : (glyph?.unicode ?? '?'))
+                  )
+                  .join('');
+              }
+
+              console.error(
+                '[OP]',
+                i,
+                opName,
+                typeof printable === 'string' ? printable : JSON.stringify(printable)?.slice(0, 200)
+              );
+            }
+
             //debugging: Object.keys(pdfjs.OPS).find(item=>pdfjs.OPS[item] == opList.fnArray[33])
             //opList.fnArray.map(item=>Object.keys(pdfjs.OPS).find(key=>pdfjs.OPS[key] == item))
             if (fn === OPS.constructPath) {
@@ -1693,6 +1717,12 @@ export function init({
                     }
                     if (setCharWidth) {
                       glyph['charWidth'] = charWidth;
+
+                      // Visible advance of the glyph: without char spacing (Tc), with word spacing
+                      // (Tw). A large Tc that pushes glyphs into different table cells must show
+                      // up as a gap between them.
+                      glyph['advanceWidth'] =
+                        width * widthAdvanceScale + (glyph.isSpace ? wordSpacing : 0) * fontDirection;
                     }
 
                     if (setPageGeometry && Array.isArray(pageTransform) && pageTransform.length >= 6) {
@@ -1933,6 +1963,10 @@ export function init({
               });
 
               let normalizedShowText = normalizeShowTextArgs(args);
+              // Tc and Tw are given in unscaled text space units. With a Tf size of 1 and the
+              // scale carried by Tm (here 9) they must be scaled just like the font size.
+              const spacingScale = fontSize > 0 ? effectiveHeight / fontSize : 1;
+
               let { widthRanges, str, charsRangesArrays, fontSpaceWidths } = handleCharsArgs({
                 charsArr: JSON.parse(JSON.stringify(normalizedShowText)),//JSON.parse(JSON.stringify(args[0])), //clearChars({chars:args[0], fullClear:false, clearStart:true, clearEnd:false}),
                 x: preliminaryItem.transform[4],
@@ -1940,6 +1974,8 @@ export function init({
                 setCoordinates: true,
                 setCharWidth: true,
                 fontSize: effectiveHeight,
+                charSpacing: charSpacing * spacingScale,
+                wordSpacing: wordSpacing * spacingScale,
                 pageTransform: preliminaryItem.transform,
                 setPageGeometry: true,
               });
@@ -2011,6 +2047,9 @@ export function init({
                   (ch: any) =>
                     ch && typeof ch === 'object' && typeof ch.unicode === 'string' && ch.x !== undefined
                 );
+                // End of a glyph as it is seen on the page (see advanceWidth)
+                const getAdvance = (glyph: any): number =>
+                  (glyph.advanceWidth ?? glyph.charWidth) || item.height * 0.5;
                 if (glyphs.length <= 1) {
                   return [item];
                 }
@@ -2023,7 +2062,7 @@ export function init({
                 const segments: any[] = [];
                 let currentGlyphs: any[] = [glyphs[0]];
                 let currentStartX = glyphs[0].x;
-                let lastEndX = glyphs[0].x + (glyphs[0].charWidth || item.height * 0.5);
+                let lastEndX = glyphs[0].x + getAdvance(glyphs[0]);//glyphs[0].x + (glyphs[0].charWidth || item.height * 0.5);
                 let spaceRunCount = isSpace(glyphs[0]) ? 1 : 0;
                 let spaceRunWidth = isSpace(glyphs[0]) ? glyphs[0].charWidth || 0 : 0;
 
@@ -2057,8 +2096,7 @@ export function init({
                     currentGlyphs.push(g);
                   }
 
-                  lastEndX = g.x + (g.charWidth || item.height * 0.5);
-
+                  lastEndX = g.x + getAdvance(g);//g.x + (g.charWidth || item.height * 0.5);
                   if (isSpace(g)) {
                     spaceRunCount++;
                     spaceRunWidth += g.charWidth || 0;
@@ -2104,7 +2142,8 @@ export function init({
               }
 
               function buildSegment(baseItem: any, glyphs: any[], startX: number): any {
-                const endX = glyphs[glyphs.length - 1].x + (glyphs[glyphs.length - 1].charWidth || 0);
+                const lastGlyph = glyphs[glyphs.length - 1];
+                const endX = lastGlyph.x + (lastGlyph.advanceWidth ?? lastGlyph.charWidth ?? 0);
                 const width = Math.max(0, endX - startX);
                 const str = glyphs.map((g: any) => g.unicode).join('');
 
@@ -5743,27 +5782,53 @@ export function init({
                 let rowOccupiedCols = hasColsInfo ? getOccupiedColumnBins(textBlocks, cols) : null;
                 let fullColsCount = hasColsInfo ? (cols.length - 1) : 0;
 
+
+                let isSequential = isSequentialIndexRow(
+                  [...textBlocks]
+                    .sort((a, b) => a.x - b.x)
+                    .map(block => (block?.str || '').trim())
+                    .filter(Boolean)
+                )
+
+                const followsHeader =
+                  currentHeaderCombo != undefined
+                  && !!lastTruthHeaderCombo
+                  && currentHeaderCombo == lastTruthHeaderCombo;
+
+                // A numbering row ("1 | 2= (3 to 6)+14 | 3 | ...") labels the columns.
+                // Blocks are sorted left to right: the Tj order of such rows is not spatial.
+                const isIndexRow =
+                  hasColsInfo
+                  && textBlocks.length > 1
+                  && isSequential;
+
+                // Directly under the header and spanning most of the columns: part of the header,
+                // even though it has no more blocks than the header row above it.
+                const continuesHeaderAsIndexRow =
+                  isIndexRow
+                  && followsHeader
+                  && rowOccupiedCols.size >= Math.ceil(fullColsCount * 0.7);
+
+
                 let columnsSignalHeaderEnded = !!(
                   hasColsInfo &&
-                  currentHeaderCombo != undefined &&
-                  lastTruthHeaderCombo &&
-                  (currentHeaderCombo == lastTruthHeaderCombo) &&
+                  followsHeader &&
                   cumulativeOccupiedCols.size >= fullColsCount &&
                   rowOccupiedCols.size >= fullColsCount &&
-                  !isSequentialIndexRow(textBlocks.map(b => (b?.str || '').trim()).filter(Boolean))
+                  !isIndexRow
                 );
 
                 if (
-                  textBlocks?.length && !columnsSignalHeaderEnded &&
-                  (//The number of text items in the current row is greater than the number of items in the previous row (merged headings indicator)
-                    currentHeaderCombo != undefined &&
-                      lastTruthHeaderCombo &&
-                      (currentHeaderCombo == lastTruthHeaderCombo) ?
-                      (currentHeaderCombo.textBlocks.length < textBlocks.length || hasDuplicateCopies)
-                      : true
+                  textBlocks?.length && !columnsSignalHeaderEnded
+                  && (//The number of text items in the current row is greater than the number of items in the previous row (merged headings indicator)
+                    continuesHeaderAsIndexRow
+                    || (
+                      followsHeader
+                        ? (currentHeaderCombo.textBlocks.length < textBlocks.length || hasDuplicateCopies)
+                        : true
+                    )
                   )
                 ) {
-
 
                   let propertiesCounter = countProperties(textBlocks);
                   let currentTargetProperties = targetProperties.filter(prop => Object.keys(propertiesCounter?.[prop] || {})?.length > 1);
@@ -5846,12 +5911,22 @@ export function init({
                     if (!spansBeyondThisRow) {
                       if (currentTargetProperties.length) {
                         hasMajorityStyle = currentTargetProperties.every(prop => {
+                          // Cell height depends on the number of text lines in the cell, so it
+                          // says nothing about the cell style (hasDistinctStyle already makes the
+                          // same exception). Without it a header cell whose height is unique in
+                          // the row fails once the row has 11+ cells: the threshold is
+                          // total * 0.1, which is > 1 for 11 blocks.
+                          if (prop === 'height') {
+                            return true;
+                          }
+
                           let weight = 1 - targetPropertiesWeight[prop];
                           let total = Number(
                             Object.values(propertiesCounter?.[prop] || {})
                               .reduce((p, c) => Number(p) + Number(c), 0) || 0
                           );
                           let count = Number(propertiesCounter?.[prop]?.[textBlock?.[prop]] || 0);
+
                           return count > (total * (weight || 1));//the number of cells with target properties exceeds the number of cells with other properties
                         });
                       } else if (targetProperties.length) {
@@ -5950,7 +6025,7 @@ export function init({
                     headerConditions.push(condition);
                   });
 
-                  let isHeader = headerConditions.every(item => item);
+                  let isHeader = continuesHeaderAsIndexRow || headerConditions.every(item => item);
 
                   console.error('[HEADER ROW TRACE] range', range.join('-'), 'isHeader:', isHeader, 'conditions:', headerConditions);
 
@@ -6102,6 +6177,194 @@ export function init({
             return group;
           }
 
+          /**
+ * splitGroups() cuts a group at every gap row without text. A single row that
+ * follows such a gap (a totals row such as "ALL INDIA") ends up in a range of
+ * two values, and ranges of two values are discarded as noise.
+ *
+ * A short tail is attached back to the preceding range when it is a real
+ * continuation of the same table:
+ *   - it is close to the table (gap <= text line tolerance),
+ *   - its text occupies (nearly) the same columns as the table body,
+ *   - its values have the same kind (number / text) as the body column,
+ *   - if the table is drawn with horizontal lines, such lines span the
+ *     table width next to the tail.
+ */
+          function rescueContinuationRanges(options: {
+            rowsRanges: number[][];
+            group: any;
+            globalGroup: any;
+          }): number[][] {
+            const { rowsRanges, group, globalGroup } = options;
+
+            const cols = [...(group.cols || [])].sort((a, b) => a - b);
+            const columnCount = cols.length - 1;
+
+            if (rowsRanges.length < 2 || columnCount < 2) {
+              return rowsRanges;
+            }
+
+            const textBlocks = (group.coordinates || []).filter(
+              block => block?.str?.trim() && Number.isFinite(block.y)
+            );
+
+            const getColumn = (block: any): number => {
+              const center = block.x + (block.width || 0) / 2;
+
+              for (let column = 0; column < columnCount; column++) {
+                if (center >= cols[column] && center < cols[column + 1]) {
+                  return column;
+                }
+              }
+
+              return -1;
+            };
+
+            const getKind = (block: any): string =>
+              /^[-+\u2212]?\d[\d.,\s]*%?$/.test(block.str.trim()) ? 'number' : 'text';
+
+            // Same convention as extractTableData(): baseline <= top && baseline > bottom
+            const getBlocksBetween = (top: number, bottom: number) =>
+              textBlocks.filter(block => block.y <= top && block.y > bottom);
+
+            const tableLeft = cols[0];
+            const tableRight = cols[cols.length - 1];
+            const tableWidth = tableRight - tableLeft;
+
+            const isHorizontalLine = (edge: any) =>
+              isVisibleVector(edge) && edge.height < lineMaxWidth && edge.width > lineMaxWidth;
+
+            const groupHasLines = (group.edges || []).some(isHorizontalLine);
+
+            const horizontalLines = uniqueArr(
+              [...(group.edges || []), ...(globalGroup?.edges || [])].filter(isHorizontalLine),
+              ['x', 'y', 'width', 'height']
+            );
+
+            const getLineCoverage = (boundaries: number[]): number => {
+              let covered = 0;
+
+              horizontalLines.forEach(edge => {
+                const center = edge.y + edge.height / 2;
+
+                if (!boundaries.some(boundary => Math.abs(boundary - center) <= 1.5)) {
+                  return;
+                }
+
+                covered += Math.max(
+                  0,
+                  Math.min(edge.x + edge.width, tableRight) - Math.max(edge.x, tableLeft)
+                );
+              });
+
+              return tableWidth > 0 ? covered / tableWidth : 0;
+            };
+
+            const rawTolerance = calculateToleranceValue(group.coordinates || []);
+            const tolerance = Number.isFinite(rawTolerance) ? rawTolerance : 0;
+
+            const isContinuation = (previous: number[], tail: number[]): boolean => {
+              const bodyTop = previous[0];
+              const bodyBottom = previous[previous.length - 1];
+              const tailTop = tail[0];
+              const tailBottom = tail[tail.length - 1];
+
+              const round = (values: number[]) => values.map(value => +value.toFixed(2));
+
+              if (Math.abs(tailTop - bodyBottom) > 1e-6 || tail.length < 2) {
+                return false;
+              }
+
+              // Gap between the body and the first boundary of the tail
+              const gap = tail.length >= 3 ? bodyBottom - tail[1] : 0;
+
+              const tailBlocks = getBlocksBetween(tailTop, tailBottom)
+                .filter(block => getColumn(block) >= 0);
+
+              const bodyKindCounts: Array<Record<string, number>> =
+                Array.from({ length: columnCount }, () => ({}));
+
+              getBlocksBetween(bodyTop, bodyBottom).forEach(block => {
+                const column = getColumn(block);
+
+                if (column >= 0) {
+                  const kind = getKind(block);
+                  bodyKindCounts[column][kind] = (bodyKindCounts[column][kind] || 0) + 1;
+                }
+              });
+
+              const bodyKinds = bodyKindCounts.map(counts => {
+                const kinds = Object.keys(counts);
+
+                return kinds.length
+                  ? kinds.reduce((best, kind) => counts[kind] > counts[best] ? kind : best)
+                  : null;
+              });
+
+              const occupiedBodyColumns = bodyKinds.filter(Boolean).length;
+              const tailColumns = new Set(tailBlocks.map(getColumn));
+
+              const kindRatio = tailBlocks.length
+                ? tailBlocks.filter(block => bodyKinds[getColumn(block)] === getKind(block)).length
+                / tailBlocks.length
+                : 0;
+
+              const lineCoverage = getLineCoverage(tail);
+
+              const accepted =
+                tailBlocks.length > 0
+                && gap <= tolerance
+                && tailColumns.size >= Math.max(2, Math.ceil(occupiedBodyColumns * 0.7))
+                && kindRatio >= 0.8
+                && (!groupHasLines || lineCoverage >= 0.85);
+
+              console.error('[SPLIT RESCUE]', {
+                tail: round(tail),
+                gap: +gap.toFixed(2),
+                tolerance: +tolerance.toFixed(2),
+                tailColumns: tailColumns.size,
+                bodyColumns: occupiedBodyColumns,
+                kindRatio: +kindRatio.toFixed(2),
+                lineCoverage: +lineCoverage.toFixed(2),
+                accepted,
+              });
+
+              return accepted;
+            };
+
+            const result: number[][] = [];
+
+            for (let index = 0; index < rowsRanges.length;) {
+              const range = rowsRanges[index];
+
+              if (range.length > 2) {
+                result.push([...range]);
+                index++;
+                continue;
+              }
+
+              // Collect consecutive short ranges: a gap row and the row after it
+              const chain: number[][] = [];
+
+              while (index < rowsRanges.length && rowsRanges[index].length <= 2) {
+                chain.push(rowsRanges[index]);
+                index++;
+              }
+
+              const previous = result[result.length - 1];
+              const tail = [...new Set(chain.flat())].sort((a, b) => b - a);
+
+              if (previous && previous.length > 2 && tail.length && isContinuation(previous, tail)) {
+                const previousBottom = previous[previous.length - 1];
+                previous.push(...tail.filter(value => value < previousBottom - 1e-6));
+              } else {
+                result.push(...chain);
+              }
+            }
+
+            return result;
+          }
+
           function extendGroupTopBorder(group, pageGroup, lineMaxWidth) {
             if (!pageGroup || !group.rows?.length || !group.cols?.length) return group;
 
@@ -6188,6 +6451,297 @@ export function init({
               rows: group.rows || [],
               lineMaxWidth: lineMaxWidth,
             });
+
+            return group;
+          }
+
+          /**
+ * Text that lies inside the box of a table belongs to that table. Splitting a
+ * group by rows and columns can leave pieces of the same table as separate
+ * fragments, or lose them when a fragment has no header and is discarded.
+ * This drops the fragments whose text lies completely inside a bigger group
+ * and gives that group every unclaimed text block that lies inside its box.
+ */
+          function absorbEnclosedBlocks(tableGroups: any[], pageGroup: any): any[] {
+            if (!tableGroups.length || !pageGroup?.coordinates?.length) {
+              return tableGroups;
+            }
+
+            const tolerance = 2;
+
+            const getBox = (group: any) =>
+              group?.x?.length === 2 && group?.y?.length === 2
+                ? { left: group.x[0], right: group.x[1], bottom: group.y[0], top: group.y[1] }
+                : null;
+
+            const getArea = (box: any) => (box.right - box.left) * (box.top - box.bottom);
+
+            const isCenterInside = (block: any, box: any): boolean => {
+              const centerX = block.x + (block.width || 0) / 2;
+              const centerY = block.y + (block.height || 0) / 2;
+
+              return centerX >= box.left - tolerance
+                && centerX <= box.right + tolerance
+                && centerY >= box.bottom - tolerance
+                && centerY <= box.top + tolerance;
+            };
+
+            const boxes = tableGroups.map(getBox);
+
+            const isFragment = tableGroups.map((group, index) => {
+              const box = boxes[index];
+              const blocks = (group.coordinates || []).filter(block => block?.str?.trim());
+
+              if (!box || !blocks.length) {
+                return false;
+              }
+
+              return tableGroups.some((other, otherIndex) => {
+                const otherBox = boxes[otherIndex];
+
+                return otherIndex !== index
+                  && !!otherBox
+                  && getArea(otherBox) > getArea(box)
+                  && blocks.every(block => isCenterInside(block, otherBox));
+              });
+            });
+
+            const groups = tableGroups.filter((_, index) => !isFragment[index]);
+            const claimed = new Set<number>();
+
+            groups.forEach(group =>
+              (group.coordinates || []).forEach(block => claimed.add(block.index))
+            );
+
+            groups.forEach(group => {
+              const box = getBox(group);
+
+              if (!box) {
+                return;
+              }
+
+              const additions = pageGroup.coordinates.filter(block =>
+                block?.str?.trim()
+                && !claimed.has(block.index)
+                && isCenterInside(block, box)
+              );
+
+              if (!additions.length) {
+                return;
+              }
+
+              additions.forEach(block => claimed.add(block.index));
+              group.coordinates = [...(group.coordinates || []), ...additions];
+
+              console.error('[ABSORB BLOCKS]', {
+                added: additions.length,
+                sample: additions.slice(0, 6).map(block => block.str),
+                droppedFragments: tableGroups.length - groups.length,
+              });
+            });
+
+            return groups;
+          }
+
+          /**
+ * A totals row ("ALL INDIA") drawn with its own rules can lie further from the
+ * table than the clustering tolerance, so it never joins the table group (and a
+ * group without a header is discarded). This looks for such a row below the
+ * table in the page-level group and attaches it when it really continues the
+ * table: it is bounded by full-width horizontal rules, its text occupies the
+ * same columns as the body and has the same value kinds.
+ */
+          function extendGroupBottomRow(group, pageGroup, lineMaxWidth) {
+            if (!pageGroup || !group?.rows?.length || !group?.cols?.length || group.cols.length < 3) {
+              return group;
+            }
+
+            // Only for tables that are drawn with horizontal rules
+            if (!(group.edgesRows || []).length) {
+              return group;
+            }
+
+            const cols = [...group.cols].sort((a, b) => a - b);
+            const columnCount = cols.length - 1;
+            const tableLeft = cols[0];
+            const tableRight = cols[cols.length - 1];
+            const tableWidth = tableRight - tableLeft;
+
+            const groupBlocks = (group.coordinates || []).filter(
+              block => block?.str?.trim() && Number.isFinite(block.y)
+            );
+
+            if (groupBlocks.length < 4 || tableWidth <= 0) {
+              return group;
+            }
+
+            const modalTextHeight = +findMod(groupBlocks.map(block => block.height)) || 1;
+            const tableBottomText = Math.min(...groupBlocks.map(block => block.y));
+
+            // Full-width horizontal rules of the page, clustered by position
+            const lineClusters: Array<{ y: number; center: number; covered: number; edges: any[] }> = [];
+
+            uniqueArr(
+              (pageGroup.edges || []).filter(
+                edge => isVisibleVector(edge)
+                  && edge.height < lineMaxWidth
+                  && edge.width > lineMaxWidth
+              ),
+              ['x', 'y', 'width', 'height']
+            ).forEach(edge => {
+              const overlap = Math.max(
+                0,
+                Math.min(edge.x + edge.width, tableRight) - Math.max(edge.x, tableLeft)
+              );
+
+              if (overlap <= 0) {
+                return;
+              }
+
+              const center = edge.y + edge.height / 2;
+              let cluster = lineClusters.find(item => Math.abs(item.center - center) <= 1.5);
+
+              if (!cluster) {
+                cluster = { y: edge.y, center, covered: 0, edges: [] };
+                lineClusters.push(cluster);
+              }
+
+              cluster.y = Math.min(cluster.y, edge.y);
+              cluster.covered += overlap;
+              cluster.edges.push(edge);
+            });
+
+            const fullLines = lineClusters
+              .filter(cluster =>
+                cluster.covered / tableWidth >= 0.85
+                && cluster.center < tableBottomText - 0.5
+              )
+              .sort((a, b) => b.center - a.center);
+
+            const maxGap = modalTextHeight * 2;
+            const maxRowHeight = modalTextHeight * 4;
+            const topLine = fullLines[0];
+
+            if (!topLine || tableBottomText - topLine.center > maxGap) {
+              return group;
+            }
+
+            const bottomLine = fullLines.find(cluster =>
+              cluster.center < topLine.center - 0.5
+              && topLine.center - cluster.center <= maxRowHeight
+            );
+
+            const bandTop = topLine.center;
+            const bandBottom = bottomLine ? bottomLine.center : topLine.center - modalTextHeight * 2;
+
+            const knownIndexes = new Set(groupBlocks.map(block => block.index));
+
+            // Same convention as extractTableData(): baseline <= top && baseline > bottom
+            const rowBlocks = (pageGroup.coordinates || []).filter(block => {
+              if (!block?.str?.trim() || knownIndexes.has(block.index)) {
+                return false;
+              }
+
+              const center = block.x + (block.width || 0) / 2;
+
+              return block.y <= bandTop
+                && block.y > bandBottom
+                && center >= tableLeft - 1
+                && center <= tableRight + 1;
+            });
+
+            const getColumn = (block: any): number => {
+              const center = block.x + (block.width || 0) / 2;
+
+              for (let column = 0; column < columnCount; column++) {
+                if (center >= cols[column] && center < cols[column + 1]) {
+                  return column;
+                }
+              }
+
+              return -1;
+            };
+
+            const isPlaceholder = (block: any): boolean =>
+              /^(?:[-\u2013\u2014\u2212]|n\.?a\.?|\.\.)$/i.test(block.str.trim());
+
+            const getKind = (block: any): string =>
+              /^[-+\u2212]?\d[\d.,\s]*%?$/.test(block.str.trim()) ? 'number' : 'text';
+
+            const bodyKindCounts: Array<Record<string, number>> =
+              Array.from({ length: columnCount }, () => ({}));
+
+            groupBlocks.forEach(block => {
+              const column = getColumn(block);
+
+              if (column >= 0 && !isPlaceholder(block)) {
+                const kind = getKind(block);
+                bodyKindCounts[column][kind] = (bodyKindCounts[column][kind] || 0) + 1;
+              }
+            });
+
+            const bodyKinds = bodyKindCounts.map(counts => {
+              const kinds = Object.keys(counts);
+
+              return kinds.length
+                ? kinds.reduce((best, kind) => counts[kind] > counts[best] ? kind : best)
+                : null;
+            });
+
+            const occupiedBodyColumns = bodyKinds.filter(Boolean).length;
+            const rowBlocksInGrid = rowBlocks.filter(block => getColumn(block) >= 0);
+            const rowColumns = new Set(rowBlocksInGrid.map(getColumn));
+
+            const comparableBlocks = rowBlocksInGrid.filter(block => !isPlaceholder(block));
+
+            const kindRatio = comparableBlocks.length
+              ? comparableBlocks.filter(
+                block => bodyKinds[getColumn(block)] === getKind(block)
+              ).length / comparableBlocks.length
+              : 0;
+
+            const accepted =
+              rowBlocksInGrid.length > 0
+              && rowColumns.size >= Math.max(2, Math.ceil(occupiedBodyColumns * 0.7))
+              && kindRatio >= 0.8;
+
+            console.error('[BOTTOM ROW EXTENSION]', {
+              topLine: +topLine.center.toFixed(2),
+              bottomLine: bottomLine ? +bottomLine.center.toFixed(2) : null,
+              gap: +(tableBottomText - topLine.center).toFixed(2),
+              blocks: rowBlocksInGrid.map(block => block.str),
+              columns: rowColumns.size,
+              bodyColumns: occupiedBodyColumns,
+              kindRatio: +kindRatio.toFixed(2),
+              accepted,
+            });
+
+            if (!accepted) {
+              return group;
+            }
+
+            const newRows = [
+              topLine.y,
+              bottomLine
+                ? bottomLine.y
+                : Math.min(...rowBlocksInGrid.map(block => block.y)) - modalTextHeight * 0.5,
+            ];
+
+            group.rows = [...new Set([...group.rows, ...newRows])].sort((a, b) => a - b);
+            group.edgesRows = [...new Set([
+              ...(group.edgesRows || []),
+              topLine.y,
+              ...(bottomLine ? [bottomLine.y] : []),
+            ])].sort((a, b) => a - b);
+            group.edges = uniqueArr(
+              [...(group.edges || []), ...topLine.edges, ...(bottomLine ? bottomLine.edges : [])],
+              ['x', 'y', 'width', 'height']
+            );
+            group.coordinates = uniqueArr(
+              [...(group.coordinates || []), ...rowBlocksInGrid],
+              ['x', 'y', 'width', 'height']
+            );
+            group.y = [Math.min(...group.rows), Math.max(...group.rows)];
 
             return group;
           }
@@ -6334,6 +6888,144 @@ export function init({
               synthesizedRows,
               rows: [...group.rows].sort((a, b) => b - a).slice(0, 4),
               headerRows: Object.keys(group.headerRows),
+            });
+
+            return group;
+          }
+
+          /**
+ * Between two real rules the table has no row separators, so the row grid is
+ * derived from raw text borders (baseline and top of every text line). Every
+ * text line then gets TWO borders, which yields an empty row between each pair
+ * of data rows. When such empty, unbacked, text-height rows are found, the rows
+ * between the rules are rebuilt: one boundary in the middle of every gap
+ * between consecutive text lines.
+ */
+          function rebuildUnseparatedRows(group, lineMaxWidth) {
+            if (!group?.rows?.length || group.rows.length < 6) {
+              return group;
+            }
+
+            const assured = [...new Set([
+              ...(group.edgesRows || []),
+              ...(group.rectanglesRows || []),
+            ])].sort((a, b) => b - a);
+
+            if (assured.length < 2) {
+              return group;
+            }
+
+            const blocks = (group.coordinates || []).filter(
+              block => block?.str?.trim() && Number.isFinite(block.y)
+            );
+
+            if (blocks.length < 4) {
+              return group;
+            }
+
+            const isAssured = (y: number) => assured.some(value => Math.abs(value - y) <= 0.01);
+            const modalTextHeight = +findMod(blocks.map(block => block.height)) || 1;
+            const rowsDesc = [...group.rows].sort((a, b) => b - a);
+
+            // Same convention as extractTableData(): baseline <= top && baseline > bottom
+            const hasText = (top: number, bottom: number) =>
+              blocks.some(block => block.y <= top && block.y > bottom);
+
+            // Interior rows that are empty, as tall as a text line and not backed by a rule,
+            // between two rows that contain text
+            const tinyEmptyRows: Array<[number, number]> = [];
+
+            for (let i = 1; i < rowsDesc.length - 2; i++) {
+              const top = rowsDesc[i];
+              const bottom = rowsDesc[i + 1];
+
+              if (isAssured(top) || isAssured(bottom)) {
+                continue;
+              }
+
+              if (
+                top - bottom <= modalTextHeight * 1.2
+                && !hasText(top, bottom)
+                && hasText(rowsDesc[i - 1], top)
+                && hasText(bottom, rowsDesc[i + 2])
+              ) {
+                tinyEmptyRows.push([top, bottom]);
+              }
+            }
+
+            const interiorRows = rowsDesc.length - 3;
+
+            if (tinyEmptyRows.length < 3 || tinyEmptyRows.length < interiorRows * 0.25) {
+              return group;
+            }
+
+            // Anchors: real rules, plus the lowest row if it lies below the last rule
+            const anchors = [...assured];
+            const lowestRow = rowsDesc[rowsDesc.length - 1];
+
+            if (lowestRow < anchors[anchors.length - 1] - 0.01) {
+              anchors.push(lowestRow);
+            }
+
+            let rows = [...rowsDesc];
+            const midpoints: number[] = [];
+
+            for (let index = 0; index < anchors.length - 1; index++) {
+              const top = anchors[index];
+              const bottom = anchors[index + 1];
+
+              const hasGapRows = tinyEmptyRows.some(
+                ([gapTop, gapBottom]) => gapTop <= top + 0.01 && gapBottom >= bottom - 0.01
+              );
+
+              if (!hasGapRows) {
+                continue;
+              }
+
+              // Text bands inside the interval (union of the vertical extents of blocks)
+              const bands: Array<{ bottom: number; top: number }> = [];
+
+              blocks
+                .filter(block => block.y <= top && block.y > bottom)
+                .sort((first, second) => first.y - second.y)
+                .forEach(block => {
+                  const last = bands[bands.length - 1];
+                  const blockTop = block.y + block.height;
+
+                  if (last && block.y <= last.top + 0.25) {
+                    last.top = Math.max(last.top, blockTop);
+                  } else {
+                    bands.push({ bottom: block.y, top: blockTop });
+                  }
+                });
+
+              if (bands.length < 2) {
+                continue;
+              }
+
+              const intervalMidpoints = bands
+                .slice(1)
+                .map((band, bandIndex) => (bands[bandIndex].top + band.bottom) / 2);
+
+              rows = rows.filter(y => !(y < top - 0.01 && y > bottom + 0.01));
+              rows.push(...intervalMidpoints);
+              midpoints.push(...intervalMidpoints);
+            }
+
+            if (!midpoints.length) {
+              return group;
+            }
+
+            group.rows = [...new Set(rows)].sort((a, b) => a - b);
+            // Boundaries without a drawn rule must survive generateVirtualEdges()
+            group.synthesizedRows = [...(group.synthesizedRows || []), ...midpoints];
+            group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+
+            console.error('[REBUILD ROWS]', {
+              tinyEmptyRows: tinyEmptyRows.length,
+              interiorRows,
+              midpoints: midpoints.length,
+              rows: group.rows.length,
             });
 
             return group;
@@ -6608,7 +7300,7 @@ export function init({
             let tableGroups = createGroup({ edges, rectangles, coordinates, tolerance });
             console.error('[GROUPS BEFORE SPLIT]', tableGroups.length, tolerance);
             tableGroups = splitGroups({ groups: tableGroups, globalGroup: pageGroups[0], downcheck: true });
-
+            tableGroups = absorbEnclosedBlocks(tableGroups, pageGroups[0]);
             // Reconstruct missing row boundaries
             tableGroups = tableGroups.map(group => {
               const currentRows = [...(group.rows || [])]
@@ -6671,8 +7363,10 @@ export function init({
             });
 
             tableGroups = tableGroups.map(group => extendGroupTopBorder(group, pageGroups[0], lineMaxWidth));
+            tableGroups = tableGroups.map(group => extendGroupBottomRow(group, pageGroups[0], lineMaxWidth));
             tableGroups = tableGroups.map(group => trimUnsupportedTrailingRows(group, lineMaxWidth));//!BUG fpdf_example-1.pdf (the last row of the table is missing)
             tableGroups = tableGroups.map(group => refineTextOnlyTopRows(group, lineMaxWidth));
+            tableGroups = tableGroups.map(group => rebuildUnseparatedRows(group, lineMaxWidth));
 
             // The order of the tables in the result should correspond to the reading order (from top to bottom on the page), not the order in which they were randomly arranged by clustering.
             tableGroups = [...tableGroups].sort((a, b) => {
@@ -6860,7 +7554,8 @@ export function init({
                           //&& isSameSideEdges //share common visual boundaries
                         ) {
                           if (!group.rows.includes(nextRow)) {
-                            group.rows = [...new Set([...group.rows.slice(0, group.rows.indexOf(row) + 1), nextRow])].sort((a, b) => a - b) || [];
+                            //group.rows = [...new Set([...group.rows.slice(0, group.rows.indexOf(row) + 1), nextRow])].sort((a, b) => a - b) || [];
+                            group.rows = [...new Set([...group.rows, nextRow])].sort((a, b) => a - b);
                           }
                         } else {
                           if (index != startIndex) {//exclusion for the first row after headings
@@ -7272,6 +7967,14 @@ export function init({
                   }
 
                 });
+
+                console.error(
+                  '[SPLIT RANGES RAW]',
+                  rowsRanges.map(range => range.map(value => +value.toFixed(2)))
+                );
+
+                rowsRanges = rescueContinuationRanges({ rowsRanges, group, globalGroup });
+
                 rowsRanges = rowsRanges.reduce((prev, range) => {
                   if (range.length > 2) {
                     prev.push(range);
@@ -7920,6 +8623,18 @@ export function init({
               let paddingSizes = [];
               let paddingSize = 0;
               let modeTextHeight = findMod(coordinates.map(item => item.height));
+              // Rows below the lowest assured border (drawn rule or band edge) have no
+              // geometric evidence: typical for a ruled header followed by a body without
+              // row lines. They must be split by the text itself instead of being collapsed
+              // into one row.
+              const lowestAssuredBorder = assuredGridItems.length
+                ? Math.min(...assuredGridItems)
+                : Infinity;
+
+              const isTextOnlyRegion = (border: number): boolean =>
+                gridItemsType === 'rows'
+                && assuredGridItems.length > 2
+                && border < lowestAssuredBorder - 0.01;
               let coordinatePaddings = coordinates.reduce((prev, cur) => {
                 let secondLine = cur[gridItemsType === 'cols' ? 'x' : 'y'];
                 let firstLine = gridItems?.[findClosestIndex(gridItems, secondLine, modeTextHeight * 2)];
@@ -7985,8 +8700,11 @@ export function init({
                     Object.keys(gridItemsPairs),
                     [{ isNumber: true, order: 'asc' }]
                   );
-                  let gridItemRangeEnded = (assuredGridItems.length > 2 ? isAssuredBorder : intersectsNextGridItem) && textBlocks.some(item => item.contained);
-
+                  let gridItemRangeEnded =
+                    (assuredGridItems.length > 2 && !isTextOnlyRegion(secondBorder)
+                      ? isAssuredBorder
+                      : intersectsNextGridItem)
+                    && textBlocks.some(item => item.contained);
                   function updateCycle(secondBorder) {
                     //for optimization, we skip checking the boundaries that go before the current coordinate pair
                     let foundSecondBorderIndex = gridItems.indexOf(secondBorder);
@@ -10581,6 +11299,45 @@ export function init({
                 [{ field: 'y', order: 'desc' }, { field: 'x', order: 'asc' }]
               );
 
+              // Superscripts: a small raised block glued to the right edge of a bigger block
+              // ("24.91" + raised "2"). It belongs to the same cell and must follow the host
+              // text instead of being placed before it (which gives "224.91").
+              const normalTextHeight = +findMod(coordinates.map(item => item.height)) || 0;
+              const superscriptBlocks = new Set<any>();
+              const superscriptsByHost = new Map<any, any[]>();
+
+              if (normalTextHeight > 0) {
+                coordinates.forEach(candidate => {
+                  if (!candidate?.str?.trim() || !(candidate.height < normalTextHeight * 0.75)) {
+                    return;
+                  }
+
+                  const gapLimit = Math.max(candidate.height * 0.75, 1);
+
+                  const host = coordinates.find(other => {
+                    if (other === candidate || !other?.str?.trim()) {
+                      return false;
+                    }
+
+                    if (!(other.height >= candidate.height * 1.25)) {
+                      return false;
+                    }
+
+                    const raised = candidate.y - other.y;
+                    const hostRight = other.x + other.width;
+
+                    return raised > 0.5
+                      && raised <= other.height * 0.7
+                      && Math.abs(candidate.x - hostRight) <= gapLimit;
+                  });
+
+                  if (host) {
+                    superscriptBlocks.add(candidate);
+                    superscriptsByHost.set(host, [...(superscriptsByHost.get(host) || []), candidate]);
+                  }
+                });
+              }
+
               const rowsCount = horizons.length - 1;
               const colsCount = verticles.length - 1;
               const table = {
@@ -10593,6 +11350,9 @@ export function init({
               // ===== DIAGNOSTICS: try-catch with precise location =====
               try {
                 for (const item of coordinates) {
+                  if (superscriptBlocks.has(item)) {
+                    continue;
+                  }
                   const x = item.transform[4];
                   const y = item.transform[5];
 
@@ -10695,6 +11455,18 @@ export function init({
                   }
                   tablePos[row][col] = y;
                   table.array[row][col]['str'] += (item?.str || '');
+                  const attachedSuperscripts = superscriptsByHost.get(item);
+
+                  if (attachedSuperscripts?.length) {
+                    const cell = table.array[row][col];
+
+                    attachedSuperscripts.forEach(superscript => {
+                      const start = cell['str'].length;
+
+                      cell['str'] += (superscript?.str || '').trim();
+                      (cell['sup'] = cell['sup'] || []).push([start, cell['str'].length]);
+                    });
+                  }
                   if (item.fillColor) {
                     table.array[row][col]['fillColor'] = item.fillColor;
                   }
@@ -11217,7 +11989,24 @@ export function init({
                         borderStyle += `color: ${textColor};`;
                       }
 
-                      let safeStr = (table.array[r][c]['str'] || '').replace(/\n/gim, '<br>');
+                      const cellData = table.array[r][c];
+                      const lineBreaksToHtml = (text: string) => text.replace(/\n/gim, '<br>');
+
+                      let safeStr = lineBreaksToHtml(cellData['str'] || '');
+
+                      if (cellData['sup']?.length) {
+                        const text = cellData['str'] || '';
+                        let html = '';
+                        let position = 0;
+
+                        cellData['sup'].forEach(([start, end]) => {
+                          html += lineBreaksToHtml(text.slice(position, start))
+                            + '<sup>' + text.slice(start, end) + '</sup>';
+                          position = end;
+                        });
+
+                        safeStr = html + lineBreaksToHtml(text.slice(position));
+                      }
                       let cell = `<${tagName} style="${borderStyle}${fillColor ? ` background-color: ${fillColor};` : ''}"`;
 
                       if (merges[r_c]) {
@@ -11299,7 +12088,15 @@ export function init({
                     return paths;
                   }
 
-                  let headerPaths = generateHeaderPaths(clonedArray.slice(0, topHeaderRowCount));//generateHeaderPaths(clonedArray.slice(0, headerRowsKeys.length));
+
+                  // A numbering row labels the columns for the reader, it must not leak into the keys
+                  const headerRowsForPaths = clonedArray
+                    .slice(0, topHeaderRowCount) //.slice(0, headerRowsKeys.length)
+                    .filter(row => !isSequentialIndexRow(
+                      row.map(cell => (cell?.str || '').trim()).filter(Boolean)
+                    ));
+
+                  let headerPaths = generateHeaderPaths(headerRowsForPaths);
 
                   let jsonData = clonedArray.slice(headerRowCount).map((row, rowIdx) => {
                     let obj = {};
