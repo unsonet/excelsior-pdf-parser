@@ -1715,14 +1715,17 @@ export function init({
                         glyph['y'] = y;
                       }
                     }
+
                     if (setCharWidth) {
                       glyph['charWidth'] = charWidth;
 
-                      // Visible advance of the glyph: without char spacing (Tc), with word spacing
-                      // (Tw). A large Tc that pushes glyphs into different table cells must show
-                      // up as a gap between them.
+                      // Visible advance of the glyph: without char spacing (Tc), with word spacing (Tw)
+                      // A large Tc that pushes glyphs into different table cells must show up as a gap between them.
                       glyph['advanceWidth'] =
                         width * widthAdvanceScale + (glyph.isSpace ? wordSpacing : 0) * fontDirection;
+
+                      // The word spacing alone (scaled like everything else), see getVisibleAdvance()
+                      glyph['wordSpacingWidth'] = glyph.isSpace ? wordSpacing * fontDirection : 0;
                     }
 
                     if (setPageGeometry && Array.isArray(pageTransform) && pageTransform.length >= 6) {
@@ -2035,6 +2038,21 @@ export function init({
               });
               relatedTextContentItems = relatedTextContentItems.length ? relatedTextContentItems : [undefined];
 
+              // Advance of a glyph as it is seen on the page.
+              //  - Char spacing (Tc) is never part of it.
+              //  - A very wide word spacing (Tw >= 1.5 text heights) is not part of it either:
+              //    such a Tw pushes the next word into another table cell ("1." + Tw + "1967").
+              //    A small Tw (justified text) stays in the advance, so words are not split.
+              function getVisibleAdvance(glyph: any, textHeight: number): number {
+                const advance = (glyph.advanceWidth ?? glyph.charWidth) || textHeight * 0.5;
+                const wordSpacingWidth = glyph.wordSpacingWidth || 0;
+                const wideWordSpacing = Math.max(textHeight * 1.5, 6);
+
+                return wordSpacingWidth >= wideWordSpacing
+                  ? advance - wordSpacingWidth
+                  : advance;
+              }
+
               // ============================================================
               // FUNCTIONS OF SEGMENTATION preliminaryItem BASED ON GLYPH GEOMETRY
               // ============================================================
@@ -2047,9 +2065,7 @@ export function init({
                   (ch: any) =>
                     ch && typeof ch === 'object' && typeof ch.unicode === 'string' && ch.x !== undefined
                 );
-                // End of a glyph as it is seen on the page (see advanceWidth)
-                const getAdvance = (glyph: any): number =>
-                  (glyph.advanceWidth ?? glyph.charWidth) || item.height * 0.5;
+
                 if (glyphs.length <= 1) {
                   return [item];
                 }
@@ -2062,7 +2078,7 @@ export function init({
                 const segments: any[] = [];
                 let currentGlyphs: any[] = [glyphs[0]];
                 let currentStartX = glyphs[0].x;
-                let lastEndX = glyphs[0].x + getAdvance(glyphs[0]);//glyphs[0].x + (glyphs[0].charWidth || item.height * 0.5);
+                let lastEndX = glyphs[0].x + getVisibleAdvance(glyphs[0], item.height);//glyphs[0].x + (glyphs[0].charWidth || item.height * 0.5);
                 let spaceRunCount = isSpace(glyphs[0]) ? 1 : 0;
                 let spaceRunWidth = isSpace(glyphs[0]) ? glyphs[0].charWidth || 0 : 0;
 
@@ -2096,7 +2112,7 @@ export function init({
                     currentGlyphs.push(g);
                   }
 
-                  lastEndX = g.x + getAdvance(g);//g.x + (g.charWidth || item.height * 0.5);
+                  lastEndX = g.x + getVisibleAdvance(g, item.height);//g.x + (g.charWidth || item.height * 0.5);
                   if (isSpace(g)) {
                     spaceRunCount++;
                     spaceRunWidth += g.charWidth || 0;
@@ -2143,7 +2159,7 @@ export function init({
 
               function buildSegment(baseItem: any, glyphs: any[], startX: number): any {
                 const lastGlyph = glyphs[glyphs.length - 1];
-                const endX = lastGlyph.x + (lastGlyph.advanceWidth ?? lastGlyph.charWidth ?? 0);
+                const endX = lastGlyph.x + getVisibleAdvance(lastGlyph, baseItem.height);
                 const width = Math.max(0, endX - startX);
                 const str = glyphs.map((g: any) => g.unicode).join('');
 
@@ -5045,6 +5061,105 @@ export function init({
             return `rgba(${r},${g},${b},${parseFloat(a.toFixed(3))})`;
           }
 
+          /**
+ * Fill colour of every table cell, taken from the filled rectangles of the page
+ * in paint order (a later rectangle covers an earlier one).
+ *
+ * The text based fill (extractCoordinates) only exists for cells with text, and
+ * only when the text block lies completely inside the rectangle. Empty cells and
+ * header cells that stick out of the band got no fill that way.
+ */
+          function computeCellFills(options: {
+            verticles: any[];
+            horizons: any[];
+            merges: Record<string, any>;
+            mergeAlias: Record<string, string>;
+            rectangles: any[];
+          }): Record<string, string> {
+            const { verticles, horizons, merges, mergeAlias, rectangles } = options;
+            const fills: Record<string, string> = {};
+
+            const painted = (rectangles || []).filter(rect =>
+              rect?.fillColor
+              && isVisibleVector(rect)
+              && Number(rect.width) > 0
+              && Number(rect.height) > 0
+            );
+
+            if (!painted.length) {
+              return fills;
+            }
+
+            const MIN_COVERAGE = 0.4;       // share of the cell area covered by the rectangle
+            const CENTER_TOLERANCE = 0.15;  // share of the cell height
+
+            for (let row = 0; row < horizons.length - 1; row++) {
+              for (let col = 0; col < verticles.length - 1; col++) {
+                const key = `${row}-${col}`;
+
+                if (mergeAlias[key]) {
+                  continue;
+                }
+
+                const span = merges[key];
+                const rowSpan = span?.height || 1;
+                const colSpan = span?.width || 1;
+
+                const left = verticles[col]?.x;
+                const right = verticles[col + colSpan]?.x;
+                const top = horizons[row]?.y;
+                const bottom = horizons[row + rowSpan]?.y;
+
+                if (![left, right, top, bottom].every(Number.isFinite)) {
+                  continue;
+                }
+
+                const x1 = Math.min(left, right);
+                const x2 = Math.max(left, right);
+                const y1 = Math.min(top, bottom);
+                const y2 = Math.max(top, bottom);
+                const area = (x2 - x1) * (y2 - y1);
+
+                if (!(area > 0)) {
+                  continue;
+                }
+
+                const centerX = (x1 + x2) / 2;
+                const centerY = (y1 + y2) / 2;
+                const tolerance = (y2 - y1) * CENTER_TOLERANCE;
+                const layers: string[] = [];
+
+                for (const rect of painted) {
+                  const rectRight = rect.x + rect.width;
+                  const rectTop = rect.y + rect.height;
+
+                  const overlapX = Math.max(0, Math.min(x2, rectRight) - Math.max(x1, rect.x));
+                  const overlapY = Math.max(0, Math.min(y2, rectTop) - Math.max(y1, rect.y));
+
+                  const centerInside =
+                    centerX >= rect.x
+                    && centerX <= rectRight
+                    && centerY >= rect.y - tolerance
+                    && centerY <= rectTop + tolerance;
+
+                  if (overlapX * overlapY / area >= MIN_COVERAGE && centerInside) {
+                    layers.push(rect.fillColor);
+                  }
+                }
+
+                if (layers.length) {
+                  const color = compositeCellColors(layers);
+
+                  if (color) {
+                    fills[key] = color;
+                  }
+                }
+              }
+            }
+
+            return fills;
+          }
+
           // Function for extracting text coordinates
           function extractCoordinates(data) {
 
@@ -6456,6 +6571,111 @@ export function init({
           }
 
           /**
+ * A group without a detected header must show real table structure: a ruled grid
+ * (3+ visible rules in one direction) or filled bands (3+ band borders).
+ * A text box inside a decorative frame or a filled rectangle is not a table.
+ */
+          function isTableGroup(group: any, lineMaxWidth: number): boolean {
+            if (Object.keys(group?.headerRows || {}).length) {
+              return true;
+            }
+
+            // Number of distinct positions (rules closer than 2 pt are one rule)
+            const countDistinct = (values: number[]): number => {
+              let count = 0;
+              let previous = -Infinity;
+
+              [...values].sort((a, b) => a - b).forEach(value => {
+                if (value - previous > 2) {
+                  count++;
+                }
+
+                previous = value;
+              });
+
+              return count;
+            };
+
+            const rules = (group?.edges || []).filter(
+              (edge: any) => isVisibleVector(edge) && !edge['_isFakeLine']
+            );
+
+            const horizontal = countDistinct(
+              rules
+                .filter((edge: any) => edge.height < lineMaxWidth && edge.width > lineMaxWidth)
+                .map((edge: any) => edge.y + edge.height / 2)
+            );
+
+            const vertical = countDistinct(
+              rules
+                .filter((edge: any) => edge.width < lineMaxWidth && edge.height > lineMaxWidth)
+                .map((edge: any) => edge.x + edge.width / 2)
+            );
+
+            return horizontal >= 3
+              || vertical >= 3
+              || (group?.rectanglesRows || []).length >= 3;
+          }
+
+          /**
+ * Horizontal extent of a ruled table: the widest span shared by at least three
+ * visible horizontal rules. A rule drawn once (an accent line under the table)
+ * and invisible clip edges do not count. Returns null when the rules do not
+ * give one unambiguous extent (e.g. two tables side by side).
+ */
+          function getRuleExtent(
+            group: any,
+            lineMaxWidth: number
+          ): { left: number; right: number } | null {
+            const tolerance = 1.5;
+
+            const horizontals = (group?.edges || []).filter((edge: any) =>
+              isVisibleVector(edge)
+              && !edge['_isFakeLine']
+              && edge.height < lineMaxWidth
+              && edge.width > lineMaxWidth
+            );
+
+            // One entry per rule: segments of the same rule are united
+            const rules: Array<{ y: number; left: number; right: number }> = [];
+
+            horizontals.forEach((edge: any) => {
+              const y = edge.y + edge.height / 2;
+              const rule = rules.find(item => Math.abs(item.y - y) <= tolerance);
+
+              if (rule) {
+                rule.left = Math.min(rule.left, edge.x);
+                rule.right = Math.max(rule.right, edge.x + edge.width);
+              } else {
+                rules.push({ y, left: edge.x, right: edge.x + edge.width });
+              }
+            });
+
+            const supported = rules.filter(rule =>
+              rules.filter(other =>
+                Math.abs(other.left - rule.left) <= tolerance
+                && Math.abs(other.right - rule.right) <= tolerance
+              ).length >= 3
+            );
+
+            if (!supported.length) {
+              return null;
+            }
+
+            const widest = supported.reduce((best, rule) =>
+              rule.right - rule.left > best.right - best.left ? rule : best
+            );
+
+            // Every well supported extent must lie inside the widest one,
+            // otherwise these are separate tables and nothing can be cut
+            const unambiguous = supported.every(rule =>
+              rule.left >= widest.left - tolerance && rule.right <= widest.right + tolerance
+            );
+
+            return unambiguous ? { left: widest.left, right: widest.right } : null;
+          }
+
+          /**
  * Text that lies inside the box of a table belongs to that table. Splitting a
  * group by rows and columns can leave pieces of the same table as separate
  * fragments, or lose them when a fragment has no header and is discarded.
@@ -7373,6 +7593,20 @@ export function init({
               let aTop = a.rows?.length ? Math.max(...a.rows) : (a.y ? a.y[1] : 0);
               let bTop = b.rows?.length ? Math.max(...b.rows) : (b.y ? b.y[1] : 0);
               return bTop - aTop;
+            });
+
+            tableGroups = tableGroups.filter(group => {
+              const keep = isTableGroup(group, lineMaxWidth);
+
+              if (!keep) {
+                console.error('[DROPPED GROUP]', {
+                  x: group.x,
+                  y: group.y,
+                  blocks: group.coordinates?.length,
+                });
+              }
+
+              return keep;
             });
 
             tableGroups.forEach(group => {
@@ -8500,6 +8734,26 @@ export function init({
                 let increasedCoordinates = JSON.parse(JSON.stringify(coordinates));
                 let increasedCoordinatesIndexes = [];
 
+                // Text that lies completely outside a closed rule box is not part of the table.
+                // Left in, it creates an extra column (a stray "." right of the right border).
+                // increasedCoordinates is built from ALL coordinates passed to createGroup, so it
+                // has to be filtered as well, not only group['coordinates'].
+                const ruledBox = getRuledBoxExtent(group, lineMaxWidth);
+
+                if (ruledBox) {
+                  const isOutsideBox = (block: any) =>
+                    block.x >= ruledBox.right || block.x + block.width <= ruledBox.left;
+
+                  const outsideBlocks = (group['coordinates'] || []).filter(isOutsideBox);
+
+                  group['coordinates'] = (group['coordinates'] || []).filter(block => !isOutsideBox(block));
+                  increasedCoordinates = increasedCoordinates.filter(block => !isOutsideBox(block));
+
+                  if (outsideBlocks.length) {
+                    console.error('[OUTSIDE BOX]', outsideBlocks.map(block => block.str));
+                  }
+                }
+
                 // --- REMOVING CAPTION FROM COORDINATES ---
                 if (group['coordinates']?.length && group['edges']?.length) {
                   let tableYMin = Math.min(...group['coordinates'].map(c => c.y));
@@ -8570,6 +8824,35 @@ export function init({
                 });
                 alias['cols'] = handledCols.alias;
                 group['cols'] = handledCols.gridItems;
+
+                // The width of a ruled table is defined by its rules: column borders outside them
+                // (decorations, pictures, backdrops) are not columns of the table
+                if (tolerance !== Infinity) {
+                  const ruleExtent = getRuleExtent(group, lineMaxWidth);
+
+                  if (ruleExtent) {
+                    const margin = 1.5;
+                    const before = [...group['cols']];
+
+                    group['cols'] = [...new Set([
+                      ruleExtent.left,
+                      ...group['cols'].filter(
+                        col => col > ruleExtent.left + margin && col < ruleExtent.right - margin
+                      ),
+                      ruleExtent.right,
+                    ])].sort((a, b) => a - b);
+
+                    if (before.length !== group['cols'].length) {
+                      console.error('[RULE EXTENT]', {
+                        left: +ruleExtent.left.toFixed(1),
+                        right: +ruleExtent.right.toFixed(1),
+                        before: before.map(value => +value.toFixed(1)),
+                        after: group['cols'].map(value => +value.toFixed(1)),
+                      });
+                    }
+                  }
+                }
+
                 group['increasedCoordinates'] = increasedCoordinates;
                 group['paddingSize'] = handledRows.paddingSize;
                 group['borderSize'] = borderSize;
@@ -8965,6 +9248,17 @@ export function init({
               return [...new Set(gridItems)];
             }
 
+            console.error('[FINAL GROUPS]', tableGroups.map(group => ({
+              x: group.x?.map(value => +value.toFixed(1)),
+              y: group.y?.map(value => +value.toFixed(1)),
+              cols: group.cols?.map(value => +value.toFixed(1)),
+              assuredCols: group.assuredCols?.map(value => +value.toFixed(1)),
+              edgesCols: group.edgesCols?.map(value => +value.toFixed(1)),
+              rectanglesCols: group.rectanglesCols?.map(value => +value.toFixed(1)),
+              headerRows: Object.keys(group.headerRows || {}).length,
+              blocks: group.coordinates?.length,
+            })));
+
             return { tableGroups, pageGroups };
           }
 
@@ -9035,6 +9329,41 @@ export function init({
             }
 
             return +findMod(widths) || defaultBorderSize;
+          }
+
+          /**
+ * Horizontal extent of a table that is closed by drawn rules: the outermost
+ * horizontal rules end exactly on vertical rules at both sides. Returns null
+ * for tables that are not closed (borderless, horizontal rules only...), so
+ * text beside such a table is never treated as "outside".
+ */
+          function getRuledBoxExtent(group: any, lineMaxWidth: number): { left: number; right: number } | null {
+            const visibleEdges = (group?.edges || []).filter(
+              (edge: any) => isVisibleVector(edge) && !edge['_isFakeLine']
+            );
+
+            const horizontals = visibleEdges.filter(
+              (edge: any) => edge.height < lineMaxWidth && edge.width > lineMaxWidth
+            );
+
+            const verticals = visibleEdges.filter(
+              (edge: any) => edge.width < lineMaxWidth && edge.height > lineMaxWidth
+            );
+
+            if (horizontals.length < 2 || verticals.length < 2) {
+              return null;
+            }
+
+            const left = Math.min(...horizontals.map((edge: any) => edge.x));
+            const right = Math.max(...horizontals.map((edge: any) => edge.x + edge.width));
+            const tolerance = 1.5;
+
+            const hasVerticalRuleAt = (x: number) => verticals.some((edge: any) =>
+              Math.abs(edge.x - x) <= tolerance
+              || Math.abs(edge.x + edge.width - x) <= tolerance
+            );
+
+            return hasVerticalRuleAt(left) && hasVerticalRuleAt(right) ? { left, right } : null;
           }
 
           //Function for generating virtual edges
@@ -9407,6 +9736,75 @@ export function init({
                 : 0
             );
 
+            // ---- Boxed rows: closed by real rules, but no real inner vertical line --------
+            const realHorizontalLines = horizontalAssuredEdges.filter(edge => !edge['_isFakeLine']);
+            const realVerticalLines = verticalAssuredEdges.filter(edge => !edge['_isFakeLine']);
+            const boxTolerance = Math.max(borderSize * 2, 1);
+
+            // Share of the interval [from, to] covered by the lines that lie on `axis`
+            const getLineCoverage = (
+              lines: any[],
+              isHorizontal: boolean,
+              axis: number,
+              from: number,
+              to: number
+            ): number => {
+              const length = to - from;
+
+              if (!(length > 0)) {
+                return 0;
+              }
+
+              let covered = 0;
+
+              lines.forEach(edge => {
+                const center = isHorizontal
+                  ? edge.y + edge.height / 2
+                  : edge.x + edge.width / 2;
+
+                if (Math.abs(center - axis) > boxTolerance) {
+                  return;
+                }
+
+                const start = isHorizontal ? edge.x : edge.y;
+                const end = start + (isHorizontal ? edge.width : edge.height);
+
+                covered += Math.max(0, Math.min(end, to) - Math.max(start, from));
+              });
+
+              return Math.min(1, covered / length);
+            };
+
+            const isBoxedRowWithoutInnerLines = (rowIndex: number): boolean => {
+              const bottom = rows[rowIndex];
+              const top = rows[rowIndex + 1];
+
+              if (!Number.isFinite(bottom) || !Number.isFinite(top) || cols.length < 3) {
+                return false;
+              }
+
+              const left = cols[0];
+              const right = cols[cols.length - 1];
+
+              const isClosed =
+                getLineCoverage(realHorizontalLines, true, top, left, right) >= 0.85
+                && getLineCoverage(realHorizontalLines, true, bottom, left, right) >= 0.85
+                && getLineCoverage(realVerticalLines, false, left, bottom, top) >= 0.8
+                && getLineCoverage(realVerticalLines, false, right, bottom, top) >= 0.8;
+
+              if (!isClosed) {
+                return false;
+              }
+
+              for (let boundary = 1; boundary < cols.length - 1; boundary++) {
+                if (getLineCoverage(realVerticalLines, false, cols[boundary], bottom, top) >= 0.25) {
+                  return false;
+                }
+              }
+
+              return true;
+            };
+
             function getVirtualBoundaryMergeReason(
               borderIndex: number,
               rowIndex: number
@@ -9442,7 +9840,13 @@ export function init({
                 return 'text-crosses-boundary';
               }
 
-              // 2. The only empty column of the row is the right neighbour of a
+              // 2. The row is closed by real rules but has no real inner vertical line:
+              //    a column without text of its own is absorbed by its left neighbour.
+              if (isBoxedRowWithoutInnerLines(rowIndex)) {
+                return 'empty-cell-in-boxed-row';
+              }
+
+              // 3. The only empty column of the row is the right neighbour of a
               //    multiline cell, and that column is normally filled in other rows.
               if (!ENABLE_EMPTY_NEIGHBOUR_MERGE) {
                 return null;
@@ -9767,15 +10171,19 @@ export function init({
                 intersectionsIndexes: tableContentItems.reduce(
                   (prev, cur, index) => {
                     if (index != mainIndex) {
+                      // An image never turns text into a watermark: text drawn over pictures
+                      // (a starry background, a logo behind a table) is ordinary content.
+                      // A watermark IMAGE is still removed: it is checked as `item` itself
+                      // (it intersects many text items).
+                      if (cur?.imageName && !item?.imageName) {
+                        return prev;
+                      }
+
                       let inRange = (
                         checkRectangleRanges(
                           getObj(cur),
                           getObj(item),
-                          {
-                            strict: true,
-                            strictIntersecting: true,
-                            axis: ['x', 'y']
-                          }
+                          { strict: true, strictIntersecting: true, axis: ['x', 'y'] }
                         ) as Array<any>
                       ).every(item => item.inRange);
 
@@ -9858,6 +10266,16 @@ export function init({
 
               array.push(data);
             }
+
+            console.error('[WATERMARK REMOVED]', watermarksIndexes.map(index => ({
+              str: tableContentItems[index]?.str,
+              y: tableContentItems[index]?.transform?.[5],
+              intersects: (array.find(entry => entry.index === index)?.intersectionsIndexes || [])
+                .map(other => ({
+                  str: tableContentItems[other]?.str,
+                  image: tableContentItems[other]?.imageName,
+                })),
+            })));
 
             removeByIndexes(tableContentItems, watermarksIndexes);
 
@@ -11279,6 +11697,13 @@ export function init({
               mergeAlias: matrixData.mergeAlias,
               matrix: matrixData.matrix,
               filledRectangles,
+              cellFills: computeCellFills({
+                verticles,
+                horizons,
+                merges: matrixData.merges,
+                mergeAlias: matrixData.mergeAlias,
+                rectangles,
+              }),
             });
           }
 
@@ -11695,6 +12120,21 @@ export function init({
                 }
               }
 
+              // Cells without a text based fill: empty cells and cells whose text sticks out of the
+              // filled rectangle (computed from the page rectangles in the first pass)
+              const cellFills = tableGroup?.cellFills || {};
+
+              for (let r = 0; r < rowsCount; r++) {
+                for (let c = 0; c < colsCount; c++) {
+                  const cell = table.array[r]?.[c];
+                  const fill = cellFills[`${r}-${c}`];
+
+                  if (cell && cell['fillColor'] == null && fill) {
+                    cell['fillColor'] = fill;
+                  }
+                }
+              }
+
               // We consider only the sequence of ranges starting at the top of the table to be headers.
               // False “headers” in the middle of the table should not cause the first N rows to be converted to <th>.
               const topHeaderRowCount = (() => {
@@ -11913,26 +12353,41 @@ export function init({
 
                     // 3. If there is a line nearby, but the color has not shifted (micro-shifts) — the dominant color
                     if (!result && hasAnyBorders && tableBorderColor) {
-                      let hasNearbyEdge = allEdges.some(edge => {
-                        let isHorizontalEdge = edge.height < lineMaxWidth && edge.width > lineMaxWidth;
-                        let isVerticalEdge = edge.width < lineMaxWidth && edge.height > lineMaxWidth;
-                        if (isHorizontalIdeal && !isHorizontalEdge) return false;
-                        if (!isHorizontalIdeal && !isVerticalEdge) return false;
+                      // A rule that merely ends next to the segment (or touches it) is not the border
+                      // of this cell: require that it really covers a part of the segment.
+                      let nearbyCoverage = 0;
 
-                        if (isHorizontalIdeal) {
-                          let yMatch = Math.abs(edge.y - idealLine.y1) <= tolerance;
-                          let xOverlap = !(edge.x + edge.width < Math.min(idealLine.x1, idealLine.x2) - tolerance ||
-                            edge.x > Math.max(idealLine.x1, idealLine.x2) + tolerance);
-                          return yMatch && xOverlap;
-                        } else {
-                          let xMatch = Math.abs(edge.x - idealLine.x1) <= tolerance;
-                          let yOverlap = !(edge.y + edge.height < Math.min(idealLine.y1, idealLine.y2) - tolerance ||
-                            edge.y > Math.max(idealLine.y1, idealLine.y2) + tolerance);
-                          return xMatch && yOverlap;
+                      allEdges.forEach(edge => {
+                        const isHorizontalEdge = edge.height < lineMaxWidth && edge.width > lineMaxWidth;
+                        const isVerticalEdge = edge.width < lineMaxWidth && edge.height > lineMaxWidth;
+
+                        if (isHorizontalIdeal ? !isHorizontalEdge : !isVerticalEdge) {
+                          return;
                         }
+
+                        const axisMatch = isHorizontalIdeal
+                          ? Math.abs(edge.y - idealLine.y1) <= tolerance
+                          : Math.abs(edge.x - idealLine.x1) <= tolerance;
+
+                        if (!axisMatch) {
+                          return;
+                        }
+
+                        const from = isHorizontalIdeal
+                          ? Math.min(idealLine.x1, idealLine.x2)
+                          : Math.min(idealLine.y1, idealLine.y2);
+
+                        const to = isHorizontalIdeal
+                          ? Math.max(idealLine.x1, idealLine.x2)
+                          : Math.max(idealLine.y1, idealLine.y2);
+
+                        const start = isHorizontalIdeal ? edge.x : edge.y;
+                        const end = start + (isHorizontalIdeal ? edge.width : edge.height);
+
+                        nearbyCoverage += Math.max(0, Math.min(end, to) - Math.max(start, from));
                       });
 
-                      if (hasNearbyEdge) {
+                      if (nearbyCoverage >= idealLength * 0.25) {
                         result = tableBorderColor;
                       }
                     }
@@ -12144,7 +12599,12 @@ export function init({
               lineMaxWidth: lineMaxWidth,
               rectangles: tableGroup.rectangles,
             });
-            if (tableData.table.array.length) {
+            const hasText = tableData.table.array.some(row =>
+              row.some(cell => (cell?.str || '').trim().length > 0)
+            );
+
+            // A grid without any text is a decoration (a filled box, a frame, shadows), not a table
+            if (tableData.table.array.length && hasText) {
               tableGroup.tableData = tableData;
             }
           }
@@ -12209,7 +12669,7 @@ export function init({
 
           result.pageTables.push({
             page: pageNum,
-            tableGroups,
+            tableGroups: tableGroups.filter(group => group.tableData),
             pageGroup: pageGroups[0]
           });
           result.currentPage++;
