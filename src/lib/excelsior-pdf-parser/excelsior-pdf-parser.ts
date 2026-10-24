@@ -4,7 +4,33 @@
 // import { dirname } from 'path';
 import { getTextDirection, findClosestIndex, parseRGB, getMergedArray, uniqueArr, findMod, findAverage, caseIndependentCompare, splitByIndex, checkRectangleRanges, removeByIndexes, getSplitEdgeRange, getOnePercentOfAbsoluteDifference, typeValue, sortArrayOfObjects, deepSet, stringifyPseudoJson, isSequentialIndexRow } from '@unsonet/js-utils'
 import { buildDebugReport, DebugOptions } from '../pdftrace-debug-kit/pdf-debug';
-
+import { headerIndicatorWords as _headerIndicatorWords, OPS as _OPS, LEADER_CHARS, LEADER_RUN, LEADER_THEN_CONTENT, LEADER_TRAILING_RUN } from '../constants';
+import {
+  applyTransformFn,
+  extractArrayLike,
+  extractClosedSubpathRectangles,
+  getDeviceBBox,
+  isBorderAbsorbedByFills,
+  normalizeColorArgs,
+  normalizeFontArgs,
+  normalizeGenericColorArgs,
+  normalizeNumericArgs,
+  normalizeShowTextArgs,
+  transformFn,
+} from './pdf-operator-utils';
+import {
+  hasVectorColor,
+  isEdgeFilledEvenOdd,
+  isSameFillColor,
+  isStrictlyContained,
+  isVisibleVector,
+} from './pdf-vector-utils';
+import {
+  calculateEdgeToleranceValue,
+  calculateToleranceValue,
+  getAverageBorderSize,
+  mergeCoordinates,
+} from './pdf-grid-utils';
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = dirname(__filename);
 export function init({
@@ -95,24 +121,9 @@ export function init({
         );
     }
 
-    //pdfjs.Util.transform
-    function transformFn(m1, m2) {
-      return [
-        m1[0] * m2[0] + m1[2] * m2[1],
-        m1[1] * m2[0] + m1[3] * m2[1],
-        m1[0] * m2[2] + m1[2] * m2[3],
-        m1[1] * m2[2] + m1[3] * m2[3],
-        m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
-        m1[1] * m2[4] + m1[3] * m2[5] + m1[5]
-      ];
-    };
 
-    //pdfjs.Util.applyTransform
-    function applyTransformFn(p, m) {
-      var xt = p[0] * m[0] + p[1] * m[2] + m[4];
-      var yt = p[0] * m[1] + p[1] * m[3] + m[5];
-      return [xt, yt];
-    };
+
+
 
 
     var pagesToProcess = resolvePagesToProcess(numPages, pages);
@@ -169,42 +180,7 @@ export function init({
 
         console.error(`[DEBUG Page ${pageNum}] filtered items:`, pageTextContent.items.length);
 
-        // Converts an element's (transform, width, height) into a true
-        // axis-aligned bounding box in device coordinates—by projecting onto
-        // the element's actual reading/rising directions (the same logic we
-        // have already applied in extractCoordinates/buildSegment). This is necessary because
-        // both `width` and `height` for ANY text element (including
-        // native elements from `pageTextContent.items` in pdf.js itself)
-        // are measured along the element’s READING direction, not along
-        // the device’s fixed X/Y axes—for horizontal text, this
-        // is the same, but for rotated text (as in rotated.pdf), it is not.
-        function getDeviceBBox(transform, width, height) {
-          const [a, b, c, d, e, f] = transform;
-          const readingLen = Math.hypot(a, b) || 1;
-          const ascentLen = Math.hypot(c, d) || 1;
-          const readingUnit = [a / readingLen, b / readingLen];
-          const ascentUnit = [c / ascentLen, d / ascentLen];
 
-          const corners = [];
-          for (const t of [0, width]) {
-            for (const s of [0, height]) {
-              corners.push([
-                e + readingUnit[0] * t + ascentUnit[0] * s,
-                f + readingUnit[1] * t + ascentUnit[1] * s,
-              ]);
-            }
-          }
-
-          const xs = corners.map(p => p[0]);
-          const ys = corners.map(p => p[1]);
-
-          return {
-            x: Math.min(...xs),
-            y: Math.min(...ys),
-            width: Math.max(...xs) - Math.min(...xs),
-            height: Math.max(...ys) - Math.min(...ys),
-          };
-        }
 
         function getRelatedTextContentItems(element) {
           return pageTextContent.items.filter((item, index) => {
@@ -218,44 +194,11 @@ export function init({
           });
         };
 
-        const NESTED_RECT_TOLERANCE = 0.5;
 
-        function isSameFillColor(a: any, b: any): boolean {
-          return !!a?.fillColor && a.fillColor === b?.fillColor;
-        }
 
-        function isStrictlyContained(outer: any, inner: any, tolerance: number = NESTED_RECT_TOLERANCE): boolean {
-          const innerRight = inner.x + inner.width;
-          const innerBottom = inner.y + inner.height;
-          const outerRight = outer.x + outer.width;
-          const outerBottom = outer.y + outer.height;
 
-          const contained =
-            inner.x >= outer.x - tolerance &&
-            inner.y >= outer.y - tolerance &&
-            innerRight <= outerRight + tolerance &&
-            innerBottom <= outerBottom + tolerance;
 
-          if (!contained) return false;
 
-          // We filter out duplicates/matching rectangles:
-          // the nested one must be noticeably smaller in at least one axis.
-          const strictlySmaller =
-            innerRight - inner.x < outerRight - outer.x - tolerance ||
-            innerBottom - inner.y < outerBottom - outer.y - tolerance;
-
-          return strictlySmaller;
-        }
-
-        function isVisibleVector(item) {
-          let color = item?.fillColor || item?.strokeColor;
-          let numbers = parseRGB(color);
-          return numbers?.length ? !(numbers.length == 4 && numbers[numbers.length - 1] == 0) : false;
-        }
-
-        function hasVectorColor(item) {
-          return !!(item?.fillColor || item?.strokeColor);
-        }
 
         return page.getOperatorList().then(async function (opList) {
 
@@ -267,10 +210,117 @@ export function init({
           var edges = [];
           var tableContentItems = [];
           var tableContentItemsCache = {};
+          var tableContentItemsCacheSource: Record<string, any> = {};
           var lastActiveCacheKey = null;
 
           if (debugTrace) {
             debugTrace.cleanupRoots.push(edges, tableContentItems, tableContentItemsCache);
+          }
+
+          function getItemRight(item: any): number {
+            const rights = (item?.chars || [])
+              .filter(
+                (glyph: any) =>
+                  glyph && typeof glyph === 'object' && Number.isFinite(glyph.x) && Number.isFinite(glyph.charWidth)
+              )
+              .map((glyph: any) => glyph.x + glyph.charWidth);
+            return rights.length ? Math.max(...rights) : item.transform[4] + (item.width || 0);
+          }
+
+          // The item that starts exactly where the flushed text ends, on the same baseline.
+          function findContinuationItem(flushed: any): any {
+            const height = Math.max(flushed.height || 0, 1);
+            const baselineTolerance = Math.max(height * 0.5, 1);
+            const maxGap = Math.max(height * 0.75, 2);
+            const right = getItemRight(flushed);
+            let best: any = null;
+            let bestGap = Infinity;
+
+            for (const item of tableContentItems) {
+              if (!item?.transform || item.imageName || !item.str?.trim() || !item.chars?.length) continue;
+              if (Math.abs(item.transform[5] - flushed.transform[5]) > baselineTolerance) continue;
+
+              const gap = item.transform[4] - right;
+              if (gap < -height * 0.25 || gap > maxGap || gap >= bestGap) continue;
+              if (hasVerticalSeparatorBetween(flushed, item)) continue;
+
+              best = item;
+              bestGap = gap;
+            }
+            return best;
+          }
+
+          function attachToContinuation(target: any, flushed: any): void {
+            const isGlyph = (glyph: any) => glyph && typeof glyph === 'object' && typeof glyph.unicode === 'string';
+            const lastGlyph = [...flushed.chars].reverse().find(isGlyph);
+            const firstGlyph = target.chars.find(isGlyph);
+            const right = getItemRight(flushed);
+            const gap = target.transform[4] - right;
+            const needsSpace = !!lastGlyph?.unicode.trim() &&
+              !!firstGlyph?.unicode.trim() &&
+              gap >= Math.max((flushed.height || 0) * 0.15, 0.5);
+
+            const spaceGlyph = {
+              originalCharCode: 32,
+              fontChar: ' ',
+              unicode: ' ',
+              accent: null,
+              width: 250,
+              isSpace: true,
+              isInFont: true,
+              isLineBreak: false,
+              x: right,
+              y: flushed.transform[5],
+              charWidth: Math.max(gap, 0)
+            };
+
+            target.chars = [...flushed.chars, ...(needsSpace ? [spaceGlyph] : []), ...target.chars];
+            target.str = `${flushed.str}${needsSpace ? ' ' : ''}${target.str}`;
+            target.width = Math.max(getItemRight(target), right) - flushed.transform[4];
+            target.transform = [
+              target.transform[0],
+              target.transform[1],
+              target.transform[2],
+              target.transform[3],
+              flushed.transform[4],
+              target.transform[5]
+            ];
+          }
+
+          // Original behaviour, kept for rotated text: fragments of a rotated (multi-line) header lie
+          // at different transform[5] values along the reading direction, so the whole bucket is
+          // one text item.
+          function mergeCachedBucketAsWhole(cachedItems: any[]): any {
+            const mergedStr = cachedItems
+              .map(item => item?.str || '')
+              .filter(part => part.trim().length)
+              .join(' ');
+
+            const mergedChars = cachedItems.reduce(
+              (chars, item) => chars.concat(item?.chars || []),
+              []
+            );
+
+            const first = cachedItems[0];
+            const last = cachedItems[cachedItems.length - 1];
+
+            return {
+              ...first,
+              str: mergedStr,
+              chars: mergedChars,
+              hasEOT: true,
+              hasEOL: last?.hasEOL || false,
+              width: Math.max(...cachedItems.map(item => item?.width || 0)),
+              height: Math.max(...cachedItems.map(item => item?.height || 0)),
+              transform: [
+                first.transform[0],
+                first.transform[1],
+                first.transform[2],
+                first.transform[3],
+                Math.min(...cachedItems.map(item => item.transform[4])),
+                Math.min(...cachedItems.map(item => item.transform[5]))
+              ]
+            };
           }
 
           // Fallback: if the showText chain (for example, a
@@ -282,45 +332,83 @@ export function init({
           // the subsequent layout into cells in `extractTableData()` will still
           // concatenate the text within a single cell anyway.
           function flushStaleTableContentItemsCache() {
-            const staleKeys = Object.keys(tableContentItemsCache);
-            for (let k = 0; k < staleKeys.length; k++) {
-              const key = staleKeys[k];
+            for (const key of Object.keys(tableContentItemsCache)) {
               const cachedItems = (tableContentItemsCache[key] || []).filter(Boolean);
+              const source = tableContentItemsCacheSource[key];
+              delete tableContentItemsCache[key];
+              delete tableContentItemsCacheSource[key];
+              if (!cachedItems.length) continue;
 
-              if (cachedItems.length) {
-                const mergedStr = cachedItems
-                  .map(item => item?.str || '')
-                  .filter(part => part.trim().length)
-                  .join(' ');
-
-                const mergedChars = cachedItems.reduce(
-                  (chars, item) => chars.concat(item?.chars || []),
-                  []
-                );
-
-                const first = cachedItems[0];
-                const last = cachedItems[cachedItems.length - 1];
-
-                tableContentItems.push({
-                  ...first,
-                  str: mergedStr,
-                  chars: mergedChars,
-                  hasEOT: true,
-                  hasEOL: last?.hasEOL || false,
-                  width: Math.max(...cachedItems.map(item => item?.width || 0)),
-                  height: Math.max(...cachedItems.map(item => item?.height || 0)),
-                  transform: [
-                    first.transform[0],
-                    first.transform[1],
-                    first.transform[2],
-                    first.transform[3],
-                    Math.min(...cachedItems.map(item => item.transform[4])),
-                    Math.min(...cachedItems.map(item => item.transform[5]))
-                  ]
-                });
+              const isRotatedBucket = cachedItems.some(
+                item => item?.transform && (isRotatedTextItem(item) || isRotatedText(item))
+              );
+              if (isRotatedBucket) {
+                tableContentItems.push(mergeCachedBucketAsWhole(cachedItems));
+                continue;
               }
 
-              delete tableContentItemsCache[key];
+              // Fragments with text define the line; whitespace-only fragments
+              // (possibly attached from a neighbouring line) must not move it.
+              const solidItems = cachedItems.filter(item => item.str?.trim());
+              const candidates = solidItems.length ? solidItems : cachedItems;
+              const reference = candidates[0];
+              const referenceHeight = Math.max(reference.height || 0, 1);
+              const baselineTolerance = Math.max(referenceHeight * 0.5, 1);
+
+              // The pdf.js item this bucket was waiting for is the ground truth for the baseline.
+              const sourceBaseline = Number(source?.transform?.[5]);
+              const baseline =
+                Number.isFinite(sourceBaseline) &&
+                  Math.abs(sourceBaseline - reference.transform[5]) <= referenceHeight * 3 ?
+                  sourceBaseline :
+                  reference.transform[5];
+
+              const lineItems = candidates.filter(
+                item => Math.abs(item.transform[5] - reference.transform[5]) <= baselineTolerance
+              );
+              const strayItems = candidates.filter(
+                item => !lineItems.includes(item) && item.str?.trim()
+              );
+
+              const mergedChars = lineItems.reduce((chars, item) => chars.concat(item.chars || []), []);
+              mergedChars.forEach((glyph: any) => {
+                if (glyph && typeof glyph === 'object' && Number.isFinite(glyph.y)) {
+                  glyph.y = baseline;
+                }
+              });
+
+              const first = lineItems[0];
+              const left = Math.min(...lineItems.map(item => item.transform[4]));
+              const right = Math.max(...lineItems.map(getItemRight));
+              const flushed = {
+                ...first,
+                str: lineItems.map(item => item?.str || '').filter(part => part.trim().length).join(' '),
+                chars: mergedChars,
+                hasEOT: true,
+                hasEOL: lineItems[lineItems.length - 1]?.hasEOL || false,
+                width: Math.max(0, right - left),
+                height: Math.max(...lineItems.map(item => item?.height || 0)),
+                transform: [first.transform[0], first.transform[1], first.transform[2], first.transform[3], left, baseline]
+              };
+
+              const continuation = findContinuationItem(flushed);
+              console.error('[STALE FLUSH]', {
+                text: flushed.str,
+                ownBaseline: reference.transform[5],
+                sourceBaseline,
+                usedBaseline: baseline,
+                mergedInto: continuation?.str || null
+              });
+
+              if (continuation) {
+                attachToContinuation(continuation, flushed);
+              } else {
+                tableContentItems.push(flushed);
+              }
+              strayItems.forEach(item => tableContentItems.push({
+                ...item,
+                hasEOT: true
+              }));
             }
           }
 
@@ -409,198 +497,6 @@ export function init({
             return JSON.stringify(transformMatrix) == JSON.stringify(_defaultTransformMatrix);
           }
 
-
-          // ===== HELPERS for compatibility of pdfjs-dist v5.1+ / v6+ (Node.js fake worker) =====
-          function extractArrayLike(v: any): any[] {
-            if (Array.isArray(v)) return v;
-            if (!v || typeof v !== 'object') return [];
-            if (typeof v.length === 'number') return Array.from(v);
-            var keys = Object.keys(v).filter(function (k) { return /^\d+$/.test(k); })
-              .sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
-            return keys.map(function (k) { return v[k]; });
-          }
-
-          function normalizeNumericArgs(args: any): any[] {
-            // New format: [ { "0": x, "1": y, ... } ] (array with one Array-like object)
-            if (Array.isArray(args) && args.length === 1 && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
-              return extractArrayLike(args[0]);
-            }
-            // Old format: Array-like object without wrapper
-            if (!Array.isArray(args) && args && typeof args === 'object') {
-              return extractArrayLike(args);
-            }
-            return args;
-          }
-
-          function grayToRGB(value: number): number[] {
-            const gray = Math.round(
-              Math.max(0, Math.min(1, value)) * 255
-            );
-
-            return [gray, gray, gray];
-          }
-
-          function cmykToRGB(
-            c: number,
-            m: number,
-            y: number,
-            k: number
-          ): number[] {
-            c = Math.max(0, Math.min(1, c));
-            m = Math.max(0, Math.min(1, m));
-            y = Math.max(0, Math.min(1, y));
-            k = Math.max(0, Math.min(1, k));
-
-            return [
-              Math.round(255 * (1 - Math.min(1, c + k))),
-              Math.round(255 * (1 - Math.min(1, m + k))),
-              Math.round(255 * (1 - Math.min(1, y + k))),
-            ];
-          }
-
-          function normalizeGenericColorArgs(args: any): number[] {
-            const values = normalizeNumericArgs(args)
-              .filter(value => typeof value === 'number');
-
-            if (values.length === 1) {
-              return grayToRGB(values[0]);
-            }
-
-            if (values.length === 3) {
-              return values.map(value =>
-                Math.round(
-                  Math.max(0, Math.min(1, value)) * 255
-                )
-              );
-            }
-
-            if (values.length === 4) {
-              return cmykToRGB(
-                values[0],
-                values[1],
-                values[2],
-                values[3]
-              );
-            }
-
-            return [];
-          }
-
-          function normalizeColorArgs(args: any): number[] {
-            if (Array.isArray(args) && args.length === 1 && typeof args[0] === 'string' && args[0].startsWith('#')) {
-              var hex = args[0].slice(1);
-              if (hex.length === 3) hex = hex.split('').map(function (c) { return c + c; }).join('');
-              var num = parseInt(hex, 16);
-              return [(num >> 16) & 255, (num >> 8) & 255, num & 255];
-            }
-            var arr = normalizeNumericArgs(args);
-            // Old format: args = [{"0":128,"1":128,"2":128}]
-            if (Array.isArray(arr) && arr.length === 1 && arr[0] && typeof arr[0] === 'object' && !Array.isArray(arr[0])) {
-              arr = extractArrayLike(arr[0]);
-            }
-            return Array.isArray(arr) ? arr.filter(v => typeof v === 'number') : [];
-          }
-
-          function normalizeFontArgs(args: any): [string, number] {
-            if (!Array.isArray(args) || args.length === 0) return ['', 0];
-            // New format pdfjs@6: [["g_d0_f3", 8], ["g_d0_f2", 8]]
-            if (Array.isArray(args[0]) && args.length >= 1) {
-              return [args[0][0], args[0][1]];
-            }
-            // Old format: ["g_d0_f1", 8]
-            if (typeof args[0] === 'string') {
-              return [args[0], args[1] || 0];
-            }
-            // Fallback
-            let norm = normalizeNumericArgs(args);
-            if (Array.isArray(norm[0])) return [norm[0][0], norm[0][1]];
-            return [norm[0], norm[1]];
-          }
-
-          /**
-          * Extracts closed axial subpaths from pathOps/pathCoords
-          * (moveTo → lineTo×N → closePath) that describe rectangles, and replaces
-          * each with a single OPS.rectangle. Non‑convertible subpaths (curves,
-          * non‑closed, non‑degenerate) are copied unchanged.
-          */
-          function extractClosedSubpathRectangles(pathOps: number[], pathCoords: number[]): { ops: number[], coords: number[] } {
-            const coordCountFor = (op: number): number => {
-              if (op === OPS.rectangle) return 4;
-              if (op === OPS.moveTo || op === OPS.lineTo) return 2;
-              if (op === OPS.curveTo) return 6;
-              if (op === OPS.curveTo2 || op === OPS.curveTo3) return 4;
-              return 0; // closePath and others without coordinates
-            };
-
-            const trySubpathToRect = (pts: number[][]): [number, number, number, number] | null => {
-              if (pts.length < 4) return null; // moveTo + at least 3 corners
-              const xs = pts.map(p => p[0]);
-              const ys = pts.map(p => p[1]);
-              const x1 = Math.min(...xs), x2 = Math.max(...xs);
-              const y1 = Math.min(...ys), y2 = Math.max(...ys);
-              if (x2 - x1 < 0.01 || y2 - y1 < 0.01) return null;
-              // all segments are axial and on the perimeter of the bbox; the path perimeter is equal to the bbox perimeter
-              let perimeter = 0;
-              for (let k = 0; k < pts.length; k++) {
-                const [ax, ay] = pts[k];
-                const [bx, by] = pts[(k + 1) % pts.length];
-                const dx = bx - ax, dy = by - ay;
-                if (Math.abs(dx) > 1e-4 && Math.abs(dy) > 1e-4) return null;
-                perimeter += Math.abs(dx) + Math.abs(dy);
-              }
-              for (const [px, py] of pts) {
-                const onV = (Math.abs(px - x1) < 0.01 || Math.abs(px - x2) < 0.01) && py >= y1 - 0.01 && py <= y2 + 0.01;
-                const onH = (Math.abs(py - y1) < 0.01 || Math.abs(py - y2) < 0.01) && px >= x1 - 0.01 && px <= x2 + 0.01;
-                if (!onV && !onH) return null;
-              }
-              if (Math.abs(perimeter - 2 * ((x2 - x1) + (y2 - y1))) > 0.5) return null;
-              return [x1, y1, x2 - x1, y2 - y1];
-            };
-
-            const outOps: number[] = [];
-            const outCoords: number[] = [];
-            let ci = 0, i = 0;
-            while (i < pathOps.length) {
-              if (pathOps[i] !== OPS.moveTo) {
-                const op = pathOps[i];
-                outOps.push(op);
-                const n = coordCountFor(op);
-                for (let k = 0; k < n; k++) outCoords.push(pathCoords[ci++]);
-                i++;
-                continue;
-              }
-              // collect the subpath up to closePath / the next moveTo
-              const pts: number[][] = [[pathCoords[ci], pathCoords[ci + 1]]];
-              ci += 2;
-              const subOps: number[] = [OPS.moveTo];
-              const subCoords: number[] = [...pts[0]];
-              let closed = false;
-              let hasCurves = false;
-              i++;
-              while (i < pathOps.length) {
-                const op = pathOps[i];
-                if (op === OPS.closePath) { closed = true; i++; break; }
-                if (op === OPS.moveTo) break;
-                subOps.push(op);
-                const n = coordCountFor(op);
-                for (let k = 0; k < n; k++) subCoords.push(pathCoords[ci]);
-                if (op === OPS.lineTo) pts.push([pathCoords[ci], pathCoords[ci + 1]]);
-                if (op >= OPS.curveTo && op <= OPS.curveTo3) hasCurves = true;
-                ci += n;
-                i++;
-              }
-              const rect = (closed && !hasCurves) ? trySubpathToRect(pts) : null;
-              if (rect) {
-                outOps.push(OPS.rectangle);
-                outCoords.push(...rect);
-              } else {
-                outOps.push(...subOps, ...(closed ? [OPS.closePath] : []));
-                outCoords.push(...subCoords);
-              }
-            }
-            return { ops: outOps, coords: outCoords };
-          }
-
           // Rectangular paths drawn with both fill and stroke (fillStroke / closeFillStroke).
           // They are not included in the rectangles (which are fill-only), so we copy them separately:
           // They are needed only to fill the cells in the output and do not affect the grid in any way.
@@ -622,7 +518,7 @@ export function init({
               return 0;
             };
 
-            const extracted = extractClosedSubpathRectangles(ops, coords);
+            const extracted = extractClosedSubpathRectangles(ops, coords, OPS);
             let coordIdx = 0;
 
             for (const op of extracted.ops) {
@@ -668,76 +564,10 @@ export function init({
             }
           }
 
-          function normalizeShowTextArgs(args: any): any[] {
-            if (!args || !args.length) return [];
-            let glyphs = args[0];
-            // If pdfjs returned the string directly
-            if (typeof glyphs === 'string') {
-              return glyphs.split('').map(ch => ({
-                unicode: ch,
-                width: 500,
-                isSpace: ch === ' ',
-                isLineBreak: ch === '\n',
-                isInFont: true
-              }));
-            }
-            // Array of arrays — flatten
-            if (Array.isArray(glyphs) && glyphs.length > 0 && Array.isArray(glyphs[0])) {
-              glyphs = glyphs.flat();
-            }
-            // Make sure that \n is marked as isLineBreak
-            if (Array.isArray(glyphs)) {
-              return glyphs.map(g => {
-                if (typeof g === 'number') return g;
-                if (typeof g === 'object' && g !== null) {
-                  if (g.unicode === '\n' && !g.isLineBreak) {
-                    return { ...g, isLineBreak: true };
-                  }
-                  return g;
-                }
-                return g;
-              });
-            }
-            return [];
-          }
-
-          function normalizeDependencyArgs(args: any): string[] {
-            if (!Array.isArray(args)) return [];
-            if (args.length > 0 && Array.isArray(args[0])) {
-              return args.map(pair => pair[0]).filter(Boolean);
-            }
-            return args.filter(item => typeof item === 'string');
-          }
           // ===== END OF HELPERS =====
 
           // ===== BULLETPROOF OPS + getOperatorList =====
-          const OPS = pdfjs?.OPS || {
-            dependency: 1, setLineWidth: 2, setLineCap: 3, setLineJoin: 4, setMiterLimit: 5,
-            setDash: 6, setRenderingIntent: 7, setFlatness: 8, setGState: 9, save: 10,
-            restore: 11, transform: 12, moveTo: 13, lineTo: 14, curveTo: 15, curveTo2: 16,
-            curveTo3: 17, closePath: 18, rectangle: 19, stroke: 20, closeStroke: 21,
-            fill: 22, eoFill: 23, fillStroke: 24, eoFillStroke: 25, closeFillStroke: 26,
-            closeEOFillStroke: 27, endPath: 28, clip: 29, eoClip: 30, beginText: 31,
-            endText: 32, setCharSpacing: 33, setWordSpacing: 34, setHScale: 35,
-            setLeading: 36, setFont: 37, setTextRenderingMode: 38, setTextRise: 39,
-            moveText: 40, setLeadingMoveText: 41, setTextMatrix: 42, nextLine: 43,
-            showText: 44, showSpacedText: 45, nextLineShowText: 46,
-            nextLineSetSpacingShowText: 47, setCharWidth: 48, setCharWidthAndBounds: 49,
-            setStrokeColorSpace: 50, setFillColorSpace: 51, setStrokeColor: 52,
-            setStrokeColorN: 53, setFillColor: 54, setFillColorN: 55, setStrokeGray: 56,
-            setFillGray: 57, setStrokeRGBColor: 58, setFillRGBColor: 59,
-            setStrokeCMYKColor: 60, setFillCMYKColor: 61, shadingFill: 62,
-            beginInlineImage: 63, beginImageData: 64, endInlineImage: 65,
-            paintXObject: 66, markPoint: 67, markPointProps: 68, beginMarkedContent: 69,
-            beginMarkedContentProps: 70, endMarkedContent: 71, beginCompat: 72,
-            endCompat: 73, paintFormXObjectBegin: 74, paintFormXObjectEnd: 75,
-            beginGroup: 76, endGroup: 77, beginAnnotation: 80, endAnnotation: 81,
-            paintImageMaskXObject: 83, paintImageMaskXObjectGroup: 84,
-            paintImageXObject: 85, paintInlineImageXObject: 86,
-            paintInlineImageXObjectGroup: 87, paintImageXObjectRepeat: 88,
-            paintImageMaskXObjectRepeat: 89, paintSolidColorImageMask: 90,
-            constructPath: 91, setStrokeTransparent: 92, setFillTransparent: 93
-          };
+          const OPS = pdfjs?.OPS || _OPS;
 
           // Normalize to regular arrays (Node.js can return an Int32Array)
           const _fnArray = Array.from(opList.fnArray || []);
@@ -749,7 +579,7 @@ export function init({
           const DEBUG_DUMP_CONTENT = true;
           if (DEBUG_DUMP_CONTENT) {
             let content = opList.fnArray
-              .map(item => Object.keys(pdfjs.OPS).find(key => pdfjs.OPS[key] == item))
+              .map(item => Object.keys(OPS).find(key => OPS[key] == item))
               .map((item, index) => {
                 let args = opList.argsArray[index];
                 let operation = item;
@@ -774,32 +604,9 @@ export function init({
             const fn = _fnArray[i];
             const args: any = _argsArray[i];
 
-            // Temporary diagnostics: raw operators around the numbering row and the dash rows
-            if (i >= 118 && i <= 160) {
-              const opName = Object.keys(pdfjs.OPS).find(key => pdfjs.OPS[key] === fn);
-              let printable: any = args;
 
-              if (fn === OPS.showText) {
-                // TJ adjustments are printed as ⟨n⟩, spaces as ␣
-                printable = (Array.isArray(args?.[0]) ? args[0].flat() : [])
-                  .map((glyph: any) =>
-                    typeof glyph === 'number'
-                      ? `⟨${glyph}⟩`
-                      : (glyph?.isSpace ? '␣' : (glyph?.unicode ?? '?'))
-                  )
-                  .join('');
-              }
-
-              console.error(
-                '[OP]',
-                i,
-                opName,
-                typeof printable === 'string' ? printable : JSON.stringify(printable)?.slice(0, 200)
-              );
-            }
-
-            //debugging: Object.keys(pdfjs.OPS).find(item=>pdfjs.OPS[item] == opList.fnArray[33])
-            //opList.fnArray.map(item=>Object.keys(pdfjs.OPS).find(key=>pdfjs.OPS[key] == item))
+            //debugging: Object.keys(OPS).find(item=>OPS[item] == opList.fnArray[33])
+            //opList.fnArray.map(item=>Object.keys(OPS).find(key=>OPS[key] == item))
             if (fn === OPS.constructPath) {
               constructPathCount++;
               current['pathConstructed'] = true;
@@ -935,7 +742,7 @@ export function init({
                     if (isFillOnlyPaint) {
                       // The cell background is often drawn using a single fill path consisting of dozens of sub‑rectangles;
                       // each represents the geometry of a separate cell (including merged rowspan/colspan).
-                      const extracted = extractClosedSubpathRectangles(pathOps, pathCoords);
+                      const extracted = extractClosedSubpathRectangles(pathOps, pathCoords, OPS);
                       pathOps = extracted.ops;
                       pathCoords = extracted.coords;
                     }
@@ -1454,83 +1261,9 @@ export function init({
             } else if (fn === OPS.setLineWidth) {
               current['lineWidth'] = args[0];
             } else if (fn === OPS.eoFill) {
-              /**
-                 * Determines if the area between two points is filled using the evenodd rule.
-                 *
-                 * @param {Object} edgeStart - The starting point of the edge.
-                 * @param {Object} edgeEnd - The end point of the edge.
-                 * @param {Array} allEdges - All edges to verify crossings.
-                 * @returns {boolean} - True if the area is filled.
-                 */
-              function isEdgeFilledEvenOdd(edgeStart, edgeEnd, allEdges) {
-                // Check if the start and end points match
-                if (edgeStart.x === edgeEnd.x && edgeStart.y === edgeEnd.y) {
-                  // If it is a closed path, treat it as a filled area
-                  return true;
-                }
 
-                let intersections = 0;
 
-                // Check intersections with other edges
-                allEdges.forEach(edge => {
-                  if (edge !== edgeStart && edge !== edgeEnd && doEdgesIntersect(edge, edgeStart, edgeEnd)) {
-                    intersections++;
-                  }
-                });
 
-                // Evenodd rule: if the number of intersections is odd, the area is flooded
-                return intersections % 2 === 1;
-              }
-
-              /**
-               * Checks the intersection of two segments.
-               *
-               * @param {Object} edge - Edge for verification.
-               * @param {Object} edgeStart - The starting point of the current edge.
-               * @param {Object} edgeEnd - The end point of the current edge.
-               * @returns {boolean} - True if the segments intersect.
-               */
-              function doEdgesIntersect(edge, edgeStart, edgeEnd) {
-                // Determine the coordinates of the segments
-                const x1 = edgeStart.x;
-                const y1 = edgeStart.y;
-                const x2 = edgeEnd.x;
-                const y2 = edgeEnd.y;
-                const x3 = edge.x;
-                const y3 = edge.y;
-                const x4 = edge.x + edge.width;
-                const y4 = edge.y + edge.height;
-
-                // We use the axial intersection test
-                const o1 = orientation(x1, y1, x2, y2, x3, y3);
-                const o2 = orientation(x1, y1, x2, y2, x4, y4);
-                const o3 = orientation(x3, y3, x4, y4, x1, y1);
-                const o4 = orientation(x3, y3, x4, y4, x2, y2);
-
-                // Crossing check
-                if (o1 !== o2 && o3 !== o4) {
-                  return true;
-                }
-
-                return false;
-              }
-
-              /**
-               * Defines the orientation of the three points (rotation direction).
-               *
-               * @param {number} x1 - The x coordinate of the first point.
-               * @param {number} y1 - The y coordinate of the first point.
-               * @param {number} x2 - The x coordinate of the second point.
-               * @param {number} y2 - The y coordinate of the second point.
-               * @param {number} x3 - The x coordinate of the third point.
-               * @param {number} y3 - The y coordinate of the third point.
-               * @returns {number} - 0: collinear, 1: clockwise, 2: counterclockwise.
-               */
-              function orientation(x1, y1, x2, y2, x3, y3) {
-                const val = (y2 - y1) * (x3 - x2) - (x2 - x1) * (y3 - y2);
-                if (val === 0) return 0; // collinear
-                return (val > 0) ? 1 : 2; // clockwise or counterclockwise
-              }
 
               let vectorType = current['vectorType'];
               let vectors = vectorType == 'rectangle' ? rectangles : edges;
@@ -1626,7 +1359,7 @@ export function init({
                   ...(textMatrixChanged ? [textMatrix[4], textMatrix[5]] : normLeadArgs)
                 ]
               });
-            } else if (fn === OPS.moveText) {//BUG:|| pdfjs.OPS.setLeadingMoveText == fn
+            } else if (fn === OPS.moveText) {//BUG:|| OPS.setLeadingMoveText == fn
               var normMoveArgs = normalizeNumericArgs(args);
               let textMatrixChanged = textMatrix.toString() != _defaultTransformMatrix.toString();
               if (textMatrixChanged) {//BUGFIX?
@@ -3168,7 +2901,11 @@ export function init({
                 if ((relatedTextContentItem && !similarToRelated && !reachedEnd) || !newItem) {
                   if (newItem) {
                     //removeByIndexes(tableContentItems, [newItemIndex]);
-                    tableContentItemsCache[relatedTextContentId] = [...(tableContentItemsCache[relatedTextContentId] || []), newItem];
+                    tableContentItemsCache[relatedTextContentId] = [
+                      ...(tableContentItemsCache[relatedTextContentId] || []),
+                      newItem
+                    ];
+                    tableContentItemsCacheSource[relatedTextContentId] = relatedTextContentItem;
                     lastActiveCacheKey = relatedTextContentId;
                   }
                 } else {
@@ -5760,10 +5497,7 @@ export function init({
             function isHeaderIndicator(str) {
               str = str?.trim() || '';
 
-              let headerIndicatorWords: { [key: string]: Array<string> } = {
-                eng: ['name', 'surname', 'last name', 'first name', 'full name', 'user name', 'age', 'gender', 'sex', 'relationship', 'nationality', 'status', 'time', 'timeframe', 'period', 'duration', 'dilution', 'viscosity', 'resistance', 'density', 'destination', 'term', 'deadline', 'release', 'released', 'receive', 'received', 'effective', 'date', 'dates', 'start date', 'end date', 'birth day', 'date of birth', 'dob', 'description', 'title', 'label', 'subject', 'interest', 'experience', 'note', 'notes', 'comment', 'comments', 'header', 'column', 'col', 'area', 'country', 'city', 'town', 'zip', 'zip code', 'postal code', 'location', 'region', 'address', 'address line', 'street address', 'mail', 'e-mail', 'email', 'email address', 'phone', 'phone number', 'mobile', 'tel', 'telephone', 'contact', 'contacts', 'site', 'website', 'web', 'url', 'uri', 'path', 'parent', 'parents', 'operation', 'source', 'education', 'position', 'occupation', 'role', 'team', 'designation', 'department', 'volume', 'sold', 'unsold', 'average', 'span', 'currency', 'cost', 'price', 'unit price', 'price per unit', 'offer', 'order', 'budget', 'total', 'sub total', 'total price', 'discount', 'donation', 'quality', 'quantity', 'amount', 'salary', 'revenue', 'color', 'colour', 'speed', 'distance', 'valuation', 'value', 'size', 'width', 'height', 'length', 'weight', 'depth', 'population', 'range', 'queue', 'index', 'id', '#', '№', 'no', 'number', 'hash', 'year', 'month', 'day', 'height', 'weight', 'length', 'model', 'category', 'ticker', 'employee', 'artist', 'author', 'director', 'owner', 'genre', 'commodity', 'product', 'item', 'freight', 'feature', 'plan', 'task', 'issue', 'group', 'company', 'sector', 'division', 'district', 'customer', 'vendor', 'brand', 'salesman', 'assignee', 'requester', 'contributor', 'office', 'rate', 'balance', 'rating', 'rank', 'fee', 'score', 'grade', 'type', 'class', 'count', 'runs', 'progress', 'points', 'coins', 'expenses', 'priority', 'trend', 'engagement', 'percentage', 'profit', 'locale', 'language', 'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sun', 'mon', 'tues', 'wed', 'thur', 'fri', 'sat', 'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'],
-                zho: ['稀釋倍數'],
-              };
+              let headerIndicatorWords: { [key: string]: Array<string> } = _headerIndicatorWords;
               let headerIndicatorWordsArray = Object.keys(headerIndicatorWords).reduce((prev, cur) => {
                 return [...prev, ...headerIndicatorWords[cur]];
               }, []);
@@ -7251,6 +6985,169 @@ export function init({
             return group;
           }
 
+          // Rows that end with a run of filler characters ("........") are followed by
+          // a virtual row boundary. The boundary spans from the label to the last value
+          // that stands on the same baseline.
+          // Rows with a run of filler characters ("........") are separate rows.
+          // A virtual boundary is placed:
+          //  1. below every line that ends with a leader followed by data;
+          //  2. between neighbouring data lines (label + values) of one run of lines,
+          //     if that run contains at least one leader line. This keeps lines that
+          //     are too long to carry dots ("...and sought advice/treatment")
+          //     separate from the dotted lines around them.
+          function applyLeaderRowBoundaries(group: any): any {
+            if (!group?.rows?.length || !group?.coordinates?.length) {
+              return group;
+            }
+
+            const LEADER_RUN = new RegExp(`(${LEADER_CHARS})(?:\\s?\\1){4,}`, 'u');
+            const LEADER_THEN_CONTENT = new RegExp(
+              `(${LEADER_CHARS})(?:\\s?\\1){4,}\\s*[\\p{L}\\p{N}]`,
+              'u'
+            );
+
+            const textBlocks = group.coordinates.filter(
+              (block: any) =>
+                block?.str?.trim() &&
+                [block.x, block.y, block.width, block.height].every(Number.isFinite)
+            );
+            if (!textBlocks.some((block: any) => LEADER_RUN.test(block.str))) {
+              return group;
+            }
+
+            // Footnote marks (superscripts) belong to their host line and
+            // must not form lines of their own.
+            const modalHeight = +findMod(textBlocks.map((block: any) => block.height)) || 0;
+            const mainBlocks = textBlocks.filter(
+              (block: any) => !(modalHeight > 0 && block.height < modalHeight * 0.75)
+            );
+
+            // 1. Visual lines, top to bottom.
+            const lines: any[] = [];
+            [...mainBlocks]
+              .sort((a, b) => b.y - a.y)
+              .forEach(block => {
+                const last = lines[lines.length - 1];
+                if (last && Math.abs(last.baseline - block.y) <= Math.max(block.height * 0.6, 1.5)) {
+                  last.blocks.push(block);
+                } else {
+                  lines.push({ baseline: block.y, blocks: [block] });
+                }
+              });
+
+            lines.forEach(line => {
+              const blocks = line.blocks;
+              line.top = Math.max(...blocks.map((block: any) => block.y + block.height));
+              line.bottom = Math.min(...blocks.map((block: any) => block.y));
+              line.x1 = Math.min(...blocks.map((block: any) => block.x));
+              line.x2 = Math.max(...blocks.map((block: any) => block.x + block.width));
+              line.height = Math.max(...blocks.map((block: any) => block.height));
+
+              // The line ends a row if a leader is followed by data.
+              line.endsWithLeader = blocks.some((block: any) => {
+                if (!LEADER_RUN.test(block.str)) {
+                  return false;
+                }
+                const gap = Math.max(block.height * 0.5, 2);
+                return (
+                  LEADER_THEN_CONTENT.test(block.str) ||
+                  blocks.some((other: any) => other !== block && other.x >= block.x + block.width - gap)
+                );
+              });
+              line.isData = blocks.length >= 2 || line.endsWithLeader;
+            });
+
+            // 2. Runs of consecutive data lines; a run matters only if it holds a leader line.
+            const chainHasLeader: boolean[] = [];
+            let chainId = -1;
+            lines.forEach((line, index) => {
+              const previous = lines[index - 1];
+              const gap = previous ? previous.bottom - line.top : Infinity;
+              const continues =
+                !!previous &&
+                previous.isData &&
+                line.isData &&
+                gap <= Math.max(previous.height, line.height) * 2;
+
+              if (!continues) {
+                chainId++;
+                chainHasLeader[chainId] = false;
+              }
+              line.chain = chainId;
+              if (line.endsWithLeader) {
+                chainHasLeader[chainId] = true;
+              }
+            });
+
+            // 3. Boundaries between neighbouring lines.
+            const rows: number[] = [...group.rows].sort((a, b) => a - b);
+            const boundaries = new Map<string, { y: number; x1: number; x2: number }>();
+            const synthesized: number[] = [];
+
+            for (let index = 0; index < lines.length - 1; index++) {
+              const upper = lines[index];
+              const lower = lines[index + 1];
+
+              const splitsAfterLeader = upper.endsWithLeader;
+              const splitsDataLines =
+                upper.isData &&
+                lower.isData &&
+                upper.chain === lower.chain &&
+                chainHasLeader[upper.chain];
+              if (!splitsAfterLeader && !splitsDataLines) {
+                continue;
+              }
+
+              // Existing row boundaries between the two lines.
+              const slack = upper.height * 0.25;
+              let separators = rows.filter(y => y < upper.bottom - 0.01 && y > lower.top - slack);
+
+              if (!separators.length) {
+                if (upper.bottom - lower.top < 1) {
+                  continue;
+                }
+                const y = (upper.bottom + lower.top) / 2;
+                synthesized.push(y);
+                separators = [y];
+              }
+
+              const x1 = Math.min(upper.x1, lower.x1);
+              const x2 = Math.max(upper.x2, lower.x2);
+              separators.forEach(y => boundaries.set(y.toFixed(2), { y, x1, x2 }));
+            }
+
+            const result = [...boundaries.values()];
+            if (!result.length) {
+              return group;
+            }
+
+            if (synthesized.length) {
+              group.rows = [...new Set([...group.rows, ...synthesized])].sort((a, b) => a - b);
+              group.synthesizedRows = [...(group.synthesizedRows || []), ...synthesized];
+              group.y = [
+                Math.min(...(group.y || []), ...synthesized),
+                Math.max(...(group.y || []), ...synthesized)
+              ];
+              group.headerRows = determineHeaderRows({
+                coordinates: group.coordinates || [],
+                edges: group.edges || [],
+                rectangles: group.rectangles || [],
+                rows: [...group.rows],
+                cols: group.cols || [],
+                lineMaxWidth,
+                separatorRows: group.synthesizedRows
+              });
+            }
+
+            group.leaderBoundaries = result;
+            console.error('[LEADER ROWS]', {
+              lines: lines.length,
+              boundaries: result.length,
+              synthesized: synthesized.length
+            });
+            return group;
+          }
+
           //Function for defining tables
           function defineGroups(options) {
             let { item, type, axis, tolerance, groups, lineMaxWidth, downcheck } = options;
@@ -7443,74 +7340,9 @@ export function init({
             return groups;
           }
 
-          function calculateEdgeToleranceValue(edges, lineMaxWidth) {
-            let horizontalEdges = (edges || []).filter(e =>
-              isVisibleVector(e) && e.height < lineMaxWidth && e.width > lineMaxWidth
-            );
-            if (horizontalEdges.length < 2) return null;
 
-            let ys = uniqueArr(horizontalEdges.map(e => e.y)).sort((a, b) => a - b);
-            let gaps = ys.slice(1).map((y, i) => y - ys[i]).filter(g => g > 0);
-            if (!gaps.length) return null;
 
-            return +findMod(gaps) || findAverage(gaps);
-          }
 
-          function calculateToleranceValue(coordinates) {
-            //Find the modulus of text height
-            let modeTextHeight = findMod(coordinates.map(item => item.height));
-
-            // The baseline of a single visual line may vary by tenths of a point
-            // (Td ty = ±0.014 em); this must be a SINGLE line key. Otherwise, the even/odd
-            // processing described below will measure the jitter instead of the spacing between lines.
-            const baselineJitter = Math.min(0.5, modeTextHeight * 0.1);
-            const sortedBaselines = [...new Set<number>(coordinates.map(item => item.y))].sort((a, b) => a - b);
-            const baselineKeys = new Map<number, number>();
-            let clusterStart = -Infinity;
-
-            for (const baseline of sortedBaselines) {
-              if (baseline - clusterStart > baselineJitter) {
-                clusterStart = baseline;
-              }
-              baselineKeys.set(baseline, clusterStart);
-            }
-
-            //Create an object with y-coordinates grouping
-            let obj = coordinates.reduce((prev, cur) => {
-              const key = baselineKeys.get(cur.y);
-              prev[key] = [...(prev[key] || []), cur.y + cur.height];
-              return prev;
-            }, {});
-
-            //Sort object keys
-            let sortedKeys = Object.keys(obj).sort((a: any, b: any) => a - b);
-            //Create a data array by alternating keys and values
-            let data = sortedKeys.reduce((prev, key: any, index) => {
-              let value = +findMod(obj[key]);
-              key = +key;
-              if (index % 2) {
-                prev.push(key);
-              } else {
-                prev.push(value);
-              }
-              return prev;
-            }, [])
-              .sort((a, b) => a - b);
-
-            //Calculate distances between elements of a data array and filter them out
-            let distances = data.slice(1).reduce((prev, cur, index) => {
-              let distance = cur - data[index];
-              if (distance < modeTextHeight * 2 && distance > modeTextHeight / 2) {
-                prev.push(distance);
-              }
-              return prev;
-            }, []);
-
-            //Calculate the average of the distances and divide by 2
-            let averageDistance = (findAverage(distances) + (+findMod(distances))) / 2;//old: findAverage(distances)/2 
-
-            return averageDistance;
-          }
 
           // Function for defining cell boundaries
           function getGroups() {
@@ -7582,11 +7414,13 @@ export function init({
               ) === index;
             });
 
+            tableGroups = tableGroups.map(group => constrainGroupToRuledFrame(group));
             tableGroups = tableGroups.map(group => extendGroupTopBorder(group, pageGroups[0], lineMaxWidth));
             tableGroups = tableGroups.map(group => extendGroupBottomRow(group, pageGroups[0], lineMaxWidth));
             tableGroups = tableGroups.map(group => trimUnsupportedTrailingRows(group, lineMaxWidth));//!BUG fpdf_example-1.pdf (the last row of the table is missing)
             tableGroups = tableGroups.map(group => refineTextOnlyTopRows(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => rebuildUnseparatedRows(group, lineMaxWidth));
+            tableGroups = tableGroups.map(group => applyLeaderRowBoundaries(group));
 
             // The order of the tables in the result should correspond to the reading order (from top to bottom on the page), not the order in which they were randomly arranged by clustering.
             tableGroups = [...tableGroups].sort((a, b) => {
@@ -9262,74 +9096,7 @@ export function init({
             return { tableGroups, pageGroups };
           }
 
-          //Function for combining close coordinates
-          function mergeCoordinates(coordinates, fixedCoordinates, options) {
-            const { threshold = 2.5, averageMerge = false, specialMode = false, preferLarger = false } = options;
 
-            if (!coordinates || coordinates?.length === 0) return [];
-
-            const mergedCoordinates = [];
-            let i = 0;
-
-            while (i < coordinates.length) {
-              let currentCoordinate = coordinates[i];
-              let isFixed = fixedCoordinates.includes(currentCoordinate);
-              let tempCoords = [currentCoordinate];
-
-              let j = i + 1;
-              while (j < coordinates.length && Math.abs(coordinates[j] - currentCoordinate) < threshold) {
-                if (fixedCoordinates.includes(coordinates[j])) {
-                  tempCoords.push(coordinates[j]);
-                  break;
-                }
-                if (specialMode && !isFixed && !fixedCoordinates.includes(coordinates[j])) {
-                  j++;
-                  continue;
-                }
-                tempCoords.push(coordinates[j]);
-                j++;
-              }
-
-              if (tempCoords.length > 1) {
-                if (tempCoords.some(coord => fixedCoordinates.includes(coord))) {
-                  //If there is a fixed coordinate, it has priority
-                  mergedCoordinates.push(...tempCoords.filter(coord => fixedCoordinates.includes(coord)));
-                } else {
-                  if (averageMerge) {
-                    const average = tempCoords.reduce((sum, coord) => sum + coord, 0) / tempCoords.length;
-                    mergedCoordinates.push(average);
-                  } else {
-                    const maxCoordinate = Math.max(...tempCoords);
-                    const minCoordinate = Math.min(...tempCoords);
-                    mergedCoordinates.push(preferLarger ? maxCoordinate : minCoordinate);
-                  }
-                }
-              } else {
-                mergedCoordinates.push(currentCoordinate);
-              }
-
-              i = j;
-            }
-
-            return uniqueArr(mergedCoordinates);
-          }
-
-          function getAverageBorderSize(edges, lineMaxWidth) {
-            let defaultBorderSize = 0.57;
-            let widths = [];
-
-            for (let index = 0; index < edges.length; index++) {
-              let item = edges[index];
-              if (item.height < lineMaxWidth) {
-                widths.push(item.height);
-              }
-              if (item.width < lineMaxWidth) {
-                widths.push(item.width);
-              }
-            }
-
-            return +findMod(widths) || defaultBorderSize;
-          }
 
           /**
  * Horizontal extent of a table that is closed by drawn rules: the outermost
@@ -9366,12 +9133,237 @@ export function init({
             return hasVerticalRuleAt(left) && hasVerticalRuleAt(right) ? { left, right } : null;
           }
 
+          function constrainGroupToRuledFrame(group: any): any {
+            if (!group?.edges?.length || !group?.rows?.length) {
+              return group;
+            }
+
+            // Reuse previously detected bounds if the group passes through
+            // another stage of table-group processing.
+            let frameBounds = group.ruledFrameBounds;
+
+            if (!frameBounds) {
+              const frame = getRuledBoxExtent(group, lineMaxWidth);
+
+              if (!frame) {
+                return group;
+              }
+
+              const frameWidth = frame.right - frame.left;
+
+              if (!(frameWidth > 0)) {
+                return group;
+              }
+
+              const borderSize = group.borderSize || 0.57;
+              const lineTolerance = Math.max(
+                1.5,
+                Math.min(borderSize * 3, 3)
+              );
+
+              const horizontalRules = group.edges.filter(
+                (edge: any) =>
+                  isVisibleVector(edge) &&
+                  !edge._isFakeLine &&
+                  edge.height < lineMaxWidth &&
+                  edge.width > lineMaxWidth
+              );
+
+              const clusters: Array<{
+                axisY: number;
+                rowCoordinates: number[];
+                intervals: Array<[number, number]>;
+              }> = [];
+
+              for (const edge of horizontalRules) {
+                const axisY = edge.y + edge.height / 2;
+                const start = Math.max(frame.left, edge.x);
+                const end = Math.min(
+                  frame.right,
+                  edge.x + edge.width
+                );
+
+                if (!(end > start)) {
+                  continue;
+                }
+
+                let cluster = clusters.find(
+                  candidate =>
+                    Math.abs(candidate.axisY - axisY) <= lineTolerance
+                );
+
+                if (!cluster) {
+                  cluster = {
+                    axisY,
+                    rowCoordinates: [],
+                    intervals: []
+                  };
+
+                  clusters.push(cluster);
+                }
+
+                cluster.rowCoordinates.push(edge.y);
+                cluster.intervals.push([start, end]);
+              }
+
+              function getCoveredWidth(
+                intervals: Array<[number, number]>
+              ): number {
+                const sorted = [...intervals].sort(
+                  (a, b) => a[0] - b[0]
+                );
+
+                if (!sorted.length) {
+                  return 0;
+                }
+
+                let covered = 0;
+                let [start, end] = sorted[0];
+
+                for (let index = 1; index < sorted.length; index++) {
+                  const [nextStart, nextEnd] = sorted[index];
+
+                  if (nextStart <= end) {
+                    end = Math.max(end, nextEnd);
+                  } else {
+                    covered += end - start;
+                    start = nextStart;
+                    end = nextEnd;
+                  }
+                }
+
+                return covered + end - start;
+              }
+
+              const frameRules = clusters.filter(
+                cluster =>
+                  getCoveredWidth(cluster.intervals) >=
+                  frameWidth * 0.6
+              );
+
+              // A closed frame must provide evidence for both its upper
+              // and lower boundaries.
+              if (frameRules.length < 2) {
+                return group;
+              }
+
+              function getMedian(values: number[]): number {
+                const sorted = [...values].sort((a, b) => a - b);
+                return sorted[Math.floor(sorted.length / 2)];
+              }
+
+              const ruleRows = frameRules.map(cluster =>
+                getMedian(cluster.rowCoordinates)
+              );
+
+              const top = Math.max(...ruleRows);
+              const bottom = Math.min(...ruleRows);
+
+              if (!(top > bottom)) {
+                return group;
+              }
+
+              frameBounds = {
+                left: frame.left,
+                right: frame.right,
+                top,
+                bottom,
+                tolerance: lineTolerance
+              };
+
+              group.ruledFrameBounds = frameBounds;
+            }
+
+            const { left, right, top, bottom, tolerance } = frameBounds;
+
+            const textBlocks = (group.coordinates || []).filter(
+              (block: any) => block?.str?.trim() && Number.isFinite(block.y)
+            );
+
+            // Text outside the frame is a caption only if every text band there holds
+            // a single block. A band with several blocks is a table row (e.g. a header
+            // drawn above the first rule) and must stay in the grid.
+            const hasOnlyCaptions = (blocks: any[]): boolean => {
+              const bands: any[][] = [];
+              [...blocks]
+                .sort((a, b) => a.y - b.y)
+                .forEach(block => {
+                  const band = bands.find(
+                    candidate =>
+                      Math.abs(candidate[0].y - block.y) <= Math.max((block.height || 0) * 0.5, 1)
+                  );
+                  if (band) {
+                    band.push(block);
+                  } else {
+                    bands.push([block]);
+                  }
+                });
+              return bands.every(band => band.length === 1);
+            };
+
+            const clipTop = hasOnlyCaptions(textBlocks.filter((block: any) => block.y >= top + tolerance));
+            const clipBottom = hasOnlyCaptions(
+              textBlocks.filter((block: any) => block.y + (block.height || 0) <= bottom - tolerance)
+            );
+            const upperLimit = clipTop ? top + tolerance : Infinity;
+            const lowerLimit = clipBottom ? bottom - tolerance : -Infinity;
+            const isInside = (value: number): boolean =>
+              Number.isFinite(value) && value >= lowerLimit && value <= upperLimit;
+
+            // Only derived grid geometry is touched. group.coordinates stays intact:
+            // text outside the grid is simply not assigned to any cell later on.
+            const constrainRows = (values: number[] = [], ensureBounds = false): number[] => {
+              const kept = values.filter(isInside).map(value => {
+                if (clipTop && Math.abs(value - top) <= tolerance) return top;
+                if (clipBottom && Math.abs(value - bottom) <= tolerance) return bottom;
+                return value;
+              });
+              if (ensureBounds) {
+                if (clipTop) kept.push(top);
+                if (clipBottom) kept.push(bottom);
+              }
+              return [...new Set(kept)].sort((a, b) => a - b);
+            };
+
+            group.rows = constrainRows(group.rows, true);
+            group.assuredRows = constrainRows(group.assuredRows);
+            group.edgesRows = constrainRows(group.edgesRows);
+            group.rectanglesRows = constrainRows(group.rectanglesRows);
+            group.synthesizedRows = constrainRows(group.synthesizedRows);
+            group.x = [left, right];
+            group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+
+            const originalHeaderRows = group.headerRows || {};
+            const keptHeaderRows = Object.fromEntries(
+              Object.entries(originalHeaderRows).filter(([key]) =>
+                key.split('-').map(Number).every(isInside)
+              )
+            );
+            const lostAllHeaders =
+              Object.keys(originalHeaderRows).length > 0 && Object.keys(keptHeaderRows).length === 0;
+
+            group.headerRows = lostAllHeaders
+              ? determineHeaderRows({
+                coordinates: group.coordinates || [],
+                edges: group.edges || [],
+                rectangles: group.rectangles || [],
+                rows: [...group.rows],
+                cols: group.cols || [],
+                lineMaxWidth,
+                separatorRows: group.synthesizedRows
+              })
+              : keptHeaderRows;
+
+            return group;
+          }
+
           //Function for generating virtual edges
           function generateVirtualEdges(options) {
             let {
               cols, rows, coordinates, assuredEdges, lineMaxWidth,
               paddingSize, headerRows,
-              protectedRows = []
+              protectedRows = [],
+              leaderBoundaries = []
             } = options;
             cols = [...cols].sort((a, b) => a - b);
             rows = [...rows].sort((a, b) => a - b);
@@ -9516,11 +9508,24 @@ export function init({
             // inside generateVirtualEdges — immediately after removePhantomBoundaryRows(rows)
             // intersectingElements depends ONLY on the textBlock, not on the position in the grid.
             // We calculate it once per coordinate instead of recalculating in each grid cell.
-            let verticalIntersectorsByCoordinate = coordinates.map((textBlock) => {
-              return verticalAssuredEdges?.filter((vector) => {
-                let res: any = checkRectangleRanges(vector, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true });
-                return res.isContained || !res.biggestArgument && res.isIntersecting;
-              }) || [];
+            // Vertical lines that cross the row of a text block. Sides of filled rectangles
+            // (fake lines) are not drawn lines: counting them made every row of a table with
+            // visible cell fills look "crossed by 3+ lines" and all text-inferred column
+            // boundaries were deleted.
+            let verticalIntersectorsByCoordinate = coordinates.map(textBlock => {
+              return (
+                verticalAssuredEdges?.filter(vector => {
+                  if (vector['_isFakeLine']) {
+                    return false;
+                  }
+                  let res: any = checkRectangleRanges(
+                    vector,
+                    { y: [textBlock.y, textBlock.y + textBlock.height] },
+                    { axis: 'y', strict: true, strictIntersecting: true }
+                  );
+                  return res.isContained || (!res.biggestArgument && res.isIntersecting);
+                }) || []
+              );
             });
             let horizontalIntersectorsByCoordinate = coordinates.map((textBlock) => {
               return horizontalAssuredEdges?.filter((vector) => {
@@ -9826,16 +9831,32 @@ export function init({
 
               // 1. Visible text runs across the separator.
               //    block.width already excludes trailing spaces.
-              const crossesBoundary = row.blocks.some(block => {
+              const getVisibleRight = (block: any): number => {
                 const left = getBlockLeft(block);
-                const right = left + Number(block.width);
+                const rights = (block.chars || [])
+                  .filter(
+                    (glyph: any) =>
+                      glyph &&
+                      typeof glyph === 'object' &&
+                      typeof glyph.unicode === 'string' &&
+                      glyph.unicode.trim() &&
+                      Number.isFinite(glyph.x) &&
+                      Number.isFinite(glyph.charWidth)
+                  )
+                  .map((glyph: any) => glyph.x + glyph.charWidth);
+                return rights.length ? Math.max(...rights) : left + Number(block.width);
+              };
 
-                return Number.isFinite(left)
-                  && Number.isFinite(right)
-                  && left < x - MERGE_CROSS_TOLERANCE
-                  && right > x + MERGE_CROSS_TOLERANCE;
+              const crossesBoundary = row.blocks.some((block: any) => {
+                const left = getBlockLeft(block);
+                const right = getVisibleRight(block);
+                return (
+                  Number.isFinite(left) &&
+                  Number.isFinite(right) &&
+                  left < x - MERGE_CROSS_TOLERANCE &&
+                  right > x + MERGE_CROSS_TOLERANCE
+                );
               });
-
               if (crossesBoundary) {
                 return 'text-crosses-boundary';
               }
@@ -9955,6 +9976,7 @@ export function init({
             let modalRowHeightForSuppression = +findMod(rowGapsForSuppression) || findAverage(rowGapsForSuppression) || 20;
             let yProximityTolerance = modalRowHeightForSuppression * 1.5;
 
+            let leaderProtectedCount = 0;
             let horizontalEdges = [];
             for (let i = 0; i < rows.length; i++) {
               for (let j = 0; j < cols.length - 1; j++) {
@@ -9981,9 +10003,21 @@ export function init({
                   }
                 }
 
-                let isProtectedEdge = isOuterBoundary
-                  || isSynthesizedBoundary
-                  || isEdgeBackedByRealLine(edge, relatedAssuredEdge, true);
+                const isLeaderBoundary = leaderBoundaries.some(boundary => {
+                  if (Math.abs(boundary.y - rows[i]) >= 0.01) {
+                    return false;
+                  }
+                  const overlap = Math.min(edge.x + edge.width, boundary.x2) - Math.max(edge.x, boundary.x1);
+                  return overlap >= edge.width * 0.5;
+                });
+                if (isLeaderBoundary) {
+                  leaderProtectedCount++;
+                }
+                let isProtectedEdge =
+                  isOuterBoundary ||
+                  isSynthesizedBoundary ||
+                  isLeaderBoundary ||
+                  isEdgeBackedByRealLine(edge, relatedAssuredEdge, true);
 
                 for (let k = 0; k < coordinates.length && !isProtectedEdge; k++) {
                   let textBlock = coordinates[k];
@@ -10031,7 +10065,12 @@ export function init({
             }
 
             let edges = [...verticalEdges, ...horizontalEdges];
-
+            console.error('[LEADER PROTECTED]', {
+              boundaries: leaderBoundaries.length,
+              boundaryYs: leaderBoundaries.slice(0, 6).map(boundary => +boundary.y.toFixed(2)),
+              protectedEdges: leaderProtectedCount,
+              rowsSample: rows.slice(0, 6).map(y => +y.toFixed(2))
+            });
             return edges;
           }
 
@@ -10401,6 +10440,7 @@ export function init({
               paddingSize: tableGroup.paddingSize,
               headerRows: tableGroup.headerRows,
               protectedRows: tableGroup.synthesizedRows || [],
+              leaderBoundaries: tableGroup.leaderBoundaries || []
               //threshold
             });
 
@@ -11126,6 +11166,8 @@ export function init({
                 const rowSpan = span.rowEnd - span.rowStart;
                 const colSpan = span.colEnd - span.colStart;
 
+
+
                 if (
                   rowSpan <= 1 &&
                   colSpan <= 1
@@ -11160,15 +11202,22 @@ export function init({
                   continue;
                 }
 
-                const anchor =
-                  occupiedCells[0];
+                const anchor = occupiedCells[0];
 
-                if (
-                  anchor.row !== span.rowStart ||
-                  anchor.col !== span.colStart
-                ) {
+                // if (
+                //   anchor.row !== span.rowStart ||
+                //   anchor.col !== span.colStart
+                // ) {
+                //   continue;
+                // }
+
+                // The label may sit anywhere inside the filled cell (e.g. in the lower row of a
+                // two-row header cell); it is still one merged cell. Tall fills are ignored
+                // so that a background rectangle cannot swallow a whole column.
+                if (rowSpan > 3) {
                   continue;
                 }
+
 
                 //Check the actual internal horizontal boundaries.
                 let hasInternalHorizontalEdge = false;
@@ -11248,55 +11297,89 @@ export function init({
               horizons: any[];
               coordinates: any[];
             }) {
-              let { merges, mergeAlias, verticles, coordinates } = options;
-              let sortedV = [...verticles].sort((a, b) => a.x - b.x);
-              let colBounds = (colIndex: number) => [sortedV[colIndex]?.x, sortedV[colIndex + 1]?.x];
+              const { merges, mergeAlias, verticles, coordinates } = options;
+              const sortedV = [...verticles].sort((a, b) => a.x - b.x);
+              const colBounds = (colIndex: number) => [sortedV[colIndex]?.x, sortedV[colIndex + 1]?.x];
+              const ySorted = [...options.horizons].sort((a, b) => b.y - a.y);
+
+              // Visible horizontal extent of a text block: from its first to the end of its last
+              // visible glyph. block.width may include trailing word spacing, which makes a value
+              // like "7.0" look as if it stretches into the neighbouring column.
+              const getVisibleExtent = (block: any): { left: number; right: number } => {
+                const glyphs = (block.chars || []).filter(
+                  (glyph: any) =>
+                    glyph &&
+                    typeof glyph === 'object' &&
+                    typeof glyph.unicode === 'string' &&
+                    glyph.unicode.trim() &&
+                    Number.isFinite(glyph.x) &&
+                    Number.isFinite(glyph.charWidth)
+                );
+                if (!glyphs.length) {
+                  return { left: block.x, right: block.x + block.width };
+                }
+                return {
+                  left: Math.min(...glyphs.map((glyph: any) => glyph.x)),
+                  right: Math.max(...glyphs.map((glyph: any) => glyph.x + glyph.charWidth))
+                };
+              };
 
               Object.keys(merges).forEach(rootKey => {
-                let merge = merges[rootKey];
-                if (merge.width <= 1) return; // not colspan — don’t touch
+                const merge = merges[rootKey];
+                if (merge.width <= 1) return;
 
-                let colFrom = merge.col;
-                let colTo = merge.col + merge.width;
-                let xFrom = sortedV[colFrom]?.x;
-                let xTo = sortedV[colTo]?.x;
+                const colFrom = merge.col;
+                const colTo = merge.col + merge.width;
+                const xFrom = sortedV[colFrom]?.x;
+                const xTo = sortedV[colTo]?.x;
                 if (!Number.isFinite(xFrom) || !Number.isFinite(xTo)) return;
 
-                let rowFrom = merge.row;
-                let rowTo = merge.row + merge.height;
-                let ySorted = [...options.horizons].sort((a, b) => b.y - a.y);
-                let yTop = ySorted[rowFrom]?.y;
-                let yBottom = ySorted[rowTo]?.y;
+                const rowFrom = merge.row;
+                const rowTo = merge.row + merge.height;
+                const yTop = ySorted[rowFrom]?.y;
+                const yBottom = ySorted[rowTo]?.y;
                 if (!Number.isFinite(yTop) || !Number.isFinite(yBottom)) return;
 
-                let itemsInSpan = (coordinates || []).filter(c => {
-                  if (!c?.str?.trim()) return false;
-                  let cx1 = c.x, cx2 = c.x + c.width;
-                  return cx1 >= xFrom - 1 && cx2 <= xTo + 1 && c.y <= yTop + 1 && c.y > yBottom - 1;
+                const itemsInSpan = (coordinates || []).filter(item => {
+                  if (!item?.str?.trim()) return false;
+                  const { left, right } = getVisibleExtent(item);
+                  return (
+                    left >= xFrom - 1 &&
+                    right <= xTo + 1 &&
+                    item.y <= yTop + 1 &&
+                    item.y > yBottom - 1
+                  );
                 });
-                if (itemsInSpan.length < 2) return; // There’s nothing to divide.
+                if (itemsInSpan.length < 2) return;
 
-                let subColumnsUsed = new Set<number>();
+                const subColumnsUsed = new Set<number>();
                 let anyItemSpansMultipleColumns = false;
+
                 itemsInSpan.forEach(item => {
-                  let itemLeft = item.x;
-                  let itemRight = item.x + item.width;
-                  let touchedCols: number[] = [];
+                  const { left: itemLeft, right: itemRight } = getVisibleExtent(item);
+                  const itemWidth = itemRight - itemLeft;
+                  const touchedCols: number[] = [];
+
                   for (let c = colFrom; c < colTo; c++) {
-                    let [cxFrom, cxTo] = colBounds(c);
-                    let overlap = Math.min(itemRight, cxTo) - Math.max(itemLeft, cxFrom);
-                    if (overlap > Math.min(item.width, cxTo - cxFrom) * 0.5) touchedCols.push(c);
+                    const [cxFrom, cxTo] = colBounds(c);
+                    const overlap = Math.min(itemRight, cxTo) - Math.max(itemLeft, cxFrom);
+                    if (overlap > Math.min(itemWidth, cxTo - cxFrom) * 0.5) {
+                      touchedCols.push(c);
+                    }
                   }
+
                   if (touchedCols.length > 1) anyItemSpansMultipleColumns = true;
                   touchedCols.forEach(c => subColumnsUsed.add(c));
                 });
 
-                // No text block actually crosses the boundary between
-                // columns, and the blocks are in different columns—which means
-                // this is NOT a single merged cell, but simply a missing
-                // separator. We'll break down the `colspan-merge` into separate
-                // `rowspan-only` merges for each column.
                 if (!anyItemSpansMultipleColumns && subColumnsUsed.size > 1) {
+                  console.error('[UNMERGE COLUMNS]', {
+                    root: rootKey,
+                    width: merge.width,
+                    height: merge.height,
+                    columnsUsed: [...subColumnsUsed]
+                  });
+
                   delete merges[rootKey];
                   (merge.arr || []).forEach((cellKey: string) => {
                     if (mergeAlias[cellKey] === rootKey) delete mergeAlias[cellKey];
@@ -11304,13 +11387,17 @@ export function init({
 
                   if (merge.height > 1) {
                     for (let c = colFrom; c < colTo; c++) {
-                      let newRootKey = `${rowFrom}-${c}`;
-                      let arr: string[] = [];
+                      const newRootKey = `${rowFrom}-${c}`;
+                      const arr: string[] = [];
                       for (let r = rowFrom; r < rowTo; r++) arr.push(`${r}-${c}`);
                       merges[newRootKey] = {
-                        row: rowFrom, col: c, arr,
-                        widthArr: [newRootKey], heightArr: arr,
-                        width: 1, height: merge.height,
+                        row: rowFrom,
+                        col: c,
+                        arr,
+                        widthArr: [newRootKey],
+                        heightArr: arr,
+                        width: 1,
+                        height: merge.height
                       };
                       arr.forEach(cellKey => {
                         if (cellKey !== newRootKey) mergeAlias[cellKey] = newRootKey;
@@ -11619,12 +11706,28 @@ export function init({
                 return prev;
               }, {})
 
+
+              // The greedy merge may produce overlapping rectangles (one cell owned by two merges).
+              // Text of such cells ends up in a hidden alias cell, so they are treated as broken too.
+              const cellOwner = new Map<string, string>();
+              const hasOverlappingMerge = Object.keys(merges).some(rootKey =>
+                merges[rootKey].arr.some((cellKey: string) => {
+                  const owner = cellOwner.get(cellKey);
+                  if (owner !== undefined && owner !== rootKey) {
+                    return true;
+                  }
+                  cellOwner.set(cellKey, rootKey);
+                  return false;
+                })
+              );
               // Non-rectangular merges (arr.length != width * height) always result in broken HTML
               // (cells are lost or duplicated). We rebuild them directly from the matrix.
-              const hasBrokenMerge = Object.keys(merges).some((key) => {
-                const merge = merges[key];
-                return merge.arr.length !== merge.width * merge.height;
-              });
+              const hasBrokenMerge =
+                hasOverlappingMerge ||
+                Object.keys(merges).some(key => {
+                  const merge = merges[key];
+                  return merge.arr.length !== merge.width * merge.height;
+                });
 
               if (hasBrokenMerge) {
                 const rebuiltMerges = buildMergesFromMatrix(
@@ -11774,6 +11877,9 @@ export function init({
 
               // ===== DIAGNOSTICS: try-catch with precise location =====
               try {
+                const tableTop = horizons[0].y;
+                const tableBottom = horizons[horizons.length - 1].y;
+                const isInsideTableVertically = (value: number) => value <= tableTop && value > tableBottom;
                 for (const item of coordinates) {
                   if (superscriptBlocks.has(item)) {
                     continue;
@@ -11833,6 +11939,14 @@ export function init({
                   }
 
                   if (col === -1) {
+                    if (isInsideTableVertically(y)) {
+                      console.error('[TEXT NOT PLACED]', {
+                        reason: 'row or column not found',
+                        str: (item?.str || '').slice(0, 40),
+                        x,
+                        y
+                      });
+                    }
                     continue;
                   }
 
@@ -11855,17 +11969,27 @@ export function init({
                     }
                   }
                   if (row === -1) {
+                    if (isInsideTableVertically(y)) {
+                      console.error('[TEXT NOT PLACED]', {
+                        reason: 'row or column not found',
+                        str: (item?.str || '').slice(0, 40),
+                        x,
+                        y
+                      });
+                    }
                     continue;
                   }
 
-                  // Check for merged cells
-                  const mergeKey = `${row}-${col}`;
-                  if (mergeAlias[mergeKey]) {
-                    const aliasMatch = /^(-?\d+)-(-?\d+)$/.exec(mergeAlias[mergeKey]);
-                    const mergedRow = aliasMatch ? Number(aliasMatch[1]) : NaN;
-                    const mergedCol = aliasMatch ? Number(aliasMatch[2]) : NaN;
-                    row = mergedRow;
-                    col = mergedCol;
+                  // Follow alias chains to the visible root cell, so that text is never
+                  // stored in a hidden alias cell.
+                  let aliasCellKey = `${row}-${col}`;
+                  for (let guard = 0; mergeAlias[aliasCellKey] && guard < 32; guard++) {
+                    aliasCellKey = mergeAlias[aliasCellKey];
+                  }
+                  const rootMatch = /^(-?\d+)-(-?\d+)$/.exec(aliasCellKey);
+                  if (rootMatch) {
+                    row = Number(rootMatch[1]);
+                    col = Number(rootMatch[2]);
                   }
 
                   // Protection from going abroad
@@ -11875,11 +11999,23 @@ export function init({
                   }
 
                   // Add text to the table
-                  if (tablePos[row][col] !== null && Math.abs(tablePos[row][col] - y) > 5) {
-                    table.array[row][col]['str'] += "\n";
+                  const cell = table.array[row][col];
+                  const previousY = tablePos[row][col];
+                  if (previousY !== null && Math.abs(previousY - y) > 5) {
+                    cell['str'] += '\n';
+                  } else if (
+                    previousY !== null &&
+                    cell['str'] &&
+                    !/\s$/.test(cell['str']) &&
+                    !/^\s/.test(item?.str || '')
+                  ) {
+                    // two separate blocks on one line in one cell: keep them apart
+                    cell['str'] += ' ';
                   }
                   tablePos[row][col] = y;
-                  table.array[row][col]['str'] += (item?.str || '');
+                  cell['str'] += item?.str || '';
+
+
                   const attachedSuperscripts = superscriptsByHost.get(item);
 
                   if (attachedSuperscripts?.length) {
@@ -12201,6 +12337,19 @@ export function init({
                   ]),
               });
 
+              const COLLAPSE_GUTTER_COLUMNS = true;
+              const modalTextHeight = +findMod(coordinates.map(item => item.height)) || 0;
+              const gutterColumns = new Set<number>();
+              if (COLLAPSE_GUTTER_COLUMNS && modalTextHeight > 0) {
+                for (let c = 1; c < colsCount - 1; c++) {
+                  const width = verticles[c + 1].x - verticles[c].x;
+                  const isEmpty = table.array.every(row => !(row[c]?.str || '').trim());
+                  if (width <= modalTextHeight * 1.2 && isEmpty) {
+                    gutterColumns.add(c);
+                  }
+                }
+              }
+
               // Generate HTML table
               table.html = (() => {
                 try {
@@ -12256,145 +12405,231 @@ export function init({
                   let borderSize = tableGroup?.borderSize || 0.57;
                   let tolerance = Math.max(lineMaxWidth * 2, borderSize * 4, 2);
 
-                  const borderColorCache = {};
+                  const borderAxisTolerance = Math.max(
+                    1.5,
+                    Math.min(borderSize * 3, 2)
+                  );
 
-                  function findColorInPool(idealLine, pool, isHorizontalIdeal, idealLength) {
-                    // Let's summarize the overlaps for each unique color.
-                    let realOverlapMap = {};
-                    let degenerateOverlapMap = {};
-                    let realTotal = 0, degenerateTotal = 0;
 
-                    for (let edge of pool) {
-                      let edgeColor = edge.isLinePath ? edge.strokeColor : (edge.strokeColor || edge.fillColor);
+
+                  const LINE_PATTERN_MIN_COVERAGE = 0.75;
+                  const borderCandidatesCache: Record<string, Array<[string, number]>> = {};
+
+                  // Colours of visible rules lying on an ideal segment, ordered by covered length.
+                  function collectBorderColors(
+                    idealLine: any,
+                    pool: any[],
+                    isHorizontalIdeal: boolean,
+                    idealLength: number
+                  ): Array<[string, number]> {
+                    const overlapByColor: Record<string, number> = {};
+
+                    for (const edge of pool) {
+                      const edgeColor = edge.isLinePath ? edge.strokeColor : edge.strokeColor || edge.fillColor;
                       if (!edgeColor) continue;
 
-                      let isHorizontalEdge = edge.height < lineMaxWidth && edge.width > lineMaxWidth;
-                      let isVerticalEdge = edge.width < lineMaxWidth && edge.height > lineMaxWidth;
+                      const isHorizontalEdge = edge.height < lineMaxWidth && edge.width > lineMaxWidth;
+                      const isVerticalEdge = edge.width < lineMaxWidth && edge.height > lineMaxWidth;
+                      if (isHorizontalIdeal ? !isHorizontalEdge : !isVerticalEdge) continue;
 
-                      if (isHorizontalIdeal && !isHorizontalEdge) continue;
-                      if (!isHorizontalIdeal && !isVerticalEdge) continue;
-
-                      // Proximity along the main axis
-                      let axisMatch = isHorizontalIdeal ? Math.abs(edge.y - idealLine.y1) <= tolerance : Math.abs(edge.x - idealLine.x1) <= tolerance;
+                      const axisMatch = isHorizontalIdeal
+                        ? Math.abs(edge.y - idealLine.y1) <= tolerance
+                        : Math.abs(edge.x - idealLine.x1) <= tolerance;
                       if (!axisMatch) continue;
 
-                      // Overlap in length
-                      let overlapStart, overlapEnd;
-                      if (isHorizontalIdeal) {
-                        overlapStart = Math.max(edge.x, Math.min(idealLine.x1, idealLine.x2));
-                        overlapEnd = Math.min(edge.x + edge.width, Math.max(idealLine.x1, idealLine.x2));
-                      } else {
-                        overlapStart = Math.max(edge.y, Math.min(idealLine.y1, idealLine.y2));
-                        overlapEnd = Math.min(edge.y + edge.height, Math.max(idealLine.y1, idealLine.y2));
-                      }
-                      let overlap = Math.max(0, overlapEnd - overlapStart);
-                      if (overlap <= 0) continue;
+                      const overlap = isHorizontalIdeal
+                        ? Math.min(edge.x + edge.width, Math.max(idealLine.x1, idealLine.x2)) -
+                        Math.max(edge.x, Math.min(idealLine.x1, idealLine.x2))
+                        : Math.min(edge.y + edge.height, Math.max(idealLine.y1, idealLine.y2)) -
+                        Math.max(edge.y, Math.min(idealLine.y1, idealLine.y2));
+                      if (!(overlap > 0)) continue;
 
-                      // A degenerate (0pt) segment is much less reliable evidence
-                      // of an actual boundary than a segment with a real thickness, even if
-                      // it is also filled with color (often a duplicate of the same outline)
-                      let thickness = isHorizontalIdeal ? edge.height : edge.width;
-
-                      // A line with `lineWidth = 0` is the thinnest line the device can draw,
-                      // that is, the actual visible boundary. We distinguish it from garbage zero fills
-                      // (which do not have a `strokeColor`).
-                      let isHairlineStroke = thickness === 0 && !!edge.strokeColor;
-
-                      if (thickness > 0.3 || isHairlineStroke) {// old: > 0.01
-                        realOverlapMap[edgeColor] = (realOverlapMap[edgeColor] || 0) + overlap;
-                        realTotal += overlap;
-                      } else {
-                        degenerateOverlapMap[edgeColor] = (degenerateOverlapMap[edgeColor] || 0) + overlap;
-                        degenerateTotal += overlap;
-                      }
-
-                      //let weight = thickness > 0.01 ? 1 : 0.05;
-                    }
-
-                    if (realTotal > 0) {
-                      let sortedColors = Object.entries(realOverlapMap)
-                        .sort((a: any, b: any) => b[1] - a[1]);
-
-                      let bestColor: any = sortedColors[0][0];
-                      let bestOverlap: any = sortedColors[0][1];
-                      // Threshold: 5% of the length or a minimum of 1px.
-                      let threshold = Math.min(idealLength * 0.05, 1);
-
-                      if (bestOverlap >= threshold) {
-                        return bestColor;
+                      // Zero-thickness fills are artefacts; a stroked hairline is a real rule.
+                      const thickness = isHorizontalIdeal ? edge.height : edge.width;
+                      const isHairlineStroke = thickness === 0 && !!edge.strokeColor;
+                      if (thickness > 0.3 || isHairlineStroke) {
+                        overlapByColor[edgeColor] = (overlapByColor[edgeColor] || 0) + overlap;
                       }
                     }
 
-                    return null;
+                    const minimalOverlap = Math.min(idealLength * 0.05, 1);
+                    return Object.entries(overlapByColor)
+                      .filter(([, overlap]) => overlap >= minimalOverlap)
+                      .sort((first, second) => second[1] - first[1]);
                   }
 
-                  function getSegmentBorderColor(idealLine) {
-                    const cacheKey = `${idealLine?.x1?.toFixed(2)},${idealLine?.y1?.toFixed(2)},${idealLine?.x2?.toFixed(2)},${idealLine?.y2?.toFixed(2)}`;
-                    if (borderColorCache[cacheKey] !== undefined) {
-                      return borderColorCache[cacheKey];
-                    }
-                    let isHorizontalIdeal = Math.abs(idealLine.y2 - idealLine.y1) < tolerance;
-                    let idealLength = isHorizontalIdeal ?
-                      Math.abs(idealLine.x2 - idealLine.x1) :
-                      Math.abs(idealLine.y2 - idealLine.y1);
+                  // A rule that only ends next to the segment is not its border: require that
+                  // it really covers a part of the segment.
+                  function hasRuleNearSegment(idealLine: any, isHorizontalIdeal: boolean, idealLength: number): boolean {
+                    let coverage = 0;
+                    allEdges.forEach(edge => {
+                      const isHorizontalEdge = edge.height < lineMaxWidth && edge.width > lineMaxWidth;
+                      const isVerticalEdge = edge.width < lineMaxWidth && edge.height > lineMaxWidth;
+                      if (isHorizontalIdeal ? !isHorizontalEdge : !isVerticalEdge) return;
 
-                    if (idealLength <= 0) {
-                      borderColorCache[cacheKey] = null;
+                      const axisMatch = isHorizontalIdeal
+                        ? Math.abs(edge.y - idealLine.y1) <= tolerance
+                        : Math.abs(edge.x - idealLine.x1) <= tolerance;
+                      if (!axisMatch) return;
+
+                      const from = isHorizontalIdeal ? Math.min(idealLine.x1, idealLine.x2) : Math.min(idealLine.y1, idealLine.y2);
+                      const to = isHorizontalIdeal ? Math.max(idealLine.x1, idealLine.x2) : Math.max(idealLine.y1, idealLine.y2);
+                      const start = isHorizontalIdeal ? edge.x : edge.y;
+                      const end = start + (isHorizontalIdeal ? edge.width : edge.height);
+                      coverage += Math.max(0, Math.min(end, to) - Math.max(start, from));
+                    });
+                    return coverage >= idealLength * 0.25;
+                  }
+
+                  function getSegmentColorCandidates(idealLine: any, isHorizontalIdeal: boolean): Array<[string, number]> {
+                    const cacheKey = `${isHorizontalIdeal ? 'h' : 'v'}:${idealLine.x1.toFixed(2)},${idealLine.y1.toFixed(2)},${idealLine.x2.toFixed(2)},${idealLine.y2.toFixed(2)}`;
+                    if (borderCandidatesCache[cacheKey]) {
+                      return borderCandidatesCache[cacheKey];
+                    }
+
+                    const idealLength = isHorizontalIdeal
+                      ? Math.abs(idealLine.x2 - idealLine.x1)
+                      : Math.abs(idealLine.y2 - idealLine.y1);
+                    let candidates: Array<[string, number]> = [];
+
+                    if (idealLength > 0) {
+                      candidates = collectBorderColors(idealLine, groupEdges, isHorizontalIdeal, idealLength);
+                      if (!candidates.length && pageEdgesFiltered.length > 0) {
+                        candidates = collectBorderColors(idealLine, pageEdgesFiltered, isHorizontalIdeal, idealLength);
+                      }
+                      if (
+                        !candidates.length &&
+                        hasAnyBorders &&
+                        tableBorderColor &&
+                        hasRuleNearSegment(idealLine, isHorizontalIdeal, idealLength)
+                      ) {
+                        candidates = [[tableBorderColor, idealLength]];
+                      }
+                    }
+
+                    borderCandidatesCache[cacheKey] = candidates;
+                    return candidates;
+                  }
+
+                  // Fill of a grid cell (merged cells resolve to their root).
+                  // Outside the table, and cells without fill, are the page itself.
+                  function getCellFillAt(row: number, col: number): string | null {
+                    if (row < 0 || col < 0 || row >= rowsCount || col >= colsCount) {
                       return null;
                     }
+                    const rootKey = mergeAlias[`${row}-${col}`] || `${row}-${col}`;
+                    const [rootRow, rootCol] = rootKey.split('-').map(Number);
+                    return table.array[rootRow]?.[rootCol]?.['fillColor'] ?? null;
+                  }
 
-                    // 1. The main search is in the edges of the table itself
-                    let result = findColorInPool(idealLine, groupEdges, isHorizontalIdeal, idealLength);
+                  // One colour per slot of a grid line. A slot is the stretch of the line
+                  // between two neighbouring cells; the fills of both are known.
+                  function planGridLine(isHorizontalLine: boolean, lineIndex: number): Array<string | null> {
+                    const axis = isHorizontalLine ? horizons[lineIndex].y : verticles[lineIndex].x;
+                    const slots: Array<{ from: number; to: number; fills: Array<string | null> }> = [];
 
-                    // 2. Fallback — real page lines, but only inside the bbox of the table
-                    if (!result && pageEdgesFiltered.length > 0) {
-                      result = findColorInPool(idealLine, pageEdgesFiltered, isHorizontalIdeal, idealLength);
-                    }
-
-                    // 3. If there is a line nearby, but the color has not shifted (micro-shifts) — the dominant color
-                    if (!result && hasAnyBorders && tableBorderColor) {
-                      // A rule that merely ends next to the segment (or touches it) is not the border
-                      // of this cell: require that it really covers a part of the segment.
-                      let nearbyCoverage = 0;
-
-                      allEdges.forEach(edge => {
-                        const isHorizontalEdge = edge.height < lineMaxWidth && edge.width > lineMaxWidth;
-                        const isVerticalEdge = edge.width < lineMaxWidth && edge.height > lineMaxWidth;
-
-                        if (isHorizontalIdeal ? !isHorizontalEdge : !isVerticalEdge) {
-                          return;
-                        }
-
-                        const axisMatch = isHorizontalIdeal
-                          ? Math.abs(edge.y - idealLine.y1) <= tolerance
-                          : Math.abs(edge.x - idealLine.x1) <= tolerance;
-
-                        if (!axisMatch) {
-                          return;
-                        }
-
-                        const from = isHorizontalIdeal
-                          ? Math.min(idealLine.x1, idealLine.x2)
-                          : Math.min(idealLine.y1, idealLine.y2);
-
-                        const to = isHorizontalIdeal
-                          ? Math.max(idealLine.x1, idealLine.x2)
-                          : Math.max(idealLine.y1, idealLine.y2);
-
-                        const start = isHorizontalIdeal ? edge.x : edge.y;
-                        const end = start + (isHorizontalIdeal ? edge.width : edge.height);
-
-                        nearbyCoverage += Math.max(0, Math.min(end, to) - Math.max(start, from));
-                      });
-
-                      if (nearbyCoverage >= idealLength * 0.25) {
-                        result = tableBorderColor;
+                    if (isHorizontalLine) {
+                      for (let col = 0; col < colsCount; col++) {
+                        const centerX = (verticles[col].x + verticles[col + 1].x) / 2;
+                        slots.push({
+                          from: verticles[col].x,
+                          to: verticles[col + 1].x,
+                          fills: [
+                            ...getSideFills(lineIndex - 1, col, centerX, axis + outsideProbeOffset),
+                            ...getSideFills(lineIndex, col, centerX, axis - outsideProbeOffset)
+                          ]
+                        });
+                      }
+                    } else {
+                      for (let row = 0; row < rowsCount; row++) {
+                        const centerY = (horizons[row].y + horizons[row + 1].y) / 2;
+                        slots.push({
+                          from: horizons[row + 1].y,
+                          to: horizons[row].y,
+                          fills: [
+                            ...getSideFills(row, lineIndex - 1, axis - outsideProbeOffset, centerY),
+                            ...getSideFills(row, lineIndex, axis + outsideProbeOffset, centerY)
+                          ]
+                        });
                       }
                     }
 
-                    borderColorCache[cacheKey] = result;
-                    return result;
+                    // A genuine border is the first candidate colour that is not just the
+                    // edge of a neighbouring fill.
+                    const genuine = slots.map(slot => {
+                      const idealLine = isHorizontalLine
+                        ? { x1: slot.from, y1: axis, x2: slot.to, y2: axis }
+                        : { x1: axis, y1: slot.from, x2: axis, y2: slot.to };
+                      const candidate = getSegmentColorCandidates(idealLine, isHorizontalLine).find(
+                        ([color]) => !isBorderAbsorbedByFills(color, slot.fills)
+                      );
+                      return candidate ? candidate[0] : null;
+                    });
+
+                    const lengthOf = (slot: { from: number; to: number }) => Math.max(0, slot.to - slot.from);
+                    const totalLength = slots.reduce((sum, slot) => sum + lengthOf(slot), 0);
+                    const weights: Record<string, number> = {};
+                    genuine.forEach((color, index) => {
+                      if (color) weights[color] = (weights[color] || 0) + lengthOf(slots[index]);
+                    });
+                    const coveredLength = Object.values(weights).reduce((sum, value) => sum + value, 0);
+
+                    if (coveredLength === 0) {
+                      return genuine;
+                    }
+                    // The line clearly has a rule: keep its pattern across the whole line
+                    // (no 1px shifts caused by cells that lost their share of the rule).
+                    if (coveredLength >= totalLength * LINE_PATTERN_MIN_COVERAGE) {
+                      const dominant = Object.entries(weights).sort((a, b) => b[1] - a[1])[0][0];
+                      return slots.map(() => dominant);
+                    }
+                    return genuine;
                   }
+
+                  function pickSideColor(colors: Array<string | null>): string | null {
+                    const weights: Record<string, number> = {};
+                    colors.forEach(color => {
+                      if (color) weights[color] = (weights[color] || 0) + 1;
+                    });
+                    const best = Object.entries(weights).sort((a, b) => b[1] - a[1])[0];
+                    return best ? best[0] : null;
+                  }
+
+                  // Filled rectangles that lie right beyond the table (a footer, a title band, ...).
+                  // They were cut off from the table, but their outline is painted in their fill colour
+                  // and must not become the colour of the table border.
+                  const outsideFillRects = (pageGroup?.rectangles || []).filter(
+                    (rect: any) => rect?.fillColor && Number(rect.width) > 0 && Number(rect.height) > 0
+                  );
+                  const outsideProbeOffset = Math.max((tableGroup?.borderSize || 0.57) * 3, 2);
+
+                  function getFillsAtPoint(x: number, y: number): Array<string | null> {
+                    const fills = outsideFillRects
+                      .filter(
+                        (rect: any) =>
+                          x >= rect.x &&
+                          x <= rect.x + rect.width &&
+                          y >= rect.y &&
+                          y <= rect.y + rect.height
+                      )
+                      .map((rect: any) => rect.fillColor as string);
+                    return fills.length ? fills : [null];
+                  }
+
+                  // Fill(s) of one side of a grid line: the cell inside the table, or whatever
+                  // is painted at the probe point when the side lies beyond the table.
+                  function getSideFills(
+                    row: number,
+                    col: number,
+                    probeX: number,
+                    probeY: number
+                  ): Array<string | null> {
+                    const inside = row >= 0 && col >= 0 && row < rowsCount && col < colsCount;
+                    return inside ? [getCellFillAt(row, col)] : getFillsAtPoint(probeX, probeY);
+                  }
+
+                  const horizontalPlan = horizons.map((_: any, index: number) => planGridLine(true, index));
+                  const verticalPlan = verticles.map((_: any, index: number) => planGridLine(false, index));
                   // --- END EDGES LOGIC ---
 
                   let html = `<table style="border-collapse:collapse;">` + '\n';
@@ -12420,6 +12655,17 @@ export function init({
                         continue;
                       }
 
+                      const spanWidth = merges[r_c]?.width || 1;
+                      let visibleSpan = spanWidth;
+                      for (let k = c; k < c + spanWidth; k++) {
+                        if (gutterColumns.has(k)) {
+                          visibleSpan--;
+                        }
+                      }
+                      if (visibleSpan <= 0) {
+                        continue;
+                      }
+
                       let fillColor = table.array[r][c]['fillColor'];
                       let textColor = table.array[r][c]['textColor'];
                       // Defining the colors of the 4 sides of the cell
@@ -12429,11 +12675,10 @@ export function init({
                       const rowSpan = mergeInfo ? mergeInfo.height : 1;
                       const colSpan = mergeInfo ? mergeInfo.width : 1;
 
-                      cellBorders.top = getSegmentBorderColor({ x1: verticles[c].x, y1: horizons[r].y, x2: verticles[c + colSpan].x, y2: horizons[r].y });
-                      cellBorders.bottom = getSegmentBorderColor({ x1: verticles[c].x, y1: horizons[r + rowSpan].y, x2: verticles[c + colSpan].x, y2: horizons[r + rowSpan].y });
-                      cellBorders.left = getSegmentBorderColor({ x1: verticles[c].x, y1: horizons[r + rowSpan].y, x2: verticles[c].x, y2: horizons[r].y });
-                      cellBorders.right = getSegmentBorderColor({ x1: verticles[c + colSpan].x, y1: horizons[r + rowSpan].y, x2: verticles[c + colSpan].x, y2: horizons[r].y });
-
+                      cellBorders.top = pickSideColor(horizontalPlan[r].slice(c, c + colSpan));
+                      cellBorders.bottom = pickSideColor(horizontalPlan[r + rowSpan].slice(c, c + colSpan));
+                      cellBorders.left = pickSideColor(verticalPlan[c].slice(r, r + rowSpan));
+                      cellBorders.right = pickSideColor(verticalPlan[c + colSpan].slice(r, r + rowSpan));
                       let borderStyle = '';
                       if (cellBorders.top) borderStyle += `border-top: 1px solid ${cellBorders.top};`;
                       if (cellBorders.right) borderStyle += `border-right: 1px solid ${cellBorders.right};`;
@@ -12464,9 +12709,16 @@ export function init({
                       }
                       let cell = `<${tagName} style="${borderStyle}${fillColor ? ` background-color: ${fillColor};` : ''}"`;
 
-                      if (merges[r_c]) {
-                        if (merges[r_c].width > 1) cell += ` colspan="${merges[r_c].width}"`;
-                        if (merges[r_c].height > 1) cell += ` rowspan="${merges[r_c].height}"`;
+                      // if (merges[r_c]) {
+                      //   if (merges[r_c].width > 1) cell += ` colspan="${merges[r_c].width}"`;
+                      //   if (merges[r_c].height > 1) cell += ` rowspan="${merges[r_c].height}"`;
+                      // }
+
+                      if (visibleSpan > 1) {
+                        cell += ` colspan="${visibleSpan}"`;
+                      }
+                      if ((merges[r_c]?.height || 1) > 1) {
+                        cell += ` rowspan="${merges[r_c].height}"`;
                       }
 
                       cell += `>${safeStr}</${tagName}>\n`;
@@ -12560,7 +12812,9 @@ export function init({
                         console.error(`[WARN JSON] headerPaths[${colIndex}] undefined for row ${rowIdx}`);
                         return;
                       }
-                      let str = row[colIndex]?.str?.trim() || '';
+                      let str = row[colIndex]?.str
+                        ?.trim()
+                        ?.replace(LEADER_TRAILING_RUN, '') || '';
                       if (str) {
                         deepSet(obj, headerPaths[colIndex], str, {
                           create: true,
