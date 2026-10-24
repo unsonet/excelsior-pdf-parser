@@ -12577,11 +12577,23 @@ export function init({
                     if (coveredLength === 0) {
                       return genuine;
                     }
-                    // The line clearly has a rule: keep its pattern across the whole line
-                    // (no 1px shifts caused by cells that lost their share of the rule).
+                    // The line clearly has a rule: bridge holes in the middle of it, so that cells that lost
+                    // their share of the rule do not produce 1px shifts. The line is never extended beyond
+                    // its first and last genuine segment: a boundary that is absent at the end of a line
+                    // (e.g. in the last row of a table) is really absent.
                     if (coveredLength >= totalLength * LINE_PATTERN_MIN_COVERAGE) {
                       const dominant = Object.entries(weights).sort((a, b) => b[1] - a[1])[0][0];
-                      return slots.map(() => dominant);
+                      const firstGenuine = genuine.findIndex(color => color !== null);
+                      const lastGenuine =
+                        genuine.length - 1 - [...genuine].reverse().findIndex(color => color !== null);
+
+                      return genuine.map((color, index) =>
+                        color !== null
+                          ? color
+                          : index > firstGenuine && index < lastGenuine
+                            ? dominant
+                            : null
+                      );
                     }
                     return genuine;
                   }
