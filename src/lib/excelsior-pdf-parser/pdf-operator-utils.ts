@@ -437,6 +437,38 @@ export function normalizeShowTextArgs(args: any): any[] {
     return [];
 }
 
+/**
+ * Видимый глиф-пунктуация, у которого ToUnicode начинается с пробела (" ."):
+ * этот пробел не имеет ширины, глиф занимает место одного символа.
+ */
+export function normalizeGlyphUnicode(entries: any[]): any[] {
+  if (!Array.isArray(entries)) {
+    return entries;
+  }
+
+  return entries.map(entry => {
+    if (!entry || typeof entry !== 'object' || entry.isSpace || entry.isLineBreak) {
+      return entry;
+    }
+
+    const unicode = entry.unicode;
+    if (typeof unicode !== 'string' || unicode.length < 2) {
+      return entry;
+    }
+
+    const visible = unicode.trim();
+    const hasOnlyLeadingPadding = visible.length === 1 && unicode.endsWith(visible);
+    const isLetterDigitOrMark = /[\p{L}\p{N}\p{M}]/u.test(visible);
+
+    if (!hasOnlyLeadingPadding || isLetterDigitOrMark) {
+      return entry;
+    }
+
+    // глифы pdf.js кэшируются и общие между операторами — не мутируем, копируем
+    return { ...entry, unicode: visible };
+  });
+}
+
 export function normalizeDependencyArgs(args: any): string[] {
     if (!Array.isArray(args)) {
         return [];
