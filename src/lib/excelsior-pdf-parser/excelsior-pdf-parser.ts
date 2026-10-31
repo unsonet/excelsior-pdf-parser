@@ -386,13 +386,26 @@ export function init({
               const right = Math.max(...lineItems.map(getItemRight));
               const flushed = {
                 ...first,
-                str: lineItems.map(item => item?.str || '').filter(part => part.trim().length).join(' '),
+                str: lineItems
+                  .map(item => item?.str || '')
+                  .filter(part => part.trim().length)
+                  .join(' '),
                 chars: mergedChars,
                 hasEOT: true,
                 hasEOL: lineItems[lineItems.length - 1]?.hasEOL || false,
+                // Marker: the item is appended to the END of tableContentItems, so its array
+                // neighbours are not its real neighbours in the content stream.
+                isStaleFlush: true,
                 width: Math.max(0, right - left),
                 height: Math.max(...lineItems.map(item => item?.height || 0)),
-                transform: [first.transform[0], first.transform[1], first.transform[2], first.transform[3], left, baseline]
+                transform: [
+                  first.transform[0],
+                  first.transform[1],
+                  first.transform[2],
+                  first.transform[3],
+                  left,
+                  baseline,
+                ],
               };
 
               const continuation = findContinuationItem(flushed);
@@ -3858,6 +3871,80 @@ export function init({
             return true;
           }
 
+          /**
+ * Items created by flushStaleTableContentItemsCache() live at the end of
+ * tableContentItems, so two neighbouring array entries are not necessarily
+ * neighbours in the document. If such items are stacked in one column and the
+ * line pitch is tight (gap < 1.25 * height), the "chain" pass glues them into
+ * one multi-line cell.
+ *
+ * Two stacked flushed items are independent rows when BOTH of them have a
+ * "row mate": a regular (not flushed), already finished text cell (hasEOT) on
+ * the same baseline in another column, and the row mates of the two lines
+ * overlap horizontally (i.e. they sit in the same column).
+ *
+ * Regular items are located before the flushed ones in the array, so their
+ * hasEOT flags are already final when the chain pass reaches the flushed items.
+ */
+          function areStaleItemsOnSeparateRows(firstItem: any, secondItem: any): boolean {
+            if (!firstItem?.isStaleFlush || !secondItem?.isStaleFlush) {
+              return false;
+            }
+
+            const getRowMates = (item: any): any[] => {
+              const baseline = item.transform[5];
+              const itemHeight = Math.max(Math.abs(item.transform[3]) || item.height || 1, 1);
+              const baselineTolerance = Math.max(itemHeight * 0.5, 1);
+              const itemLeft = item.transform[4];
+              const itemRight = itemLeft + (item.width || 0);
+
+              return tableContentItems.filter((candidate: any) => {
+                if (!candidate?.transform || candidate === item || candidate.imageName) {
+                  return false;
+                }
+                if (candidate.isStaleFlush || candidate.hasEOT !== true) {
+                  return false;
+                }
+                if (!candidate.str?.trim() || !isHorizontalText(candidate)) {
+                  return false;
+                }
+                if (Math.abs(candidate.transform[5] - baseline) > baselineTolerance) {
+                  return false;
+                }
+
+                // The mate must live in another column (to the left or to the right).
+                const candidateLeft = candidate.transform[4];
+                const candidateRight = candidateLeft + (candidate.width || 0);
+                return (
+                  candidateLeft >= itemRight - baselineTolerance ||
+                  candidateRight <= itemLeft + baselineTolerance
+                );
+              });
+            };
+
+            const firstMates = getRowMates(firstItem);
+            if (!firstMates.length) {
+              return false;
+            }
+            const secondMates = getRowMates(secondItem);
+            if (!secondMates.length) {
+              return false;
+            }
+
+            const getRange = (item: any): [number, number] => {
+              const left = item.transform[4];
+              return [left, left + (item.width || 0)];
+            };
+
+            return firstMates.some(firstMate => {
+              const [firstLeft, firstRight] = getRange(firstMate);
+              return secondMates.some(secondMate => {
+                const [secondLeft, secondRight] = getRange(secondMate);
+                return Math.min(firstRight, secondRight) - Math.max(firstLeft, secondLeft) > 0;
+              });
+            });
+          }
+
           // === Support for fully rotated (landscape, “sideways”) pages ===
           //
           // In agstat.pdf, the 90° rotation applied only to the column header text
@@ -4418,7 +4505,8 @@ export function init({
 
                 isSeparateCell =
                   horizontalOverlap < 0 ||
-                  verticalGap > maxHeight * 1.25;
+                  verticalGap > maxHeight * 1.25 ||
+                  areStaleItemsOnSeparateRows(previousItem, currentItem);
               }
 
               if (isSeparateCell) {
@@ -6940,11 +7028,28 @@ export function init({
               const lower = bands[bands.length - 2];
               const gap = upper.bottom - lower.top;
 
+              const upperHasNoHeaderBlocks = upper.blocks.every(
+                block => !headerBlockIndexes.has(block.index),
+              );
+
+              // Original rule: a lone block above a multi-block band is a caption.
+              const isLoneCaption = upper.blocks.length === 1;
+
+              // Page title made of several blocks (left / centre / right) standing above an
+              // already confirmed header band. A centred multi-line title overlaps the other
+              // blocks vertically, so they all end up in ONE band and the "lone block" rule
+              // above never fires. The title band is sparser than the header band below it
+              // and contains no header blocks.
+              const isTitleAboveConfirmedHeader =
+                upper.blocks.length > 1 &&
+                upper.blocks.length < lower.blocks.length &&
+                lower.blocks.every(block => headerBlockIndexes.has(block.index));
+
               const isCaption =
-                upper.blocks.length === 1 &&
+                (isLoneCaption || isTitleAboveConfirmedHeader) &&
                 lower.blocks.length >= 2 &&
                 gap >= modalTextHeight * 0.75 &&
-                upper.blocks.every(block => !headerBlockIndexes.has(block.index));
+                upperHasNoHeaderBlocks;
 
               if (!isCaption) {
                 break;
