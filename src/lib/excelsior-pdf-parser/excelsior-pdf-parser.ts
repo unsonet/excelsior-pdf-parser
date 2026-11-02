@@ -843,16 +843,30 @@ export function init({
                   let vector = { y: ry, x: rx, width: rwidth, height: rheight, transform: transformMatrix };
 
                   // We skip the full‑size background rectangles/page cropping
-                  let isFullPageRect = Math.abs(rwidth - pageWidth) < 1
-                    && Math.abs(rheight - pageHeight) < 1
-                    && Math.abs(rx) < 1
-                    && Math.abs(ry) < 1;
-                  if (isFullPageRect) {
+                  let isFullPageRect =
+                    Math.abs(rwidth - pageWidth) < 1 &&
+                    Math.abs(rheight - pageHeight) < 1 &&
+                    Math.abs(rx) < 1 &&
+                    Math.abs(ry) < 1;
+
+                  // A WHITE fill covering almost the whole page is a page background. The exact-size
+                  // check above misses it when the background is drawn for another paper size
+                  // (here 595.45 wide on a 612 wide page). Such a rectangle would otherwise glue
+                  // the table to everything else on the page (headers, footers).
+                  const fillRGB = current.fillRGBColor || [];
+                  const isWhiteFill = fillRGB.length >= 3 && fillRGB.slice(0, 3).every(channel => channel >= 250);
+                  const isFillOnly = isNewFormat && (paintType === OPS.fill || paintType === OPS.eoFill);
+                  const coversMostOfPage =
+                    rwidth >= pageWidth * 0.9 &&
+                    rheight >= pageHeight * 0.9 &&
+                    Math.abs(rx) <= pageWidth * 0.05 &&
+                    Math.abs(ry) <= pageHeight * 0.05;
+
+                  if (isFullPageRect || (coversMostOfPage && isFillOnly && isWhiteFill)) {
                     current['vectorCache'] = vector;
                     current['vectorType'] = 'rectangle';
-                    continue; // do not add to rectangles / edges
+                    continue;// do not add to rectangles / edges
                   }
-
 
                   let vectorType = Math.min(Math.abs(rwidth), Math.abs(rheight)) < lineMaxWidth ? 'edge' : 'rectangle';
                   let vectors = vectorType == 'rectangle' ? rectangles : edges;
@@ -933,13 +947,20 @@ export function init({
                       }
                     }
 
-                    if (!isPageBoundary) {//&& !isPaintlessPath BUG sales_order.pdf 
+                    // A diagonal segment whose bounding box is bigger than a line width in BOTH directions is not
+                    // a table rule. It comes from curves / rounded corners (e.g. the drop shadow of a frame), and
+                    // such a box can span half of the page and glue unrelated parts of it into one group.
+                    const isDiagonal = current['x'] != lx && current['y'] != ly;
+                    const isLargeDiagonal = isDiagonal && vector.width > lineMaxWidth && vector.height > lineMaxWidth;
+
+                    if (!isPageBoundary && !isLargeDiagonal) {//&& !isPaintlessPath BUG sales_order.pdf 
                       edges.push(vector);
                     }
-
                     current['vectorType'] = 'edge';
                     current['x'] = lx;
                     current['y'] = ly;
+
+
 
                   } else {
                     //unexpected behavior
@@ -3601,6 +3622,165 @@ export function init({
           // either `setFont` or `setTextMatrix` (for example, the very last block
           // of text on the page before `endText`).
           flushStaleTableContentItemsCache();
+          recoverTruncatedTails();
+
+          /**
+           * Repairs items that lost their last glyph(s) while the interpreter built them
+           * ("73,980,669" -> "73,980,66"). pdf.js getTextContent() is an independent source of
+           * the full string, so an item is repaired only when ALL of these hold:
+           *   - the item text (without spaces) is a STRICT PREFIX of a pdf.js item that starts at
+           *     the same x and baseline;
+           *   - at most 3 glyphs are missing and they are letters / digits / . , % );
+           *   - the width pdf.js reports beyond our right edge matches those glyphs;
+           *   - no other item already occupies that tail (a legitimate split into two cells).
+           */
+          function recoverTruncatedTails(): void {
+            const references = (pageTextContent.items || []).filter(
+              (reference: any) =>
+                reference &&
+                typeof reference.str === 'string' &&
+                reference.str.trim() &&
+                reference.transform &&
+                reference.transform.length >= 6 &&
+                Number.isFinite(reference.width),
+            );
+            if (!references.length) {
+              return;
+            }
+
+            const compact = (text: string) => String(text || '').replace(/\s+/g, '');
+            const isVisibleGlyph = (glyph: any) =>
+              !!glyph &&
+              typeof glyph === 'object' &&
+              typeof glyph.unicode === 'string' &&
+              glyph.unicode.trim().length > 0 &&
+              Number.isFinite(glyph.x) &&
+              Number.isFinite(glyph.charWidth);
+
+            const getExtent = (item: any) => {
+              const glyphs = (item?.chars || []).filter(isVisibleGlyph);
+              if (!glyphs.length) {
+                return null;
+              }
+              const rightmost = glyphs.reduce(
+                (best: any, glyph: any) => (glyph.x + glyph.charWidth > best.x + best.charWidth ? glyph : best),
+                glyphs[0],
+              );
+              return {
+                left: Math.min(...glyphs.map((glyph: any) => glyph.x)),
+                right: rightmost.x + rightmost.charWidth,
+                rightmost,
+              };
+            };
+
+            const skipped: any[] = [];
+
+            tableContentItems.forEach((item: any) => {
+              if (!item?.transform || item.imageName || !Array.isArray(item.chars) || !item.chars.length) {
+                return;
+              }
+              if (!isHorizontalText(item) || /\n/.test(String(item.str || '').trim())) {
+                return;
+              }
+              const visibleText = compact(item.str);
+              const extent = getExtent(item);
+              if (!visibleText || !extent) {
+                return;
+              }
+
+              const height = Math.max(Math.abs(item.transform[3]) || item.height || 1, 1);
+              const baselineTolerance = Math.max(height * 0.3, 0.5);
+
+              const reference = references.find((candidate: any) => {
+                if (Math.abs(candidate.transform[5] - item.transform[5]) > baselineTolerance) {
+                  return false;
+                }
+                if (Math.abs(candidate.transform[4] - extent.left) > 1) {
+                  return false;
+                }
+                const referenceText = compact(candidate.str);
+                return referenceText.length > visibleText.length && referenceText.startsWith(visibleText);
+              });
+              if (!reference) {
+                return;
+              }
+
+              const missing = compact(reference.str).slice(visibleText.length);
+              const referenceRight = reference.transform[4] + reference.width;
+              const tailWidth = referenceRight - extent.right;
+              const reject = (reason: string) =>
+                skipped.push({ reason, text: item.str, reference: reference.str, tailWidth: +tailWidth.toFixed(2) });
+
+              if (missing.length > 3 || !/^[\p{L}\p{N}.,%)]+$/u.test(missing)) {
+                return reject('tail is not a short word/number');
+              }
+              if (tailWidth < height * 0.1 * missing.length || tailWidth > height * 0.9 * missing.length) {
+                return reject('tail width does not match the missing glyphs');
+              }
+
+              const occupied = tableContentItems.some((other: any) => {
+                if (other === item || !other?.transform || other.imageName || !String(other.str || '').trim()) {
+                  return false;
+                }
+                if (Math.abs(other.transform[5] - item.transform[5]) > baselineTolerance) {
+                  return false;
+                }
+                const otherLeft = getExtent(other)?.left ?? other.transform[4];
+                return otherLeft >= extent.right - 0.5 && otherLeft <= referenceRight + 0.5;
+              });
+              if (occupied) {
+                return reject('tail is already a separate item');
+              }
+
+              const glyphWidth = tailWidth / missing.length;
+              const em = height * 0.001; // glyph.width is stored in 1/1000 em
+              const readingLength = Math.hypot(item.transform[0], item.transform[1]) || 1;
+              const last = extent.rightmost;
+
+              const glyphs = Array.from(missing).map((character: string, index: number) => {
+                const x = extent.right + glyphWidth * index;
+                const glyph: any = {
+                  originalCharCode: character.charCodeAt(0),
+                  fontChar: character,
+                  unicode: character,
+                  accent: null,
+                  width: glyphWidth / em,
+                  isSpace: false,
+                  isInFont: true,
+                  isLineBreak: false,
+                  x,
+                  y: Number.isFinite(last.y) ? last.y : item.transform[5],
+                  charWidth: glyphWidth,
+                  advanceWidth: glyphWidth,
+                  wordSpacingWidth: 0,
+                };
+                if (Number.isFinite(last._pageX) && Number.isFinite(last._pageY)) {
+                  glyph._pageX = last._pageX + ((x - last.x) * item.transform[0]) / readingLength;
+                  glyph._pageY = last._pageY + ((x - last.x) * item.transform[1]) / readingLength;
+                }
+                return glyph;
+              });
+
+              const before = item.str;
+              item.chars.splice(item.chars.lastIndexOf(last) + 1, 0, ...glyphs);
+              const textEnd = String(item.str).replace(/\s+$/, '').length;
+              item.str = String(item.str).slice(0, textEnd) + missing + String(item.str).slice(textEnd);
+              item.width = Math.max(item.width || 0, extent.right + tailWidth - item.transform[4]);
+
+              console.error('[TAIL RECOVERED]', {
+                before,
+                after: item.str,
+                reference: reference.str,
+                tailWidth: +tailWidth.toFixed(3),
+                // undefined => the item was built by mergeFragments (a new object), not by the interpreter
+                sourceOp: item.__pdfTraceOpIndex,
+              });
+            });
+
+            if (skipped.length) {
+              console.error('[TAIL SKIPPED]', skipped.slice(0, 10));
+            }
+          }
 
           function isRotatedText(item) {
             const transform = item?.transform;
@@ -5141,9 +5321,44 @@ export function init({
                   }
                 }
 
+                if (!layers.length) {
+                  // Shading drawn piece by piece (a rectangle per text line plus side pads): no single piece
+                  // covers MIN_COVERAGE of a tall merged cell, but the pieces of one colour together do.
+                  const byColor = new Map<string, { area: number; hasCenter: boolean }>();
+                  for (const rect of painted) {
+                    const rectRight = rect.x + rect.width;
+                    const rectTop = rect.y + rect.height;
+                    const overlapX = Math.max(0, Math.min(x2, rectRight) - Math.max(x1, rect.x));
+                    const overlapY = Math.max(0, Math.min(y2, rectTop) - Math.max(y1, rect.y));
+                    if (!(overlapX * overlapY > 0)) {
+                      continue;
+                    }
+                    const centerInside =
+                      centerX >= rect.x &&
+                      centerX <= rectRight &&
+                      centerY >= rect.y - tolerance &&
+                      centerY <= rectTop + tolerance;
+                    const entry = byColor.get(rect.fillColor) || { area: 0, hasCenter: false };
+                    entry.area += overlapX * overlapY;
+                    entry.hasCenter = entry.hasCenter || centerInside;
+                    byColor.set(rect.fillColor, entry);
+                  }
+
+                  let bestColor: string | null = null;
+                  let bestArea = 0;
+                  for (const [color, entry] of Array.from(byColor.entries())) {
+                    if (entry.hasCenter && entry.area / area >= MIN_COVERAGE && entry.area > bestArea) {
+                      bestArea = entry.area;
+                      bestColor = color;
+                    }
+                  }
+                  if (bestColor) {
+                    layers.push(bestColor);
+                  }
+                }
+
                 if (layers.length) {
                   const color = compositeCellColors(layers);
-
                   if (color) {
                     fills[key] = color;
                   }
@@ -5191,7 +5406,12 @@ export function init({
                   return prev;
                 }
 
-                if (hasEOT || index == 0) {
+                // A coordinate that so far holds only whitespace must not swallow the next item: the merged
+                // block would start at the whitespace and pull the text into the wrong column.
+                const startsAfterBlankLead =
+                  !!lastItem && !item.imageName && !lastItem.imageName && !hasContent(lastItem);
+
+                if (hasEOT || index == 0 || startsAfterBlankLead) {
                   let newItem = {
                     index: index,
                     str: item?.str || '',
@@ -6164,6 +6384,309 @@ export function init({
             }, {});
 
             return headerRows;
+          }
+
+          /**
+ * A title row ("Table: 5 Public Health Outlay ...") is a single line of text whose
+ * blocks together cross EVERY interior column boundary, i.e. the row has no cell
+ * structure at all (the grid merges it into one full-width cell). Such a row is a
+ * caption of the table, not a part of it, even when it is drawn as a coloured bar.
+ */
+          function trimFullWidthTitleRow(group: any, lineMaxWidth: number): any {
+            if (!group?.rows?.length || !group?.cols?.length || group.rows.length < 5 || group.cols.length < 4) {
+              return group;
+            }
+
+            const rowsDesc = [...group.rows].sort((a, b) => b - a);
+            const rowTop = rowsDesc[0];
+            const rowBottom = rowsDesc[1];
+
+            const textBlocks = (group.coordinates || []).filter(
+              (block: any) =>
+                block?.str?.trim() && [block.x, block.y, block.width, block.height].every(Number.isFinite),
+            );
+            const titleBlocks = textBlocks.filter((block: any) => block.y <= rowTop + 0.5 && block.y > rowBottom);
+            if (!titleBlocks.length) {
+              return group;
+            }
+
+            // 1. One line of text.
+            const baseline = titleBlocks[0].y;
+            if (titleBlocks.some((block: any) => Math.abs(block.y - baseline) > 1)) {
+              return group;
+            }
+
+            // 2. A real body (several lines) exists below the row.
+            const bodyLines = new Set(
+              textBlocks.filter((block: any) => block.y <= rowBottom).map((block: any) => Math.round(block.y)),
+            );
+            if (bodyLines.size < 3) {
+              return group;
+            }
+
+            // 3. The text crosses every interior column boundary.
+            const margin = Math.max(lineMaxWidth * 0.1, 0.3);
+            const colsAsc = [...group.cols].sort((a, b) => a - b);
+            // Boundaries within a pad width (~5 pt) of the outer edges are shading pads / frame, not columns.
+            const outerPad = lineMaxWidth * 1.3;
+            const interiorCols = colsAsc.filter(
+              x => x - colsAsc[0] > outerPad && colsAsc[colsAsc.length - 1] - x > outerPad,
+            );
+            const isCrossed = (x: number) =>
+              titleBlocks.some((block: any) => block.x + margin < x && x < block.x + block.width - margin);
+            if (!interiorCols.every(isCrossed)) {
+              return group;
+            }
+
+            const newTop = rowBottom;
+            const isBelowNewTop = (item: any) => item.y + (item.height || 0) / 2 <= newTop;
+
+            group.rows = group.rows.filter((y: number) => y <= newTop + 1e-6);
+            group.coordinates = (group.coordinates || []).filter((block: any) => !titleBlocks.includes(block));
+            group.edges = (group.edges || []).filter(isBelowNewTop);
+            group.rectangles = (group.rectangles || []).filter(isBelowNewTop);
+            group.rectanglesEdges = (group.rectanglesEdges || []).filter(isBelowNewTop);
+            ['edgesRows', 'rectanglesRows', 'synthesizedRows'].forEach(key => {
+              if (Array.isArray(group[key])) {
+                group[key] = group[key].filter((y: number) => y <= newTop + 0.5);
+              }
+            });
+            group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: [...group.rows],
+              cols: group.cols || [],
+              lineMaxWidth,
+              separatorRows: group.synthesizedRows || [],
+            });
+
+            console.error('[TITLE ROW]', { removed: titleBlocks.map((block: any) => block.str), newTop });
+            return group;
+          }
+
+          /**
+           * Some producers draw cell shading line by line: every text line of a cell gets its own
+           * rectangle, plus narrow (~5 pt) "pad" rectangles on its sides. The seams between such
+           * pieces are not cell borders. A row boundary is a shading seam when
+           *   - no real (visible, thin) horizontal rule lies on it,
+           *   - same-coloured pieces touch each other there and at least one of them is a pad,
+           *   - it is not the only boundary separating two text blocks of one column.
+           * Seam rows are dropped so one visual row stays one grid row.
+           */
+          function removeFillSeamRows(group: any, lineMaxWidth: number): any {
+            if (!group?.rows?.length || group.rows.length < 5) {
+              return group;
+            }
+
+            const tolerance = 1.5;
+            const minPieceThickness = 3; // thinner fills are rules, not shading
+            const maxPadSize = lineMaxWidth * 1.3; // pads are ~5 pt wide
+
+            const fillPieces = [
+              ...(group.rectangles || []),
+              ...(group.edges || []).filter(
+                (edge: any) =>
+                  edge?.fillColor && !edge._isFakeLine && Math.min(edge.width, edge.height) >= minPieceThickness,
+              ),
+            ].filter(
+              (piece: any) => piece?.fillColor && isVisibleVector(piece) && piece.width > 0 && piece.height > 0,
+            );
+            if (!fillPieces.length) {
+              return group;
+            }
+
+            const ruleCenters: number[] = (group.edges || [])
+              .filter(
+                (edge: any) =>
+                  isVisibleVector(edge) &&
+                  !edge._isFakeLine &&
+                  edge.height < minPieceThickness &&
+                  edge.width > lineMaxWidth,
+              )
+              .map((edge: any) => edge.y + edge.height / 2);
+
+            const textBlocks = (group.coordinates || []).filter(
+              (block: any) =>
+                block?.str?.trim() && [block.x, block.y, block.width, block.height].every(Number.isFinite),
+            );
+            const rowsAsc = [...group.rows].sort((a, b) => a - b);
+
+            const hasRuleAt = (y: number) => ruleCenters.some(center => Math.abs(center - y) <= tolerance);
+
+            const isPad = (piece: any) => Math.min(piece.width, piece.height) <= maxPadSize;
+
+            // Middle pieces of a cell are not narrow themselves, but they are flanked by pads.
+            const hasPadNeighbour = (piece: any) =>
+              fillPieces.some(
+                (other: any) =>
+                  other !== piece &&
+                  isPad(other) &&
+                  isSameFillColor(other, piece) &&
+                  (Math.abs(other.x + other.width - piece.x) <= 0.3 ||
+                    Math.abs(piece.x + piece.width - other.x) <= 0.3) &&
+                  Math.min(other.y + other.height, piece.y + piece.height) - Math.max(other.y, piece.y) > 0,
+              );
+
+            const hasShadingSeamAt = (y: number) => {
+              const above = fillPieces.filter(
+                (piece: any) => Math.abs(piece.y - y) <= tolerance && piece.y + piece.height > y + tolerance,
+              );
+              const below = fillPieces.filter(
+                (piece: any) =>
+                  Math.abs(piece.y + piece.height - y) <= tolerance && piece.y < y - tolerance,
+              );
+              const touching = above.some((first: any) =>
+                below.some(
+                  (second: any) =>
+                    isSameFillColor(first, second) &&
+                    Math.min(first.x + first.width, second.x + second.width) - Math.max(first.x, second.x) > 0,
+                ),
+              );
+              if (!touching) {
+                return false;
+              }
+              return [...above, ...below].some((piece: any) => isPad(piece) || hasPadNeighbour(piece));
+            };
+
+            // y is the only boundary between two vertically adjacent text blocks of one column?
+            const separatesText = (y: number) => {
+              const above = textBlocks.filter((block: any) => block.y >= y - tolerance);
+              const below = textBlocks.filter((block: any) => block.y + block.height <= y + tolerance);
+              return above.some((upper: any) =>
+                below.some((lower: any) => {
+                  const overlap =
+                    Math.min(upper.x + upper.width, lower.x + lower.width) - Math.max(upper.x, lower.x);
+                  if (overlap <= 0) {
+                    return false;
+                  }
+                  const from = lower.y + lower.height - tolerance;
+                  const to = upper.y + tolerance;
+                  return !rowsAsc.some(row => Math.abs(row - y) > tolerance && row >= from && row <= to);
+                }),
+              );
+            };
+
+            const seamRows = rowsAsc
+              .slice(1, -1) // never touch the outer boundaries
+              .filter(y => !hasRuleAt(y) && hasShadingSeamAt(y) && !separatesText(y));
+            if (!seamRows.length) {
+              return group;
+            }
+
+            const isSeamValue = (value: number) => seamRows.some(y => Math.abs(y - value) <= tolerance);
+            group.rows = group.rows.filter((y: number) => !seamRows.includes(y));
+            ['edgesRows', 'rectanglesRows', 'synthesizedRows'].forEach(key => {
+              if (Array.isArray(group[key])) {
+                group[key] = group[key].filter((y: number) => !isSeamValue(y));
+              }
+            });
+            group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: [...group.rows],
+              cols: group.cols || [],
+              lineMaxWidth,
+              separatorRows: group.synthesizedRows || [],
+            });
+
+            console.error('[FILL SEAM ROWS]', { removed: seamRows.map(y => +y.toFixed(2)), rows: group.rows.length });
+            return group;
+          }
+
+          /**
+ * Per-line cell shading is drawn as a wide piece plus narrow (~5 pt) pads on its sides.
+ * The OUTER side of a pad lies on the real column boundary (it coincides with an end of a
+ * visible rule, i.e. with `edgesCols`); the INNER side is only a shading seam and must not
+ * become a column boundary.
+ */
+          function removeFillPadColumns(group: any, lineMaxWidth: number): any {
+            if (!group?.cols?.length || group.cols.length < 5) {
+              return group;
+            }
+
+            const minPieceThickness = 3;
+            const maxPadSize = lineMaxWidth * 1.3;
+            const sideTolerance = 0.8;
+            const strokeTolerance = 1.5;
+
+            const realCols: number[] = group.edgesCols || [];
+            if (!realCols.length) {
+              return group;
+            }
+            const isNearRealCol = (x: number) => realCols.some(real => Math.abs(real - x) <= strokeTolerance);
+
+            const fillPieces = [
+              ...(group.rectangles || []),
+              ...(group.edges || []).filter(
+                (edge: any) =>
+                  edge?.fillColor && !edge._isFakeLine && Math.min(edge.width, edge.height) >= minPieceThickness,
+              ),
+            ].filter(
+              (piece: any) => piece?.fillColor && isVisibleVector(piece) && piece.width > 0 && piece.height > 0,
+            );
+            if (!fillPieces.length) {
+              return group;
+            }
+
+            const innerSides: number[] = [];
+            fillPieces.forEach((pad: any) => {
+              const isVerticalPad =
+                pad.width >= minPieceThickness && pad.width <= maxPadSize && pad.height >= pad.width * 1.5;
+              if (!isVerticalPad) {
+                return;
+              }
+              fillPieces.forEach((main: any) => {
+                if (main === pad || main.width <= maxPadSize || !isSameFillColor(main, pad)) {
+                  return;
+                }
+                const overlapY = Math.min(pad.y + pad.height, main.y + main.height) - Math.max(pad.y, main.y);
+                if (overlapY <= 0) {
+                  return;
+                }
+                const mainOnRight = Math.abs(main.x - (pad.x + pad.width)) <= 0.3;
+                const mainOnLeft = Math.abs(main.x + main.width - pad.x) <= 0.3;
+                if (mainOnRight && isNearRealCol(pad.x)) {
+                  innerSides.push(pad.x + pad.width);
+                }
+                if (mainOnLeft && isNearRealCol(pad.x + pad.width)) {
+                  innerSides.push(pad.x);
+                }
+              });
+            });
+            if (!innerSides.length) {
+              return group;
+            }
+
+            const colsAsc = [...group.cols].sort((a, b) => a - b);
+            const removable = colsAsc
+              .slice(1, -1) // never touch the outer boundaries
+              .filter(x => !isNearRealCol(x) && innerSides.some(side => Math.abs(side - x) <= sideTolerance));
+            if (!removable.length) {
+              return group;
+            }
+
+            group.cols = group.cols.filter((x: number) => !removable.includes(x));
+            if (Array.isArray(group.rectanglesCols)) {
+              group.rectanglesCols = group.rectanglesCols.filter(
+                (x: number) => !removable.some(removed => Math.abs(removed - x) <= sideTolerance),
+              );
+            }
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: [...(group.rows || [])],
+              cols: group.cols || [],
+              lineMaxWidth,
+              separatorRows: group.synthesizedRows || [],
+            });
+
+            console.error('[PAD COLUMNS]', { removed: removable.map(x => +x.toFixed(2)), cols: group.cols.length });
+            return group;
           }
 
           function trimUnsupportedTrailingRows(group, lineMaxWidth) {
@@ -7842,6 +8365,9 @@ export function init({
             tableGroups = tableGroups.map(group => extendGroupTopBorder(group, pageGroups[0], lineMaxWidth));
             tableGroups = tableGroups.map(group => extendGroupBottomRow(group, pageGroups[0], lineMaxWidth));
             tableGroups = tableGroups.map(group => trimUnsupportedTrailingRows(group, lineMaxWidth));//!BUG fpdf_example-1.pdf (the last row of the table is missing)
+            tableGroups = tableGroups.map(group => trimFullWidthTitleRow(group, lineMaxWidth));
+            tableGroups = tableGroups.map(group => removeFillSeamRows(group, lineMaxWidth));
+            tableGroups = tableGroups.map(group => removeFillPadColumns(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => refineTextOnlyTopRows(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => rebuildUnseparatedRows(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => applyLeaderRowBoundaries(group));
@@ -10848,46 +11374,10 @@ export function init({
           },[])
           */
 
-          const m27Pattern =
-            /LICENSE|NUMBER|632426|ALPHABETIC|PREMISE|FRESCOS|19 INC|604941/i;
-
-          const m27ItemInfo = (item: any) => ({
-            index: item.index,
-            str: item.str,
-            x: item.x ?? item.transform?.[4],
-            y: item.y ?? item.transform?.[5],
-            width: item.width,
-            height: item.height,
-            hasEOT: item.hasEOT,
-            hasEOL: item.hasEOL,
-            chars: (item.chars || []).map((ch: any) => ({
-              unicode: ch.unicode,
-              fontChar: ch.fontChar,
-              charWidth: ch.charWidth,
-              width: ch.width,
-              x: ch.x,
-              transform: ch.transform,
-            })),
-          });
-
-          console.error(
-            '[M27 RAW TEXT]',
-            tableContentItems
-              .filter((item: any) => m27Pattern.test(item?.str || ''))
-              .map(m27ItemInfo)
-          );
 
           //Extracting text coordinates
           let coordinates = extractCoordinates(tableContentItems);
 
-          console.error(
-            '[M27 EXTRACTED TEXT]',
-            coordinates
-              .filter((item: any) => m27Pattern.test(item?.str || ''))
-              .map(m27ItemInfo)
-          );
-
-          console.error('[M27 COLUMN BORDERS]', pageColumnBorders);
 
           console.error(`[DEBUG Page ${pageNum}] coordinates:`, coordinates.length);
           if (coordinates.length > 0) {
@@ -11211,6 +11701,291 @@ export function init({
                 });
                 console.error('[HEADER ROW SPAN]', { col, rows: textRow + 1 });
               }
+            }
+
+            /**
+ * Spanning header cells ("Revenue" over two sub-columns, "States-A" over two header rows) are
+ * normally recovered from the grid lines. When the lines survive, the cells stay unmerged and an
+ * empty cell remains next to the text. This step derives the spans from the text itself and
+ * only touches cells that the matrix left unmerged.
+ *   colspan: the VISIBLE text crosses a column boundary and the cells it covers are empty
+ *            and not separated by a real vertical rule;
+ *   rowspan: the cell below a header cell is empty and no real horizontal rule separates them.
+ */
+            function inferHeaderSpansFromText(options: {
+              tableGroup: any;
+              verticles: any[];
+              horizons: any[];
+              merges: Record<string, any>;
+              mergeAlias: Record<string, string>;
+              lineMaxWidth: number;
+            }): void {
+              const { tableGroup, verticles, horizons, merges, mergeAlias, lineMaxWidth } = options;
+              const rowsCount = horizons.length - 1;
+              const colsCount = verticles.length - 1;
+              const early = (reason: string, extra?: any) =>
+                console.error('[HEADER SPANS]', { status: 'skipped', reason, ...extra });
+
+              if (!tableGroup?.headerRows || rowsCount < 2 || colsCount < 2) {
+                early('no headerRows or grid too small', {
+                  headerRows: Object.keys(tableGroup?.headerRows || {}),
+                });
+                return;
+              }
+
+              const minRuleThickness = 3;
+              const tolerance = 1.5;
+              const tableWidth = verticles[colsCount].x - verticles[0].x;
+
+              const isNumericLike = (text: string) =>
+                /^[-+]?\d{1,3}(?:[,\s]\d{3})+(?:.\d+)?$|^[-+]?\d+[.,]\d+$/.test(text.trim());
+              const isDataRow = (blocks: any[]) => {
+                const texts = (blocks || []).map((b: any) => String(b?.str || '').trim()).filter(Boolean);
+                return texts.length > 0 && texts.filter(isNumericLike).length * 2 > texts.length;
+              };
+
+              const ranges = Object.keys(tableGroup.headerRows)
+                .map((key) => {
+                  const match = /^(-?\d+(?:\.\d+)?)-(-?\d+(?:\.\d+)?)$/.exec(key);
+                  if (!match) return null;
+                  const first = Number(match[1]);
+                  const second = Number(match[2]);
+                  return {
+                    top: Math.max(first, second),
+                    bottom: Math.min(first, second),
+                    blocks: tableGroup.headerRows[key],
+                  };
+                })
+                .filter(Boolean)
+                .sort((a: any, b: any) => b.top - a.top);
+
+              if (!ranges.length) {
+                early('no parseable ranges');
+                return;
+              }
+
+              // The anchor of the chain is the top of the FIRST range, not horizons[0].y:
+              // headerRows could have been calculated based on a grid different from the final one (trim passes,
+              // removeFillPadColumns), so horizons[0] does not necessarily coincide with the top of the header.
+              const firstTop = ranges[0].top;
+              let chainEdge = firstTop;
+              let rangeCount = 0;
+              for (const range of ranges as any[]) {
+                if (isDataRow(range.blocks)) break;
+                if (rangeCount > 0 && Math.abs(range.top - chainEdge) > lineMaxWidth) break;
+                chainEdge = range.bottom;
+                rangeCount++;
+              }
+              if (!rangeCount) {
+                early('all leading ranges look like data rows', { tops: ranges.map((r: any) => r.top) });
+                return;
+              }
+
+              // Number of header rows—based on the geometry: grid lines intersecting [chainEdge, firstTop].
+              const headerRowCount = horizons.slice(0, -1).filter(
+                (h: any, i: number) =>
+                  h.y > chainEdge + lineMaxWidth && horizons[i + 1].y <= firstTop + lineMaxWidth
+              ).length;
+              if (!headerRowCount) {
+                early('no grid rows intersect the header span', { firstTop, chainEdge });
+                return;
+              }
+
+              const findColumn = (x: number): number => {
+                for (let col = 0; col < colsCount; col++) {
+                  if (x >= verticles[col].x && x < verticles[col + 1].x) return col;
+                }
+                return -1;
+              };
+              const findRow = (y: number): number => {
+                for (let row = 0; row < rowsCount; row++) {
+                  if (y <= horizons[row].y && y > horizons[row + 1].y) return row;
+                }
+                return -1;
+              };
+              const getVisibleExtent = (block: any) => {
+                const glyphs = (block.chars || []).filter(
+                  (glyph: any) =>
+                    glyph &&
+                    typeof glyph === 'object' &&
+                    typeof glyph.unicode === 'string' &&
+                    glyph.unicode.trim() &&
+                    Number.isFinite(glyph.x) &&
+                    Number.isFinite(glyph.charWidth)
+                );
+                if (!glyphs.length) return { left: block.x, right: block.x + block.width };
+                return {
+                  left: Math.min(...glyphs.map((g: any) => g.x)),
+                  right: Math.max(...glyphs.map((g: any) => g.x + g.charWidth)),
+                };
+              };
+
+              // Actual color rules—one segment per header cell.
+              const rules = (tableGroup.edges || [])
+                .filter(
+                  (edge: any) =>
+                    hasVectorColor(edge) &&
+                    !edge._isFakeLine &&
+                    edge.height < minRuleThickness &&
+                    edge.width > lineMaxWidth
+                )
+                .map((edge: any) => ({ y: edge.y + edge.height / 2, from: edge.x, to: edge.x + edge.width }));
+
+              const horizontalRuleCoverage = (boundaryY: number, left: number, right: number): number => {
+                let covered = 0;
+                rules.forEach((rule: any) => {
+                  if (Math.abs(rule.y - boundaryY) > tolerance) return;
+                  covered += Math.max(0, Math.min(rule.to, right) - Math.max(rule.from, left));
+                });
+                return covered / Math.max(right - left, 1);
+              };
+
+              const textBlocks = (tableGroup.coordinates || [])
+                .filter((block: any) => block?.str?.trim() && Number.isFinite(block.y))
+                .map((block: any) => {
+                  const extent = getVisibleExtent(block);
+                  const colFrom = findColumn(extent.left + 0.01);
+                  const colTo = findColumn(extent.right - 0.5);
+                  return {
+                    text: String(block.str).trim().slice(0, 24),
+                    row: findRow(Number(block.y)),
+                    colFrom,
+                    colTo: colTo >= 0 ? colTo : colFrom,
+                    right: extent.right,
+                    left: extent.left,
+                  };
+                })
+                .filter((info: any) => info.row >= 0 && info.row < headerRowCount && info.colFrom >= 0);
+
+              const rootOf = (key: string) => mergeAlias[key] || key;
+              const textRoots = new Set<string>(
+                textBlocks.map((info: any) => rootOf(`${info.row}-${info.colFrom}`))
+              );
+              const isFree = (key: string) => !mergeAlias[key] && !merges[key] && !textRoots.has(key);
+
+              const createMerge = (rowStart: number, rowEnd: number, colStart: number, colEnd: number) => {
+                const rootKey = `${rowStart}-${colStart}`;
+                if (merges[rootKey] || mergeAlias[rootKey]) return false;
+                const arr: string[] = [];
+                for (let row = rowStart; row < rowEnd; row++) {
+                  for (let col = colStart; col < colEnd; col++) {
+                    const key = `${row}-${col}`;
+                    if (mergeAlias[key] || (merges[key] && key !== rootKey)) return false;
+                    arr.push(key);
+                  }
+                }
+                const widthArr: string[] = [];
+                for (let col = colStart; col < colEnd; col++) widthArr.push(`${rowStart}-${col}`);
+                const heightArr: string[] = [];
+                for (let row = rowStart; row < rowEnd; row++) heightArr.push(`${row}-${colStart}`);
+                merges[rootKey] = {
+                  row: rowStart, col: colStart, arr, widthArr, heightArr,
+                  width: colEnd - colStart, height: rowEnd - rowStart,
+                };
+                arr.forEach((key) => { if (key !== rootKey) mergeAlias[key] = rootKey; });
+                return true;
+              };
+
+              const created: Array<{ root: string; rows: number; cols: number; kind: string }> = [];
+              const candidates: any[] = [];
+
+              // Colspan
+              const seen = new Set<string>();
+              textBlocks.forEach((info: any) => {
+                const rootKey = `${info.row}-${info.colFrom}`;
+                if (seen.has(rootKey)) return;
+                seen.add(rootKey);
+                if (mergeAlias[rootKey] || (merges[rootKey]?.width || 1) > 1) {
+                  candidates.push({ cell: rootKey, text: info.text, result: 'already merged' });
+                  return;
+                }
+                // [FIX 3] Полноширинный блок (title/caption) не объединяем.
+                if (info.right - verticles[info.colFrom].x >= tableWidth * 0.9) {
+                  candidates.push({ cell: rootKey, text: info.text, result: 'full-width block, skipped' });
+                  return;
+                }
+
+                const cellLeft = verticles[info.colFrom].x;
+                const rowTopY = horizons[info.row].y;
+                const segment = rules.find(
+                  (rule: any) =>
+                    Math.abs(rule.y - rowTopY) <= tolerance &&
+                    Math.abs(rule.from - cellLeft) <= tolerance &&
+                    rule.to - rule.from < tableWidth * 0.9
+                );
+                let ruleEndCol = info.colFrom;
+                if (segment) {
+                  for (let col = info.colFrom + 1; col < colsCount; col++) {
+                    if (verticles[col + 1].x <= segment.to + tolerance) ruleEndCol = col;
+                    else break;
+                  }
+                }
+                const textEndCol = info.right - verticles[info.colTo].x >= 1.5 ? info.colTo : info.colFrom;
+                const endCol = Math.max(ruleEndCol, textEndCol);
+
+                const entry: any = {
+                  cell: rootKey, text: info.text, colFrom: info.colFrom,
+                  ruleEndCol, textEndCol, textRight: +info.right.toFixed(2),
+                  segment: segment ? [+segment.from.toFixed(2), +segment.to.toFixed(2)] : null,
+                };
+                if (endCol <= info.colFrom) {
+                  candidates.push({ ...entry, result: 'single column' });
+                  return;
+                }
+                for (let col = info.colFrom + 1; col <= endCol; col++) {
+                  if (!isFree(`${info.row}-${col}`)) {
+                    candidates.push({ ...entry, result: `blocked by ${info.row}-${col}` });
+                    return;
+                  }
+                }
+                if (createMerge(info.row, info.row + 1, info.colFrom, endCol + 1)) {
+                  created.push({ root: rootKey, rows: 1, cols: endCol - info.colFrom + 1, kind: 'colspan' });
+                  candidates.push({ ...entry, result: 'colspan created' });
+                } else {
+                  candidates.push({ ...entry, result: 'createMerge refused' });
+                }
+              });
+
+              // Rowspan — can EXTEND existing merge matrices downward.
+              // Without this, “Capital” (691.08) and the phantom row 700.2 would remain outside,
+              // and the rowspan of the header cells would be one row shorter.
+              Array.from(textRoots).forEach((key) => {
+                const [row, col] = key.split('-').map(Number);
+                if (!(row >= 0 && row < headerRowCount - 1)) return;
+                if (mergeAlias[key]) return;
+                const existing = merges[key];
+                const width = existing?.width || 1;
+                const currentEnd = row + (existing?.height || 1);
+                let endRow = currentEnd;
+                while (endRow < headerRowCount) {
+                  let free = true;
+                  for (let c = col; c < col + width; c++) free = free && isFree(`${endRow}-${c}`);
+                  if (
+                    !free ||
+                    horizontalRuleCoverage(horizons[endRow].y, verticles[col].x, verticles[col + width].x) >= 0.5
+                  ) {
+                    break;
+                  }
+                  endRow++;
+                }
+                if (endRow <= currentEnd) return;
+                if (existing) {
+                  for (let r = currentEnd; r < endRow; r++) {
+                    for (let c = col; c < col + width; c++) {
+                      const cellKey = `${r}-${c}`;
+                      existing.arr.push(cellKey);
+                      mergeAlias[cellKey] = key;
+                    }
+                    existing.heightArr.push(`${r}-${col}`);
+                  }
+                  existing.height = endRow - row;
+                  created.push({ root: key, rows: existing.height, cols: width, kind: 'rowspan-extended' });
+                } else if (createMerge(row, endRow, col, col + width)) {
+                  created.push({ root: key, rows: endRow - row, cols: width, kind: 'rowspan' });
+                }
+              });
+
+              console.error('[HEADER SPANS]', { headerRowCount, created, candidates });
             }
 
             function inferMergesFromFillRectangles(options: {
@@ -12047,6 +12822,28 @@ export function init({
               let xList = verticles.map(function (a) { return a.x; });
               var yList = horizons.map(function (a) { return a.y; });
 
+              const headerSegments = (tableGroup.edges || [])
+                .filter((edge: any) =>
+                  hasVectorColor(edge) &&
+                  !edge._isFakeLine &&
+                  edge.height < 3 &&
+                  edge.width > lineMaxWidth &&
+                  Math.abs(edge.y + edge.height / 2 - yList[0]) <= 1.5
+                )
+                .map((edge: any) => ({
+                  left: edge.x,
+                  right: edge.x + edge.width,
+                }));
+
+              const hasHeaderSegmentBoundary = (x: number) => {
+                const tolerance = 1.5;
+
+                return (
+                  headerSegments.some(segment => Math.abs(segment.right - x) <= tolerance) &&
+                  headerSegments.some(segment => Math.abs(segment.left - x) <= tolerance)
+                );
+              };
+
               // Create a matrix 1 larger in width and height for correct border processing
               const matrix = Array.from({ length: yList.length * 2 - 1 }, () =>
                 Array(xList.length * 2 - 1).fill(0)
@@ -12093,7 +12890,10 @@ export function init({
                       if (isVerticleBorder && isHorizonBorder) { //horizontal and vertical border
                         return Number(hCondition || vCondition);
                       } else if (isVerticleBorder && !isHorizonBorder) {
-                        return Number(vCondition);
+                        return Number(
+                          vCondition ||
+                          (horizonIndex === 0 && hasHeaderSegmentBoundary(currentVerticle.x))
+                        );
                       } else if (!isVerticleBorder && isHorizonBorder) {
                         return Number(hCondition);
                       } else {
@@ -12423,6 +13223,30 @@ export function init({
               lineMaxWidth
             });
 
+            console.error('[HEADER MERGES BEFORE]', {
+              merges: JSON.parse(JSON.stringify(matrixData.merges)),
+              mergeAlias: { ...matrixData.mergeAlias },
+              headerRows: tableGroup.headerRows,
+              grid: {
+                x: verticles.map((item: any) => item.x),
+                y: horizons.map((item: any) => item.y),
+              },
+            });
+
+            inferHeaderSpansFromText({
+              tableGroup,
+              verticles,
+              horizons,
+              merges: matrixData.merges,
+              mergeAlias: matrixData.mergeAlias,
+              lineMaxWidth,
+            });
+
+            console.error('[HEADER MERGES AFTER VALIDATION]', {
+              merges: JSON.parse(JSON.stringify(matrixData.merges)),
+              mergeAlias: { ...matrixData.mergeAlias },
+            });
+
             validateColumnMerges({
               merges: matrixData.merges,
               mergeAlias: matrixData.mergeAlias,
@@ -12523,6 +13347,9 @@ export function init({
                 json: null,
               }
               const tablePos = Array.from({ length: rowsCount }, () => Array(colsCount).fill(null));
+              // Columns where text PHYSICALLY lies. The text of a merged cell is stored in the merge root,
+              // which may be a narrow pad column; that must not keep the pad column visible.
+              const physicalTextColumns = new Set<number>();
 
               // ===== DIAGNOSTICS: try-catch with precise location =====
               try {
@@ -12533,9 +13360,27 @@ export function init({
                   if (superscriptBlocks.has(item)) {
                     continue;
                   }
-                  const x = item.transform[4];
                   const y = item.transform[5];
-
+                  // A block can start with a whitespace glyph standing far left of the first letter
+                  // (" Total": the space is at x=501.6, the word at x=535.2). Place the block by the
+                  // left edge of its VISIBLE text, otherwise it falls into the previous column.
+                  const transform = item.transform;
+                  const isHorizontal =
+                    Math.abs(transform[1]) <= Math.abs(transform[0]) * 0.2 &&
+                    Math.abs(transform[2]) <= Math.abs(transform[3]) * 0.2;
+                  const visibleGlyphXs = isHorizontal
+                    ? (item.chars || [])
+                      .filter(
+                        (glyph: any) =>
+                          glyph &&
+                          typeof glyph === 'object' &&
+                          typeof glyph.unicode === 'string' &&
+                          glyph.unicode.trim() &&
+                          Number.isFinite(glyph.x),
+                      )
+                      .map((glyph: any) => glyph.x)
+                    : [];
+                  const x = visibleGlyphXs.length ? Math.min(...visibleGlyphXs) : transform[4];
                   // Looking for the column
                   // Column boundaries are averaged values of several actual lines and may be
                   // shifted by ~1pt from the actual line. Text that starts slightly to the left of the border
@@ -12631,6 +13476,7 @@ export function init({
 
                   // Follow alias chains to the visible root cell, so that text is never
                   // stored in a hidden alias cell.
+                  physicalTextColumns.add(col);
                   let aliasCellKey = `${row}-${col}`;
                   for (let guard = 0; mergeAlias[aliasCellKey] && guard < 32; guard++) {
                     aliasCellKey = mergeAlias[aliasCellKey];
@@ -12925,8 +13771,18 @@ export function init({
               const topHeaderRowCount = (() => {
                 const tolerance = lineMaxWidth;
 
+                // Grouped ("47,824,589") or decimal ("12.5") numbers: a row mostly made of them is data.
+                const isNumericLike = (text: string) =>
+                  /^[-+]?\d{1,3}(?:[,\s]\d{3})+(?:\.\d+)?$|^[-+]?\d+[.,]\d+$/.test(text.trim());
+                const isDataRow = (blocks: any[]) => {
+                  const texts = (blocks || [])
+                    .map(block => String(block?.str || '').trim())
+                    .filter(Boolean);
+                  return texts.length > 0 && texts.filter(isNumericLike).length * 2 > texts.length;
+                };
+
                 const ranges = Object.keys(headerRows)
-                  .map((key) => {
+                  .map(key => {
                     const match = /^(-?\d+(?:\.\d+)?)-(-?\d+(?:\.\d+)?)$/.exec(key);
                     if (!match) {
                       return null;
@@ -12936,6 +13792,7 @@ export function init({
                     return {
                       top: Math.max(first, second),
                       bottom: Math.min(first, second),
+                      blocks: headerRows[key],
                     };
                   })
                   .filter(Boolean)
@@ -12943,17 +13800,27 @@ export function init({
 
                 let chainEdge = horizons[0]?.y;
                 let count = 0;
-
                 for (const range of ranges) {
                   if (!Number.isFinite(chainEdge) || Math.abs(range.top - chainEdge) > tolerance) {
+                    break;
+                  }
+                  if (isDataRow(range.blocks)) {
                     break;
                   }
                   chainEdge = range.bottom;
                   count++;
                 }
 
-                return count;
+                // `count` is the number of header RANGES, measured on group rows. The grid can have fewer
+                // rows than that: horizon clustering merges boundaries closer than lineMaxWidth.
+                // Never report more header rows than the grid rows that start above the end of the chain.
+                const gridRowsInChain = horizons
+                  .slice(0, -1)
+                  .filter((horizon: any) => horizon.y > chainEdge + tolerance).length;
+
+                return Math.min(count, gridRowsInChain);
               })();
+
 
               console.error('[M27 FINAL STRUCTURE]', {
                 headerRows,
@@ -12992,7 +13859,7 @@ export function init({
               if (COLLAPSE_GUTTER_COLUMNS && modalTextHeight > 0) {
                 for (let c = 1; c < colsCount - 1; c++) {
                   const width = verticles[c + 1].x - verticles[c].x;
-                  const isEmpty = table.array.every(row => !(row[c]?.str || '').trim());
+                  const isEmpty = !physicalTextColumns.has(c); //old:table.array.every(row => !(row[c]?.str || '').trim());
                   if (width <= modalTextHeight * 1.2 && isEmpty) {
                     gutterColumns.add(c);
                   }
@@ -13313,6 +14180,9 @@ export function init({
                   }
 
                   function pickSideColor(colors: Array<string | null>): string | null {
+                    if (!colors?.length) {
+                      return null;
+                    }
                     const weights: Record<string, number> = {};
                     colors.forEach(color => {
                       if (color) weights[color] = (weights[color] || 0) + 1;
@@ -13473,10 +14343,10 @@ export function init({
                       const rowSpan = mergeInfo ? mergeInfo.height : 1;
                       const colSpan = mergeInfo ? mergeInfo.width : 1;
 
-                      cellBorders.top = pickSideColor(horizontalPlan[r].slice(c, c + colSpan));
-                      cellBorders.bottom = pickSideColor(horizontalPlan[r + rowSpan].slice(c, c + colSpan));
-                      cellBorders.left = pickSideColor(verticalPlan[c].slice(r, r + rowSpan));
-                      cellBorders.right = pickSideColor(verticalPlan[c + colSpan].slice(r, r + rowSpan));
+                      cellBorders.top = pickSideColor(horizontalPlan[r]?.slice(c, c + colSpan));
+                      cellBorders.bottom = pickSideColor(horizontalPlan[r + rowSpan]?.slice(c, c + colSpan));
+                      cellBorders.left = pickSideColor(verticalPlan[c]?.slice(r, r + rowSpan));
+                      cellBorders.right = pickSideColor(verticalPlan[c + colSpan]?.slice(r, r + rowSpan));
                       let borderStyle = '';
                       if (cellBorders.top) borderStyle += `border-top: 1px solid ${cellBorders.top};`;
                       if (cellBorders.right) borderStyle += `border-right: 1px solid ${cellBorders.right};`;
@@ -13651,12 +14521,14 @@ export function init({
               lineMaxWidth: lineMaxWidth,
               rectangles: tableGroup.rectangles,
             });
-            const hasText = tableData.table.array.some(row =>
-              row.some(cell => (cell?.str || '').trim().length > 0)
-            );
+
+            // A table needs at least a header and one body row: a single line of text is not a table.
+            const nonEmptyRows = tableData.table.array.filter(row =>
+              row.some(cell => (cell?.str || '').trim().length > 0),
+            ).length;
 
             // A grid without any text is a decoration (a filled box, a frame, shadows), not a table
-            if (tableData.table.array.length && hasText) {
+            if (tableData.table.array.length && nonEmptyRows >= 2) {
               tableGroup.tableData = tableData;
             }
           }

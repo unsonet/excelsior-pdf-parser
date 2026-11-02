@@ -193,3 +193,66 @@ export function calculateToleranceValue(coordinates) {
 
     return averageDistance;
 }
+
+/**
+ * Pairs of adjacent grid lines that coincide with the edges of a narrow fill strip
+ * (a decorative cell fill-edge, ~5pt wide) are merged into a single line.
+ * Actual lines with a gap of 5–8pt are not merged by `mergeCoordinates` (threshold = `lineMaxWidth`),
+ * which causes each strip to generate a phantom column/row.
+ */
+export function collapseStripGridLines(
+    lines: number[],
+    rectangles: any[],
+    edges: any[],
+    lineMaxWidth: number,
+    axis: 'x' | 'y'
+): number[] {
+    const minGap = lineMaxWidth + 0.01;   // уже должны были смержиться
+    const maxGap = lineMaxWidth * 1.6;    // 8 при lineMaxWidth = 5
+    const visibleEdges = (edges || []).filter((edge: any) => isVisibleVector(edge));
+    const distToStroke = (value: number): number => {
+        let best = Infinity;
+        for (const edge of visibleEdges) {
+            const axisValue = axis === 'x' ? edge.x : edge.y;
+            const perpendicular = axis === 'x' ? edge.height : edge.width;
+            if (perpendicular > lineMaxWidth * 1.5) continue; // fill, not a line
+            best = Math.min(best, Math.abs(axisValue - value));
+        }
+        return best;
+    };
+    const fillRects = (rectangles || []).filter(
+        (rect: any) => rect?.fillColor && isVisibleVector(rect)
+    );
+    const sorted = [...new Set(lines.filter(Number.isFinite))].sort((a, b) => a - b);
+    const removed = new Set<number>();
+    for (let i = 0; i < sorted.length - 1; i++) {
+        const first = sorted[i];
+        const second = sorted[i + 1];
+        if (removed.has(first)) continue;
+        const gap = second - first;
+        if (gap <= minGap || gap > maxGap) continue;
+        const isStripEdgePair = fillRects.some((rect: any) => {
+            const start = axis === 'x'
+                ? Math.min(rect.x, rect.x + rect.width)
+                : Math.min(rect.y, rect.y + rect.height);
+            const end = axis === 'x'
+                ? Math.max(rect.x, rect.x + rect.width)
+                : Math.max(rect.y, rect.y + rect.height);
+            const stripThickness = axis === 'x' ? Math.abs(rect.width) : Math.abs(rect.height);
+            if (stripThickness > maxGap) return false;
+            return Math.abs(start - first) <= 0.8 && Math.abs(end - second) <= 0.8;
+        });
+        if (!isStripEdgePair) continue;
+        // Keep the line closest to the actual stroke (158.561 > 152.039; 514.919 > 520.32)
+        const keepFirst = distToStroke(first) <= distToStroke(second) - 0.01;
+        removed.add(keepFirst ? second : first);
+    }
+    const result = sorted.filter((value) => !removed.has(value));
+    if (result.length !== sorted.length) {
+        console.error('[STRIP LINES COLLAPSED]', {
+            axis,
+            removed: sorted.filter((v) => removed.has(v)).map((v) => +v.toFixed(2)),
+        });
+    }
+    return result.length >= 2 ? result : sorted;
+}
