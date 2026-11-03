@@ -5022,9 +5022,49 @@ export function init({
                 continue;
               }
 
-              const cutMap = new Map<number, number>(); // sourceIndex -> geometric X
+
+              const cutMap = new Map<number, number>();// sourceIndex -> geometric X
               for (const boundary of info.innerStarts) {
-                if (isColumnStart(boundary.x)) cutMap.set(boundary.sourceIndex, boundary.x);
+                if (isColumnStart(boundary.x)) {
+                  cutMap.set(boundary.sourceIndex, boundary.x);
+                }
+              }
+
+              // A word that starts exactly on a column start right after ONE space ("... GRILL 19 INC").
+              // No gap is wide enough to be recorded in innerStarts, yet the text visibly continues in
+              // the next column. The cut is made only when the column start is already confirmed by
+              // other rows (isColumnStart) and the glyph before the space is a visible one.
+              const isVisibleRef = (ref: any) => !!ref.glyph.unicode.trim();
+              for (let glyphIndex = 2; glyphIndex < info.glyphs.length; glyphIndex++) {
+                const current = info.glyphs[glyphIndex];
+                const space = info.glyphs[glyphIndex - 1];
+                const before = info.glyphs[glyphIndex - 2];
+
+                if (!isVisibleRef(current) || isVisibleRef(space) || !isVisibleRef(before)) {
+                  continue;
+                }
+                if (space.glyph.isLineBreak || space.glyph.unicode === '\n') {
+                  continue;
+                }
+                if (!isColumnStart(current.glyph.x)) {
+                  continue;
+                }
+                if (
+                  Number.isFinite(current.glyph.y) &&
+                  Number.isFinite(before.glyph.y) &&
+                  Math.abs(current.glyph.y - before.glyph.y) > BASELINE_TOLERANCE
+                ) {
+                  continue;
+                }
+                if (isLeaderGlyph(current.glyph) && isLeaderGlyph(before.glyph)) {
+                  continue;
+                }
+
+                cutMap.set(current.sourceIndex, current.glyph.x);
+                console.error('[SINGLE-SPACE COLUMN CUT]', {
+                  text: String(item.str).trim().slice(0, 40),
+                  x: +current.glyph.x.toFixed(2),
+                });
               }
 
               // A source text item can encode different cells separated by a PDF line move.
@@ -5132,28 +5172,39 @@ export function init({
 
             const sortedStarts = [...starts].sort((a, b) => a.x - b.x);
             const extents = result.map(getExtent);
-            pageColumnBorders = sortedStarts.map((start, index) => {
-              const previousStart = index > 0 ? sortedStarts[index - 1].x : -Infinity;
-              let previousRight = -Infinity;
 
-              extents.forEach(extent => {
-                if (
-                  extent &&
-                  extent.left >= previousStart - START_TOLERANCE &&
-                  extent.left < start.x - START_TOLERANCE &&
-                  extent.right <= start.x + START_TOLERANCE
-                ) {
-                  previousRight = Math.max(previousRight, extent.right);
-                }
-              });
+            pageColumnBorders = sortedStarts
+              .map((start, index) => {
+                const previousStart = index > 0 ? sortedStarts[index - 1].x : -Infinity;
+                let previousRight = -Infinity;
 
-              const limit = start.x - 0.3;
-              return {
-                x: Number.isFinite(previousRight) ? Math.min(limit, previousRight + 0.3) : limit,
-                yFrom: start.yFrom,
-                yTo: start.yTo,
-              };
-            });
+                extents.forEach(extent => {
+                  if (!extent) {
+                    return;
+                  }
+                  if (!(extent.left < start.x - START_TOLERANCE && extent.right <= start.x + START_TOLERANCE)) {
+                    return;
+                  }
+                  // Text of the previous column. A header is usually centred over its column, so it may begin
+                  // LEFT of the column start (the data below) and still end inside the column: it belongs here too.
+                  const startsInColumn = extent.left >= previousStart - START_TOLERANCE;
+                  const endsInColumn = extent.right > previousStart + START_TOLERANCE;
+                  if (startsInColumn || endsInColumn) {
+                    previousRight = Math.max(previousRight, extent.right);
+                  }
+                });
+
+                const limit = start.x - 0.3;
+                return {
+                  x: Number.isFinite(previousRight) ? Math.min(limit, previousRight + 0.3) : limit,
+                  hasContentOnTheLeft: Number.isFinite(previousRight),
+                  yFrom: start.yFrom,
+                  yTo: start.yTo,
+                };
+              })
+              // Nothing lies left of the first column start: the table edge is its border, not a column boundary.
+              .filter((border, index) => index > 0 || border.hasContentOnTheLeft)
+              .map(({ x, yFrom, yTo }) => ({ x, yFrom, yTo }));
 
             console.error('[COLUMN BORDERS]', pageColumnBorders.map(border => +border.x.toFixed(1)));
             return result;
@@ -6065,7 +6116,7 @@ export function init({
                   'y': range.map((r, i) => (i == 0 ? r - rangeMargin : r + rangeMargin)),
                   strictIntersecting: true
                 });
-                console.error('[HEADER ROW TRACE] range', range.join('-'), 'textBlocks:', textBlocks.map(tb => tb.str));
+                console.error('[HEADER ROW TRACE] range', range.join('-').replace(/(?<=\.\d{3,})\d+/gim, ''), 'textBlocks:', textBlocks.map(tb => tb.str));
 
                 // GUARD: single-block line at the edge of the table = caption?
                 if (textBlocks.length === 1 && edges?.length) {
@@ -6302,11 +6353,40 @@ export function init({
 
                     // A row boundary synthesized from a full-width text gap separates this row
                     // from the one below as reliably as a drawn line, even though no line exists.
-                    if (
-                      !hasBottomBorder &&
-                      separatorRows.some(y => Math.abs(y - range[1]) < 0.01)
-                    ) {
+                    if (!hasBottomBorder && separatorRows.some(y => Math.abs(y - range[1]) < 0.01)) {
                       hasBottomBorder = true;
+                    }
+
+                    // Text-only table: no visible rule or fill anywhere in the group, so a header has nothing to
+                    // rest on. The topmost range counts as a header when ALL hold:
+                    //   - it has at least 3 blocks and its font/colour differs from the body's dominant one;
+                    //   - at least 3 of the following ranges are populated and their typical block count
+                    //     (median) is not smaller than 80% of the header's, i.e. the body has the same columns.
+                    // A page of plain text (uniform style, few blocks per line) does not pass this.
+                    if (!hasBottomBorder && index === 0 && textBlocks.length >= 3 && arr.length >= 5) {
+                      const hasVisibleVectors = [...(edges || []), ...(rectangles || [])].some(vector =>
+                        isVisibleVector(vector),
+                      );
+                      const differsFromBody = ['fontName', 'fillColor', 'strokeColor'].some(
+                        prop => modeProperties[prop] !== undefined && textBlock?.[prop] !== modeProperties[prop],
+                      );
+
+                      if (!hasVisibleVectors && differsFromBody) {
+                        const bodyBlockCounts: number[] = [];
+                        for (let next = 1; next < Math.min(arr.length - 1, 13); next++) {
+                          bodyBlockCounts.push(
+                            coordinates.filter(
+                              (block: any) => block?.str?.trim() && block.y <= arr[next] && block.y > arr[next + 1],
+                            ).length,
+                          );
+                        }
+                        const populated = bodyBlockCounts.filter(count => count > 0).sort((a, b) => a - b);
+                        const median = populated[Math.floor(populated.length / 2)] || 0;
+
+                        if (populated.length >= 3 && median >= textBlocks.length * 0.8) {
+                          hasBottomBorder = true;
+                        }
+                      }
                     }
                     if (range && range[0] >= 408 && range[0] <= 431) {
                       console.error('[HASBOTTOMBORDER TRACE]', {
@@ -6686,6 +6766,70 @@ export function init({
             });
 
             console.error('[PAD COLUMNS]', { removed: removable.map(x => +x.toFixed(2)), cols: group.cols.length });
+            return group;
+          }
+
+          /**
+ * Text-only table (no visible rules, no fills). A band between two row boundaries that is
+ * thinner than a text line and holds no text is a gap, not a row: e.g. the white space between
+ * a multi-line header and the first body line. The text of a multi-line cell stands on the
+ * UPPER boundary of such a gap (its lowest baseline) and is assigned to the band below, so the
+ * header splits into two rows. Removing the upper boundary attaches the gap to the band above.
+ */
+          function absorbThinEmptyBands(group: any, lineMaxWidth: number): any {
+            if (!group?.rows?.length || group.rows.length < 5) {
+              return group;
+            }
+            // Rules or fills exist: the boundaries are drawn, leave them alone.
+            if ((group.edgesRows || []).length || (group.rectanglesRows || []).length) {
+              return group;
+            }
+
+            const textBlocks = (group.coordinates || []).filter(
+              (block: any) =>
+                block?.str?.trim() && Number.isFinite(block.y) && Number.isFinite(block.height),
+            );
+            const modalTextHeight = +findMod(textBlocks.map((block: any) => block.height)) || 0;
+            if (!(modalTextHeight > 0)) {
+              return group;
+            }
+
+            const tolerance = Math.max(lineMaxWidth * 0.2, 0.6);
+            const rowsDesc = [...group.rows].sort((a, b) => b - a);
+            const removed: number[] = [];
+
+            // Interior bands only: the first and the last band are never touched.
+            for (let index = 1; index < rowsDesc.length - 2; index++) {
+              const upper = rowsDesc[index];
+              const lower = rowsDesc[index + 1];
+              if (upper - lower >= modalTextHeight * 0.9) {
+                continue;
+              }
+              const hasText = textBlocks.some((block: any) => {
+                const overlap = Math.min(block.y + block.height, upper) - Math.max(block.y, lower);
+                return overlap > tolerance;
+              });
+              if (!hasText) {
+                removed.push(upper);
+              }
+            }
+            if (!removed.length) {
+              return group;
+            }
+
+            group.rows = group.rows.filter((y: number) => !removed.includes(y));
+            group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: [...group.rows],
+              cols: group.cols || [],
+              lineMaxWidth,
+              separatorRows: group.synthesizedRows || [],
+            });
+
+            console.error('[THIN EMPTY BANDS]', { removed: removed.map(y => +y.toFixed(2)), rows: group.rows.length });
             return group;
           }
 
@@ -8368,6 +8512,7 @@ export function init({
             tableGroups = tableGroups.map(group => trimFullWidthTitleRow(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => removeFillSeamRows(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => removeFillPadColumns(group, lineMaxWidth));
+            tableGroups = tableGroups.map(group => absorbThinEmptyBands(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => refineTextOnlyTopRows(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => rebuildUnseparatedRows(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => applyLeaderRowBoundaries(group));
@@ -13860,7 +14005,11 @@ export function init({
                 for (let c = 1; c < colsCount - 1; c++) {
                   const width = verticles[c + 1].x - verticles[c].x;
                   const isEmpty = !physicalTextColumns.has(c); //old:table.array.every(row => !(row[c]?.str || '').trim());
-                  if (width <= modalTextHeight * 1.2 && isEmpty) {
+                  // Without any rules or fills an empty column is only an artefact of the column borders.
+                  const isTextOnlyTable =
+                    !(tableGroup?.edgesRows || []).length && !(tableGroup?.rectanglesRows || []).length;
+
+                  if (isEmpty && (width <= modalTextHeight * 1.2 || isTextOnlyTable)) {
                     gutterColumns.add(c);
                   }
                 }
