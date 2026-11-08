@@ -22,6 +22,7 @@ import {
 import {
   hasVectorColor,
   isEdgeFilledEvenOdd,
+  isFillBandRemnant,
   isSameFillColor,
   isStrictlyContained,
   isVisibleVector,
@@ -141,6 +142,8 @@ export function init({
         var transformMatrix = JSON.parse(JSON.stringify(_defaultTransformMatrix));
         var textMatrix = JSON.parse(JSON.stringify(_defaultTransformMatrix));
         var transformStack = [];
+        var clipBoxStack: Array<number[] | null> = [];
+        var clippedAwayCount = 0;
         let pageTextContent = await page.getTextContent();
         let pageViewport = page.getViewport({ scale: 1 });
         let pageWidth = pageViewport.width;
@@ -453,6 +456,8 @@ export function init({
             colorType: null,
             leading: 0, // string offset for T* in units of text space (= -TL)
             textRunAdvance: 0, // cumulative offset after Tj since the last position update
+            clipBox: null as number[] | null,
+            pendingClip: false
           };
 
           let rectangles = [];
@@ -460,9 +465,31 @@ export function init({
           let filledRectangles = [];
           // Column boundaries determined by text alignment (tables without vertical lines)
           let pageColumnBorders: Array<{ x: number; yFrom: number; yTo: number }> = [];
+          const EMPTY_CLIP: number[] = [Infinity, Infinity, -Infinity, -Infinity];
+          const CLIP_TOLERANCE = 1;
 
           if (debugTrace) {
             debugTrace.cleanupRoots.push(rectangles, rectanglesEdges);
+          }
+
+
+          function intersectBoxes(first: number[], second: number[]): number[] {
+            const box = [
+              Math.max(first[0], second[0]),
+              Math.max(first[1], second[1]),
+              Math.min(first[2], second[2]),
+              Math.min(first[3], second[3])
+            ];
+            return box[0] <= box[2] && box[1] <= box[3] ? box : EMPTY_CLIP;
+          }
+
+          function boxesIntersect(first: number[], second: number[], tolerance: number): boolean {
+            return (
+              first[0] <= second[2] + tolerance &&
+              first[2] >= second[0] - tolerance &&
+              first[1] <= second[3] + tolerance &&
+              first[3] >= second[1] - tolerance
+            );
           }
 
           function getTextColor() {
@@ -513,6 +540,41 @@ export function init({
 
           function isDefaultTransformMatrix(transformMatrix) {
             return JSON.stringify(transformMatrix) == JSON.stringify(_defaultTransformMatrix);
+          }
+
+          function getPathPageBBox(bbox: number[], matrix: number[]): number[] | null {
+            if (bbox.length < 4 || !bbox.slice(0, 4).every(Number.isFinite)) {
+              return null;
+            }
+            const [x1, y1, x2, y2] = bbox;
+            if (isDefaultTransformMatrix(matrix)) {
+              return [Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)];
+            }
+            const corners = [
+              applyTransformFn([x1, y1], matrix),
+              applyTransformFn([x2, y1], matrix),
+              applyTransformFn([x2, y2], matrix),
+              applyTransformFn([x1, y2], matrix)
+            ];
+            const xs = corners.map((corner: number[]) => corner[0]);
+            const ys = corners.map((corner: number[]) => corner[1]);
+            return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+          }
+
+          function isRectangleWithinBox(
+            x: number,
+            y: number,
+            width: number,
+            height: number,
+            box: number[],
+            tolerance: number
+          ): boolean {
+            return (
+              x >= box[0] - tolerance &&
+              y >= box[1] - tolerance &&
+              x + width <= box[2] + tolerance &&
+              y + height <= box[3] + tolerance
+            );
           }
 
           // Rectangular paths drawn with both fill and stroke (fillStroke / closeFillStroke).
@@ -593,6 +655,8 @@ export function init({
 
           console.error(`[DIAG Page ${pageNum}] total ops:`, _fnArray.length);
           let constructPathCount = 0;
+          let rectOutsideLogged = 0;
+          let outlineLogged = 0;
 
           const DEBUG_DUMP_CONTENT = true;
           if (DEBUG_DUMP_CONTENT) {
@@ -741,10 +805,27 @@ export function init({
                         pathOps.push(OPS.lineTo);
                         pathCoords.push(pathData[idx++], pathData[idx++]);
                       }
-                    } else if (newOp === 2) {// curveTo — skip (6 coordinates), the old loop can't
-                      idx += 6;
-                    } else if (newOp === 3) {// quadraticCurveTo — skip (4 coordinates)
-                      idx += 4;
+                    } else if (newOp === 2) {
+                      // cubic curve — leave this as a real operation so that the current point moves to its end
+                      if (idx + 5 < pathData.length) {
+                        pathOps.push(OPS.curveTo);
+                        pathCoords.push(
+                          pathData[idx],
+                          pathData[idx + 1],
+                          pathData[idx + 2],
+                          pathData[idx + 3],
+                          pathData[idx + 4],
+                          pathData[idx + 5]
+                        );
+                      }
+                      idx += 6;// curveTo — skip (6 coordinates), the old loop can't
+                    } else if (newOp === 3) {
+                      // quadratic curve (x1, y1, x, y)
+                      if (idx + 3 < pathData.length) {
+                        pathOps.push(OPS.curveTo2);
+                        pathCoords.push(pathData[idx], pathData[idx + 1], pathData[idx + 2], pathData[idx + 3]);
+                      }
+                      idx += 4;// quadraticCurveTo — skip (4 coordinates)
                     } else if (newOp === 4) {// closePath
                       pathOps.push(OPS.closePath);
                     }
@@ -758,9 +839,23 @@ export function init({
                   if (isNewFormat && paintType != null && paintType !== OPS.endPath) {
                     const isFillOnlyPaint = paintType === OPS.fill || paintType === OPS.eoFill;
                     if (isFillOnlyPaint) {
+                      const round = (value: any): any => (Number.isFinite(Number(value)) ? +Number(value).toFixed(2) : value);
+                      const beforeOps = [...pathOps];
+                      const beforeCoords = [...pathCoords];
                       // The cell background is often drawn using a single fill path consisting of dozens of sub‑rectangles;
-                      // each represents the geometry of a separate cell (including merged rowspan/colspan).
+                      // each represents the geometry of a separate cell (including merged rowspan/colspan). 
                       const extracted = extractClosedSubpathRectangles(pathOps, pathCoords, OPS);
+
+                      if (i === 1021 || i === 807) {
+                        console.error('[EXTRACT RECTS]', JSON.stringify({
+                          op: i,
+                          beforeOps: beforeOps.slice(0, 14),
+                          beforeCoords: beforeCoords.slice(0, 24).map(round),
+                          afterOps: extracted.ops.slice(0, 14),
+                          afterCoords: extracted.coords.slice(0, 24).map(round)
+                        }));
+                      }
+
                       pathOps = extracted.ops;
                       pathCoords = extracted.coords;
                     }
@@ -807,7 +902,36 @@ export function init({
                 console.error(`[DIAG Page ${pageNum}] constructPath #1 pathCoords (first 8):`, pathCoords.slice(0, 8));
               }
 
+              const moveCurrentPointTo = (pointX: number, pointY: number): void => {
+                let x = pointX;
+                let y = pointY;
+                if (!isDefaultTransformMatrix(transformMatrix)) {
+                  [x, y] = applyTransformFn([x, y], transformMatrix);
+                }
+                current['x'] = x;
+                current['y'] = y;
+                current['subpathHasCurve'] = true;
+              };
+
               let coordIdx = 0;
+
+              const pathBBoxSource = isPdfjs6Format ? normArgs[3] : normArgs[2];
+              const pathBBox =
+                isNewFormat && pathBBoxSource
+                  ? getPathPageBBox(Array.from(extractArrayLike(pathBBoxSource)), transformMatrix)
+                  : null;
+
+              if (
+                !isPaintlessPath &&
+                pathBBox &&
+                current.clipBox &&
+                !boxesIntersect(pathBBox, current.clipBox, CLIP_TOLERANCE)
+              ) {
+                clippedAwayCount++;
+                current.pendingClip = false;
+                continue; // The active clip does not allow this path through: there is nothing to draw
+              }
+
               // The path is drawn with a stroke -> the closing segment (closePath) is also visible
               const strokesPath =
                 isNewFormat &&
@@ -817,6 +941,9 @@ export function init({
                   paintType === OPS.eoFillStroke ||
                   paintType === OPS.closeFillStroke ||
                   paintType === OPS.closeEOFillStroke);
+
+              const fillsPath = isNewFormat && (paintType === OPS.fill || paintType === OPS.eoFill);
+
               for (let j = 0; j < pathOps.length; j++) {
                 const op = pathOps[j];
                 if (op === OPS.rectangle) {
@@ -842,6 +969,21 @@ export function init({
                   ry = Math.min(ry, y2);
                   let vector = { y: ry, x: rx, width: rwidth, height: rheight, transform: transformMatrix };
 
+                  const bboxTolerance = Math.max(2, (current.lineWidth || 0) * 2);
+                  if (pathBBox && !isRectangleWithinBox(rx, ry, rwidth, rheight, pathBBox, bboxTolerance)) {
+                    if (rectOutsideLogged < 5) {
+                      rectOutsideLogged++;
+                      const round = (value: any): any => (Number.isFinite(Number(value)) ? +Number(value).toFixed(2) : value);
+                      console.error('[RECT OUTSIDE PATH BBOX]', {
+                        op: i,
+                        rect: [rx, ry, rwidth, rheight].map(round),
+                        bbox: pathBBox.map(round),
+                        pathOps: pathOps.slice(0, 12),
+                        pathData: (pathData || []).slice(0, 40).map(round)
+                      });
+                    }
+                    continue; // прямоугольник испорчен реконструкцией
+                  }
                   // We skip the full‑size background rectangles/page cropping
                   let isFullPageRect =
                     Math.abs(rwidth - pageWidth) < 1 &&
@@ -899,6 +1041,7 @@ export function init({
                   current['y'] = my;
                   current['subpathStartX'] = mx;
                   current['subpathStartY'] = my;
+                  current['subpathHasCurve'] = false;
                 } else if (op === OPS.lineTo) {
                   if (coordIdx + 1 >= pathCoords.length) break;
                   let lx = pathCoords[coordIdx++];
@@ -969,15 +1112,17 @@ export function init({
 
                 } else if (op === OPS.curveTo) {
                   if (coordIdx + 5 >= pathCoords.length) break;
-                  coordIdx += 6; // skip the 6 coordinates of the Bezier curve
+                  moveCurrentPointTo(pathCoords[coordIdx + 4], pathCoords[coordIdx + 5]);
+                  coordIdx += 6;// skip the 6 coordinates of the Bezier curve
                 } else if (op === OPS.curveTo2 || op === OPS.curveTo3) {
                   if (coordIdx + 3 >= pathCoords.length) break;
-                  coordIdx += 4; // skipping 4 coordinates
+                  moveCurrentPointTo(pathCoords[coordIdx + 2], pathCoords[coordIdx + 3]);
+                  coordIdx += 4;// skipping 4 coordinates
                 } else if (op === OPS.closePath) {
                   // The closing segment of a subpath, drawn with a dashed line.
                   // Only horizontal/vertical segments; we leave fill-only paths untouched.
                   if (
-                    strokesPath &&
+                    (strokesPath || (fillsPath && current['subpathHasCurve'])) &&
                     Number.isFinite(current['subpathStartX']) &&
                     Number.isFinite(current['x'])
                   ) {
@@ -1040,6 +1185,9 @@ export function init({
                   current['vectorCache'] = null;
                 }
               }
+
+
+
               // applying colors from paintType (pdfjs 4.x+) ---
               if (isNewFormat && paintType != null) {
                 let shouldFill = (
@@ -1092,6 +1240,14 @@ export function init({
                 }
               }
 
+
+              if (current.pendingClip) {
+                if (pathBBox) {
+                  current.clipBox = current.clipBox ? intersectBoxes(current.clipBox, pathBBox) : pathBBox;
+                }
+                current.pendingClip = false;
+              }
+
             } else if (fn === OPS.save) {
               transformStack.push({
                 transformMatrix: [...transformMatrix],
@@ -1101,32 +1257,55 @@ export function init({
                 strokeAlpha: current.strokeAlpha,
                 lineWidth: current.lineWidth,
                 colorType: current.colorType,
+                // text state — a part of the graphics state; q/Q saves/restores it
+                charSpacing: current.charSpacing,
+                wordSpacing: current.wordSpacing,
+                textRenderingMode: current.textRenderingMode,
+                leading: current.leading,
+                fontName: current.fontName,
+                fontSize: current.fontSize,
+                fontDirection: current.fontDirection,
+                contentItem: JSON.parse(JSON.stringify(current.contentItem || {})),
+                clipBox: current.clipBox ? [...current.clipBox] : null,
               });
-
               current['vectorType'] = null;
               current['vectorCache'] = null;
             } else if (fn === OPS.restore) {
               const savedState = transformStack.pop();
-
               if (savedState) {
                 transformMatrix = [...savedState.transformMatrix];
-
-                current.fillRGBColor = [
-                  ...(savedState.fillRGBColor || [])
-                ];
-
-                current.strokeRGBColor = [
-                  ...(savedState.strokeRGBColor || [])
-                ];
-
+                current.fillRGBColor = [...(savedState.fillRGBColor || [])];
+                current.strokeRGBColor = [...(savedState.strokeRGBColor || [])];
                 current.fillAlpha = savedState.fillAlpha;
                 current.strokeAlpha = savedState.strokeAlpha;
                 current.lineWidth = savedState.lineWidth;
                 current.colorType = savedState.colorType;
+                current.charSpacing = savedState.charSpacing;
+                current.wordSpacing = savedState.wordSpacing;
+                current.textRenderingMode = savedState.textRenderingMode;
+                current.leading = savedState.leading;
+                current.clipBox = savedState.clipBox;
+                current.pendingClip = false;
+                // We restore the font only if it had already been set at the time of `q`:
+                // PDF, which (incorrectly) relies on Tf inside q..Q, will continue to work as before.
+                if (savedState.fontName != null && savedState.fontSize != null) {
+                  current.fontName = savedState.fontName;
+                  current.fontSize = savedState.fontSize;
+                  current.fontDirection = savedState.fontDirection;
+                  if (savedState.contentItem?.transform) {
+                    current.contentItem = savedState.contentItem;
+                  }
+                }
               }
-
               current['vectorType'] = null;
               current['vectorCache'] = null;
+            } else if (fn === OPS.clip || fn === OPS.eoClip) {
+              // pdf.js places the clip operation BEFORE constructPath, which completes it
+              current.pendingClip = true;
+            } else if (fn === OPS.paintFormXObjectBegin) {
+              clipBoxStack.push(current.clipBox ? [...current.clipBox] : null);
+            } else if (fn === OPS.paintFormXObjectEnd) {
+              current.clipBox = clipBoxStack.length ? clipBoxStack.pop() ?? null : current.clipBox;
             } else if (fn === OPS.transform) {
               var normTransformArgs = normalizeNumericArgs(args);
               transformMatrix = transformFn(transformMatrix, normTransformArgs);
@@ -4032,6 +4211,211 @@ export function init({
             );
           }
 
+          // Do all overlapping elements appear on the same text line with the same font size?
+          // This is not a watermark, but an overlay of a duplicate text layer (OCR + original).
+          function isOverlayOnSameTextLine(item: any, others: any[]): boolean {
+            if (!item?.transform || item.imageName || !isHorizontalText(item)) {
+              return false;
+            }
+            const height = Math.max(Math.abs(item.transform[3]) || item.height || 1, 1);
+            const baselineTolerance = Math.max(height * 0.3, 0.5);
+            return others.every((other: any) => {
+              if (!other?.transform || other.imageName || !isHorizontalText(other)) {
+                return false;
+              }
+              const otherHeight = Math.max(Math.abs(other.transform[3]) || other.height || 1, 1);
+              return (
+                Math.abs(other.transform[5] - item.transform[5]) <= baselineTolerance &&
+                Math.abs(otherHeight - height) <= Math.max(height, otherHeight) * 0.15
+              );
+            });
+          }
+
+          // From elements that overlap (same line, same font size, overlap >= 60%
+          // of the width of the narrower one), it keeps only one—the best one.
+          function removeOverlaidDuplicateItems(items: any[]): any[] {
+            const OVERLAP_RATIO = 0.6;
+            let loggedRemovals = 0;
+            const compact = (value: any): string => String(value || '').replace(/\s+/g, '');
+
+            const isSpacedGarbage = (value: any): boolean => {
+              const tokens = String(value || '').trim().split(/\s+/).filter(Boolean);
+              return tokens.length >= 4 && tokens.filter(token => token.length === 1).length >= tokens.length * 0.7;
+            };
+
+            const getInfo = (item: any, index: number): any => {
+              if (!item?.transform || item.imageName || !isHorizontalText(item)) {
+                return null;
+              }
+              const text = String(item.str || '').trim();
+              if (!text || /\n/.test(text)) {
+                return null;
+              }
+              const glyphs = (item.chars || []).filter(
+                (glyph: any) =>
+                  glyph &&
+                  typeof glyph === 'object' &&
+                  typeof glyph.unicode === 'string' &&
+                  glyph.unicode.trim() &&
+                  Number.isFinite(glyph.x) &&
+                  Number.isFinite(glyph.charWidth)
+              );
+              const left = glyphs.length ? Math.min(...glyphs.map((glyph: any) => glyph.x)) : item.transform[4];
+              const right = glyphs.length
+                ? Math.max(...glyphs.map((glyph: any) => glyph.x + glyph.charWidth))
+                : item.transform[4] + (item.width || 0);
+              return {
+                item,
+                index,
+                left,
+                right,
+                boxLeft: item.transform[4],
+                boxRight: item.transform[4] + (item.width || 0),
+                compactText: compact(text),
+                baseline: item.transform[5],
+                height: Math.max(Math.abs(item.transform[3]) || item.height || 1, 1)
+              };
+            };
+
+            const overlapRatio = (aLeft: number, aRight: number, bLeft: number, bRight: number): number => {
+              const narrower = Math.min(aRight - aLeft, bRight - bLeft);
+              return narrower > 0 ? (Math.min(aRight, bRight) - Math.max(aLeft, bLeft)) / narrower : 0;
+            };
+
+            const isSubsequence = (needle: string, haystack: string): boolean => {
+              const wanted = Array.from(needle.toLocaleLowerCase());
+              if (!wanted.length) {
+                return true;
+              }
+              let position = 0;
+              for (const character of Array.from(haystack.toLocaleLowerCase())) {
+                if (character === wanted[position]) {
+                  position++;
+                  if (position === wanted.length) {
+                    return true;
+                  }
+                }
+              }
+              return false;
+            };
+
+            // A duplicate is the same text, possibly with some characters missing. Different texts with overlapping frames
+            // (index strings, superscript characters) are not considered duplicates.
+            const isSameTextLayer = (a: any, b: any): boolean => {
+              const [shorter, longer] = a.compactText.length <= b.compactText.length ? [a, b] : [b, a];
+              return isSubsequence(shorter.compactText, longer.compactText);
+            };
+
+            // A fragment of the OCR layer: its text is part of a longer element's text,
+            // and it lies within that element's bounding box. The bounding box is more reliable than glyph positions.
+            const isFragmentOf = (piece: any, whole: any): boolean =>
+              piece.compactText.length < whole.compactText.length &&
+              whole.compactText.includes(piece.compactText) &&
+              overlapRatio(piece.boxLeft, piece.boxRight, whole.boxLeft, whole.boxRight) >= OVERLAP_RATIO;
+
+            const isOverlay = (a: any, b: any): boolean => {
+              if (Math.abs(a.baseline - b.baseline) > Math.max(Math.min(a.height, b.height) * 0.3, 0.5)) {
+                return false;
+              }
+              if (Math.abs(a.height - b.height) > Math.max(a.height, b.height) * 0.2) {
+                return false;
+              }
+
+              if (!isSameTextLayer(a, b)) {
+                return false;
+              }
+              return (
+                overlapRatio(a.left, a.right, b.left, b.right) >= OVERLAP_RATIO ||
+                isFragmentOf(a, b) ||
+                isFragmentOf(b, a)
+              );
+            };
+
+            // true, если a лучше b
+            const isBetter = (a: any, b: any): boolean => {
+              const garbageA = isSpacedGarbage(a.item.str);
+              const garbageB = isSpacedGarbage(b.item.str);
+              if (garbageA !== garbageB) {
+                return garbageB;
+              }
+              const visibleA = !!a.item.textColor;
+              const visibleB = !!b.item.textColor;
+              if (visibleA !== visibleB) {
+                return visibleA;
+              }
+              // Text completeness: “$731” is better than “$31”, “K2-1901” is better than ‘K21901’, “1.9” is better than “1 9”
+              const compactDifference = a.compactText.length - b.compactText.length;
+              if (compactDifference !== 0) {
+                return compactDifference > 0;
+              }
+              // “19RA02 §” is better than “19RA02§”
+              const rawDifference = String(a.item.str || '').trim().length - String(b.item.str || '').trim().length;
+              if (rawDifference !== 0) {
+                return rawDifference > 0;
+              }
+              return a.index < b.index;
+            };
+
+            const infos = items
+              .map(getInfo)
+              .filter(Boolean)
+              .sort((a: any, b: any) => a.baseline - b.baseline);
+            const maxShift = Math.max(0.5, ...infos.map((info: any) => info.height * 0.3));
+            const removed = new Set<number>();
+
+            for (let i = 0; i < infos.length; i++) {
+              if (removed.has(infos[i].index)) {
+                continue;
+              }
+              for (let j = i + 1; j < infos.length; j++) {
+                if (infos[j].baseline - infos[i].baseline > maxShift) {
+                  break;
+                }
+                if (removed.has(infos[j].index) || !isOverlay(infos[i], infos[j])) {
+                  continue;
+                }
+                const loser = isBetter(infos[i], infos[j]) ? infos[j] : infos[i];
+                removed.add(loser.index);
+                // TEMP DIAGNOSTIC
+                if (loggedRemovals < 12 && /^[\d\s().,\-–§*†‡]*$/.test(String(loser.item.str || ''))) {
+                  loggedRemovals++;
+                  const winner = loser === infos[i] ? infos[j] : infos[i];
+                  const box = (info: any) => [info.left, info.right, info.baseline, info.height].map((value: number) => +value.toFixed(2));
+                  console.error('[DEDUPE REMOVED]', JSON.stringify({
+                    loser: String(loser.item.str || '').trim(),
+                    winner: String(winner.item.str || '').trim(),
+                    loserBox: box(loser),
+                    winnerBox: box(winner)
+                  }));
+                }
+                if (loser === infos[i]) {
+                  break;
+                }
+              }
+            }
+
+            if (!removed.size) {
+              return items;
+            }
+
+            const result: any[] = [];
+            items.forEach((item: any, index: number) => {
+              if (!removed.has(index)) {
+                result.push(item);
+                return;
+              }
+              // The end of the cell has been removed—the cell border should remain on the previous element
+              if (item.hasEOT && result.length) {
+                result[result.length - 1].hasEOT = true;
+              }
+            });
+            console.error('[OVERLAY DUPLICATES REMOVED]', {
+              removed: removed.size,
+              sample: [...removed].slice(0, 8).map(index => items[index]?.str)
+            });
+            return result;
+          }
+
           function areInSameRotatedCell(firstItem, secondItem) {
             if (
               !isRotatedText(firstItem) &&
@@ -5463,6 +5847,13 @@ export function init({
                   !!lastItem && !item.imageName && !lastItem.imageName && !hasContent(lastItem);
 
                 if (hasEOT || index == 0 || startsAfterBlankLead) {
+                  // A synthetic “spacing” space is not needed at the cell border. It has no coordinates,
+                  // unlike a real space from a PDF, so the real spaces are not affected.
+                  const leadingGlyph = item.chars?.[0];
+                  if (leadingGlyph?.isSpace && !Number.isFinite(leadingGlyph.x) && /^\s/.test(item.str || '')) {
+                    item.chars = item.chars.slice(1);
+                    item.str = item.str.slice(1);
+                  }
                   let newItem = {
                     index: index,
                     str: item?.str || '',
@@ -6464,6 +6855,251 @@ export function init({
             }, {});
 
             return headerRows;
+          }
+
+          function isNumericLikeText(value: any): boolean {
+            return /^[\s$€£]?[-−]?\d[\d\s.,]*%?$/.test(String(value || '').trim());
+          }
+
+
+          // Are there any lines that pass through the interior of the area
+          // (the table border and the fill border along the edge are not counted)?
+          function hasRulesInsideRegion(
+            group: any,
+            region: { left: number; right: number; top: number; bottom: number },
+            margin: number,
+            lineMaxWidth: number
+          ): boolean {
+            const fillRectangles = (group?.rectangles || []).filter((rect: any) => rect?.fillColor);
+            const width = region.right - region.left;
+            const height = region.top - region.bottom;
+
+            return (group?.edges || []).some((edge: any) => {
+              if (!isVisibleVector(edge) || edge['_isFakeLine'] || isFillBandRemnant(edge, fillRectangles)) {
+                return false;
+              }
+              if (edge.height < lineMaxWidth && edge.width > lineMaxWidth) {
+                const y = edge.y + edge.height / 2;
+                const overlap = Math.min(edge.x + edge.width, region.right) - Math.max(edge.x, region.left);
+                return y > region.bottom + margin && y < region.top - margin && overlap >= width * 0.5;
+              }
+              if (edge.width < lineMaxWidth && edge.height > lineMaxWidth) {
+                const x = edge.x + edge.width / 2;
+                const overlap = Math.min(edge.y + edge.height, region.top) - Math.max(edge.y, region.bottom);
+                return x > region.left + margin && x < region.right - margin && overlap >= height * 0.5;
+              }
+              return false;
+            });
+          }
+
+          // Displays the grid of a borderless table based on text alignment.
+          // Returns ONLY the geometry: tableGroup.coordinates blocks are neither created nor modified.
+          function inferTextAlignedGrid(tableGroup: any, currentColumnCount: number, lineMaxWidth: number): any {
+            const MIN_HEADER_CELLS = 6;
+            const MIN_BODY_CELLS = 5;
+            const MIN_NUMERIC_CELLS = 3;
+            const BODY_FILL_RATIO = 0.75;
+            const MAX_SPARSE_ROWS = 2;
+
+            const reject = (reason: string, details: any = {}) => {
+              console.error('[TEXT GRID] skipped', { reason, ...details });
+              return null;
+            };
+
+            if (!Array.isArray(tableGroup?.x) || !Array.isArray(tableGroup?.y)) {
+              return reject('group has no bounds');
+            }
+
+            const groupLeft = Math.min(...tableGroup.x);
+            const groupRight = Math.max(...tableGroup.x);
+            const groupTop = Math.max(...tableGroup.y);
+            const groupBottom = Math.min(...tableGroup.y);
+
+            // 1. Single-line horizontal blocks within a group (for geometry display only).
+            const allBlocks = (tableGroup.coordinates || []).filter(
+              (block: any) =>
+                block?.str?.trim() &&
+                !String(block.str).includes('\n') &&
+                [block.x, block.y, block.width, block.height].every(Number.isFinite) &&
+                isHorizontalText(block) &&
+                block.x >= groupLeft - lineMaxWidth &&
+                block.x + block.width <= groupRight + lineMaxWidth &&
+                block.y >= groupBottom - lineMaxWidth &&
+                block.y <= groupTop + lineMaxWidth
+            );
+            const unit = +findMod(allBlocks.map((block: any) => block.height)) || 0;
+            if (allBlocks.length < MIN_HEADER_CELLS * 2 || !(unit > 0)) {
+              return reject('not enough text', { blocks: allBlocks.length });
+            }
+            const tolerance = unit * 0.3;
+
+            // 2. Fragments within a broader block of the same line are not included in the column output.
+            const blocks = allBlocks.filter(
+              (candidate: any, index: number) =>
+                !allBlocks.some(
+                  (other: any, otherIndex: number) =>
+                    otherIndex !== index &&
+                    Math.abs(other.y - candidate.y) <= tolerance &&
+                    other.width > candidate.width + tolerance &&
+                    other.x <= candidate.x + tolerance &&
+                    other.x + other.width >= candidate.x + candidate.width - tolerance
+                )
+            );
+
+            // 3. Visual lines along the baseline.
+            const rows: Array<{ y: number; blocks: any[] }> = [];
+            [...blocks]
+              .sort((first: any, second: any) => second.y - first.y || first.x - second.x)
+              .forEach((block: any) => {
+                const row = rows.find(candidate => Math.abs(candidate.y - block.y) <= tolerance);
+                if (row) {
+                  row.blocks.push(block);
+                } else {
+                  rows.push({ y: block.y, blocks: [block] });
+                }
+              });
+            rows.forEach(row => row.blocks.sort((first: any, second: any) => first.x - second.x));
+
+            // 4. The first row of data and the header rows above it.
+            const numericCells = (row: any): number =>
+              row.blocks.filter((block: any) => isNumericLikeText(block.str)).length;
+
+            const firstBodyIndex = rows.findIndex(
+              row => row.blocks.length >= MIN_BODY_CELLS && numericCells(row) >= MIN_NUMERIC_CELLS
+            );
+            if (firstBodyIndex < 1) {
+              return reject('no data row below a header candidate');
+            }
+
+            let headerBottomIndex = -1;
+            for (let index = firstBodyIndex - 1; index >= 0; index--) {
+              if (rows[index].y - rows[firstBodyIndex].y > unit * 3) {
+                break;
+              }
+              if (rows[index].blocks.length >= MIN_HEADER_CELLS) {
+                headerBottomIndex = index;
+                break;
+              }
+            }
+            if (headerBottomIndex < 0) {
+              return reject('no header line above the first data row');
+            }
+
+            const headerBottom = rows[headerBottomIndex];
+            const upperRow = headerBottomIndex > 0 ? rows[headerBottomIndex - 1] : null;
+            const headerTop =
+              upperRow && upperRow.blocks.length >= 3 && upperRow.y - headerBottom.y <= unit * 2.5 ? upperRow : null;
+            const headerLines = headerTop ? [headerTop, headerBottom] : [headerBottom];
+
+            // 5. Column start positions: the left edge of the cell in the bottom row of the header,
+            //    shifted to the left if there is an overlapping cell above it.
+            const starts: number[] = [];
+            headerBottom.blocks.forEach((block: any) => {
+              const overlappingTop = (headerTop ? headerTop.blocks : []).filter(
+                (top: any) => top.x < block.x + block.width && top.x + top.width > block.x
+              );
+              const start = Math.min(block.x, ...overlappingTop.map((top: any) => top.x));
+              if (!starts.length || start - starts[starts.length - 1] >= unit) {
+                starts.push(start);
+              }
+            });
+            if (starts.length < 4 || starts.length <= currentColumnCount) {
+              return reject('text alignment is not finer than the current grid', {
+                textColumns: starts.length,
+                currentColumns: currentColumnCount
+              });
+            }
+
+            const margin = unit * 0.5;
+            const innerBounds = starts.slice(1).map((start: number) => start - margin);
+            const columnOf = (x: number): number => {
+              let column = 0;
+              while (column < innerBounds.length && x >= innerBounds[column]) {
+                column++;
+              }
+              return column;
+            };
+
+            // 6. Body rows: dense rows; up to MAX_SPARSE_ROWS sparse rows are allowed in a row;
+            const minPopulated = Math.ceil(starts.length * BODY_FILL_RATIO);
+            const populated = (row: any): number => new Set(row.blocks.map((block: any) => columnOf(block.x))).size;
+
+            let lastBodyIndex = firstBodyIndex;
+            let sparseRun = 0;
+            for (let index = firstBodyIndex; index < rows.length; index++) {
+              if (populated(rows[index]) >= minPopulated) {
+                lastBodyIndex = index;
+                sparseRun = 0;
+              } else if (++sparseRun > MAX_SPARSE_ROWS) {
+                break;
+              }
+            }
+            const bodyRows = rows.slice(firstBodyIndex, lastBodyIndex + 1);
+            if (bodyRows.length < 2) {
+              return reject('fewer than two dense data rows');
+            }
+
+            // 7. Column and row boundaries.
+            const contentBlocks = [...headerLines, ...bodyRows].flatMap((row: any) => row.blocks);
+            const bounds = [
+              Math.min(...contentBlocks.map((block: any) => block.x)) - margin,
+              ...innerBounds,
+              Math.max(...contentBlocks.map((block: any) => block.x + block.width)) + margin
+            ];
+
+            const baselines = bodyRows.map((row: any) => row.y);
+            const lastPitch = baselines[baselines.length - 2] - baselines[baselines.length - 1];
+            const headerBaseline = Math.min(...headerLines.flatMap((row: any) => row.blocks).map((block: any) => block.y));
+            const headerTopEdge =
+              Math.max(...headerLines.flatMap((row: any) => row.blocks).map((block: any) => block.y + block.height)) +
+              unit * 0.25;
+
+            const rowBoundaries = [
+              headerTopEdge,
+              (headerBaseline + baselines[0]) / 2,
+              ...baselines.slice(1).map((baseline: number, index: number) => (baselines[index] + baseline) / 2),
+              baselines[baselines.length - 1] - lastPitch / 2
+            ];
+
+            const left = bounds[0];
+            const right = bounds[bounds.length - 1];
+            const top = rowBoundaries[0];
+            const bottom = rowBoundaries[rowBoundaries.length - 1];
+
+            // If actual rulers pass through the body, that's not the case here.
+            if (hasRulesInsideRegion(tableGroup, { left, right, top: rowBoundaries[1], bottom }, unit, lineMaxWidth)) {
+              return reject('ruling lines inside the inferred body');
+            }
+
+
+            const headerRange = `${rowBoundaries[0]}-${rowBoundaries[1]}`;
+            const headerBlocks = (tableGroup.coordinates || []).filter(
+              (block: any) =>
+                block?.str?.trim() &&
+                Number.isFinite(block.x) &&
+                Number.isFinite(block.y) &&
+                block.y > rowBoundaries[1] &&
+                block.y <= rowBoundaries[0] &&
+                block.x >= left &&
+                block.x <= right
+            );
+
+            console.error('[TEXT GRID] applied', {
+              columns: starts.length,
+              bodyRows: bodyRows.length,
+              currentColumns: currentColumnCount
+            });
+
+            return {
+              cols: bounds,
+              rows: rowBoundaries,
+              x: [left, right],
+              y: [bottom, top],
+              headerRows: { [headerRange]: headerBlocks },
+              // “Full” lines so that `createMatrix` doesn't merge cells.
+              verticles: bounds.map((x: number) => ({ x, lines: [{ top: bottom, bottom: top }] })),
+              horizons: rowBoundaries.map((y: number) => ({ y, lines: [{ left, right }] }))
+            };
           }
 
           /**
@@ -11447,7 +12083,10 @@ export function init({
                 });
               })();
 
-              if (data.intersectionsIndexes.length > 1) {
+              if (
+                data.intersectionsIndexes.length > 1 &&
+                !isOverlayOnSameTextLine(item, data.intersectionsIndexes.map((index: number) => tableContentItems[index]))
+              ) {
                 if (!watermarksIndexes.includes(mainIndex)) {
                   watermarksIndexes.push(mainIndex);
                 }
@@ -11521,8 +12160,9 @@ export function init({
 
 
           //Extracting text coordinates
-          let coordinates = extractCoordinates(tableContentItems);
+          tableContentItems = removeOverlaidDuplicateItems(tableContentItems);
 
+          let coordinates = extractCoordinates(tableContentItems);
 
           console.error(`[DEBUG Page ${pageNum}] coordinates:`, coordinates.length);
           if (coordinates.length > 0) {
@@ -13335,6 +13975,22 @@ export function init({
             }
             horizons = horizons.filter(item => Number.isFinite(item.y));
             verticles = verticles.filter(item => Number.isFinite(item.x));
+
+            const textAlignedGrid = inferTextAlignedGrid(tableGroup, verticles.length - 1, lineMaxWidth);
+
+            if (textAlignedGrid) {
+              verticles = textAlignedGrid.verticles;
+              horizons = textAlignedGrid.horizons;
+              Object.assign(tableGroup, {
+                cols: textAlignedGrid.cols,
+                rows: textAlignedGrid.rows,
+                x: textAlignedGrid.x,
+                y: textAlignedGrid.y,
+                headerRows: textAlignedGrid.headerRows
+              });
+              // tableGroup.coordinates DO NOT touch it.
+            }
+
             let matrixData = createMatrix(
               verticles,
               horizons
@@ -14020,13 +14676,22 @@ export function init({
                 try {
                   const headerRowCount = topHeaderRowCount; //Object.keys(headerRows).length;
 
+                  const bandRectangles = uniqueArr(
+                    [...(tableGroup?.rectangles || []), ...(pageGroup?.rectangles || [])].filter(
+                      (rect: any) => rect?.fillColor && isVisibleVector(rect) && rect.width > 0 && rect.height > 0
+                    ),
+                    ['x', 'y', 'width', 'height']
+                  );
+                  const isBorderCarrier = (item: any): boolean =>
+                    isVisibleVector(item) && !item['_isFakeLine'] && !isFillBandRemnant(item, bandRectangles);
+
                   // --- EDGES LOGIC ---
 
                   // We collect ALL visible real lines: group + page lines (in case of a split)
                   let groupEdges = [
                     ...(edges || []),
                     ...(tableGroup?.rectanglesEdges || [])
-                  ].filter(item => isVisibleVector(item) && !item['_isFakeLine']);
+                  ].filter(isBorderCarrier);
 
                   // Bounding box of the current table — protection from neighboring tables/graphs
                   let tableBBox = {
@@ -14040,7 +14705,7 @@ export function init({
                     let candidates = [
                       ...(pageGroup.edges || []),
                       ...(pageGroup.rectanglesEdges || [])
-                    ].filter(item => isVisibleVector(item) && !item['_isFakeLine']);
+                    ].filter(isBorderCarrier);
 
                     pageEdgesFiltered = candidates.filter(item => {
                       let res: any = checkRectangleRanges(
@@ -14070,6 +14735,18 @@ export function init({
                   let borderSize = tableGroup?.borderSize || 0.57;
                   let tolerance = Math.max(lineMaxWidth * 2, borderSize * 4, 2);
 
+                  const THIN_EDGE_THICKNESS = 0.3; // тот же порог, что и в collectBorderColors
+                  const thinEdgeTolerance = Math.max(borderSize * 3, 1.5);
+
+                  const horizontalAxes: number[] = horizons.map((horizon: any) => horizon.y);
+                  const verticalAxes: number[] = verticles.map((vertical: any) => vertical.x);
+
+                  // An edge refers only to the nearest grid line. Otherwise, for lines that are closer to each other
+                  // than the tolerance, a single edge would fall on two boundaries at once.
+                  function isNearestGridAxis(edgeAxis: number, lineAxis: number, axes: number[]): boolean {
+                    const distance = Math.abs(edgeAxis - lineAxis);
+                    return axes.every((axis: number) => Math.abs(edgeAxis - axis) >= distance - 1e-6);
+                  }
                   const borderAxisTolerance = Math.max(
                     1.5,
                     Math.min(borderSize * 3, 2)
@@ -14101,9 +14778,11 @@ export function init({
                       const isVerticalEdge = edge.width < lineMaxWidth && edge.height > lineMaxWidth;
                       if (isHorizontalIdeal ? !isHorizontalEdge : !isVerticalEdge) continue;
 
-                      const axisMatch = isHorizontalIdeal
-                        ? Math.abs(edge.y - idealLine.y1) <= tolerance
-                        : Math.abs(edge.x - idealLine.x1) <= tolerance;
+                      const lineAxis = isHorizontalIdeal ? idealLine.y1 : idealLine.x1;
+                      const edgeCenter = isHorizontalIdeal ? edge.y + edge.height / 2 : edge.x + edge.width / 2;
+                      const axisMatch =
+                        Math.abs((isHorizontalIdeal ? edge.y : edge.x) - lineAxis) <= tolerance &&
+                        isNearestGridAxis(edgeCenter, lineAxis, isHorizontalIdeal ? horizontalAxes : verticalAxes);
                       if (!axisMatch) continue;
 
                       const overlap = isHorizontalIdeal
@@ -14137,10 +14816,31 @@ export function init({
                       const isVerticalEdge = edge.width < lineMaxWidth && edge.height > lineMaxWidth;
                       if (isHorizontalIdeal ? !isHorizontalEdge : !isVerticalEdge) return;
 
-                      const axisMatch = isHorizontalIdeal
-                        ? Math.abs(edge.y - idealLine.y1) <= tolerance
-                        : Math.abs(edge.x - idealLine.x1) <= tolerance;
+                      const lineAxis = isHorizontalIdeal ? idealLine.y1 : idealLine.x1;
+                      const edgeAxis = isHorizontalIdeal ? edge.y : edge.x;
+                      const edgeCenter = isHorizontalIdeal ? edge.y + edge.height / 2 : edge.x + edge.width / 2;
+                      const recordedThickness = isHorizontalIdeal ? edge.height : edge.width;
+
+                      // Fill without outline with a thin specified thickness—weak indication of a line:
+                      // We accept it only if it lies exactly on the grid line.
+                      const allowedOffset = !edge.strokeColor && recordedThickness <= THIN_EDGE_THICKNESS ? thinEdgeTolerance : tolerance;
+
+                      const axisMatch =
+                        Math.abs(edgeAxis - lineAxis) <= allowedOffset &&
+                        isNearestGridAxis(edgeCenter, lineAxis, isHorizontalIdeal ? horizontalAxes : verticalAxes);
+
+                      // TEMP DIAGNOSTIC
+                      if (isHorizontalIdeal && !axisMatch && Math.abs(edgeAxis - lineAxis) <= tolerance) {
+                        console.error('[THIN EDGE REJECTED]', JSON.stringify({
+                          axis: +lineAxis.toFixed(2),
+                          edge: [edge.x, edge.y, edge.width, edge.height].map((value: number) => +value.toFixed(2)),
+                          fill: edge.fillColor || null,
+                          stroke: edge.strokeColor || null
+                        }));
+                      }
+
                       if (!axisMatch) return;
+
 
                       const from = isHorizontalIdeal ? Math.min(idealLine.x1, idealLine.x2) : Math.min(idealLine.y1, idealLine.y2);
                       const to = isHorizontalIdeal ? Math.max(idealLine.x1, idealLine.x2) : Math.max(idealLine.y1, idealLine.y2);

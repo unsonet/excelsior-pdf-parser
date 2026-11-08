@@ -147,3 +147,25 @@ function orientation(
 
     return val > 0 ? 1 : 2;// clockwise or counterclockwise
 }
+
+
+// A thin, filled shape of the same color as the fill that touches it
+// — is a remnant of the fill strip, not a line.
+export function isFillBandRemnant(edge: any, fillRectangles: any[]): boolean {
+    if (!edge?.fillColor || edge.strokeColor) {
+        return false;
+    }
+    const thickness = Math.min(edge.width, edge.height);
+    if (!(thickness > 0.3)) {
+        return false; // Hairlines remain lines
+    }
+    const gap = Math.max(thickness, 1);
+    return fillRectangles.some(
+        (rect: any) =>
+            rect.fillColor === edge.fillColor &&
+            rect.x <= edge.x + edge.width + gap &&
+            rect.x + rect.width >= edge.x - gap &&
+            rect.y <= edge.y + edge.height + gap &&
+            rect.y + rect.height >= edge.y - gap
+    );
+}

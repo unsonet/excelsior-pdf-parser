@@ -311,6 +311,8 @@ export function extractClosedSubpathRectangles(
     let coordIndex = 0;
     let opIndex = 0;
 
+    let legacySubpathLogged = 0;
+
     while (opIndex < pathOps.length) {
         if (pathOps[opIndex] !== OPS.moveTo) {
             const op = pathOps[opIndex];
@@ -335,6 +337,7 @@ export function extractClosedSubpathRectangles(
 
         const subOps: number[] = [OPS.moveTo];
         const subCoords: number[] = [...points[0]];
+        const subCoordsExact: number[] = [...points[0]];  // current coordinates
 
         let closed = false;
         let hasCurves = false;
@@ -358,8 +361,10 @@ export function extractClosedSubpathRectangles(
 
             const coordCount = coordCountFor(op);
 
+            // In the loop that copies the subpath statements:
             for (let k = 0; k < coordCount; k++) {
-                subCoords.push(pathCoords[coordIndex]);
+                subCoords.push(pathCoords[coordIndex]);              // legacy: this is where background_lines_2.pdf is stored
+                subCoordsExact.push(pathCoords[coordIndex + k]);
             }
 
             if (op === OPS.lineTo) {
@@ -379,13 +384,27 @@ export function extractClosedSubpathRectangles(
 
         const rect = closed && !hasCurves ? trySubpathToRect(points) : null;
 
+        // TEMP DIAGNOSTIC
+        if (!hasCurves && legacySubpathLogged < 8 && subCoords.some((value, index) => value !== subCoordsExact[index])) {
+            legacySubpathLogged++;
+            console.error('[LEGACY SUBPATH]', JSON.stringify({
+                closed,
+                ops: subOps.slice(0, 12),
+                exact: subCoordsExact.slice(0, 24).map((value) => +Number(value).toFixed(2))
+            }));
+        }
+
         if (rect) {
             outOps.push(OPS.rectangle);
             outCoords.push(...rect);
         } else {
             outOps.push(...subOps, ...(closed ? [OPS.closePath] : []));
-            outCoords.push(...subCoords);
+            // Subpaths with curves (rounded contours) need to be specified with actual coordinates (birdisland.pdf).
+            // Leave the rest as they are for now, until background_lines_2.pdf has been parsed.
+            outCoords.push(...(hasCurves ? subCoordsExact : subCoords));
         }
+
+
     }
 
     return { ops: outOps, coords: outCoords };
@@ -438,35 +457,35 @@ export function normalizeShowTextArgs(args: any): any[] {
 }
 
 /**
- * Видимый глиф-пунктуация, у которого ToUnicode начинается с пробела (" ."):
- * этот пробел не имеет ширины, глиф занимает место одного символа.
+ * A visible punctuation glyph whose ToUnicode value begins with a space (“ .”):
+ * This space has no width; the glyph occupies the space of a single character.
  */
 export function normalizeGlyphUnicode(entries: any[]): any[] {
-  if (!Array.isArray(entries)) {
-    return entries;
-  }
-
-  return entries.map(entry => {
-    if (!entry || typeof entry !== 'object' || entry.isSpace || entry.isLineBreak) {
-      return entry;
+    if (!Array.isArray(entries)) {
+        return entries;
     }
 
-    const unicode = entry.unicode;
-    if (typeof unicode !== 'string' || unicode.length < 2) {
-      return entry;
-    }
+    return entries.map(entry => {
+        if (!entry || typeof entry !== 'object' || entry.isSpace || entry.isLineBreak) {
+            return entry;
+        }
 
-    const visible = unicode.trim();
-    const hasOnlyLeadingPadding = visible.length === 1 && unicode.endsWith(visible);
-    const isLetterDigitOrMark = /[\p{L}\p{N}\p{M}]/u.test(visible);
+        const unicode = entry.unicode;
+        if (typeof unicode !== 'string' || unicode.length < 2) {
+            return entry;
+        }
 
-    if (!hasOnlyLeadingPadding || isLetterDigitOrMark) {
-      return entry;
-    }
+        const visible = unicode.trim();
+        const hasOnlyLeadingPadding = visible.length === 1 && unicode.endsWith(visible);
+        const isLetterDigitOrMark = /[\p{L}\p{N}\p{M}]/u.test(visible);
 
-    // глифы pdf.js кэшируются и общие между операторами — не мутируем, копируем
-    return { ...entry, unicode: visible };
-  });
+        if (!hasOnlyLeadingPadding || isLetterDigitOrMark) {
+            return entry;
+        }
+
+        // pdf.js glyphs are cached and shared across statements—we don't mutate them, we copy them
+        return { ...entry, unicode: visible };
+    });
 }
 
 export function normalizeDependencyArgs(args: any): string[] {
@@ -485,64 +504,64 @@ export function normalizeDependencyArgs(args: any): string[] {
 
 
 export function parseCssColor(
-  color: string | null | undefined
+    color: string | null | undefined
 ): [number, number, number, number] | null {
-  if (!color) {
+    if (!color) {
+        return null;
+    }
+    const value = color.trim().toLowerCase().replace(/\s+/g, '');
+
+    const rgb = value.match(/^rgba?\((\d*\.?\d+),(\d*\.?\d+),(\d*\.?\d+)(?:,(\d*\.?\d+))?\)$/);
+    if (rgb) {
+        return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3]), rgb[4] === undefined ? 1 : Number(rgb[4])];
+    }
+
+    const hex = value.match(/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/);
+    if (hex) {
+        const digits = hex[1].length <= 4 ? [...hex[1]].map(char => char + char).join('') : hex[1];
+        return [
+            parseInt(digits.slice(0, 2), 16),
+            parseInt(digits.slice(2, 4), 16),
+            parseInt(digits.slice(4, 6), 16),
+            digits.length === 8 ? parseInt(digits.slice(6, 8), 16) / 255 : 1
+        ];
+    }
     return null;
-  }
-  const value = color.trim().toLowerCase().replace(/\s+/g, '');
-
-  const rgb = value.match(/^rgba?\((\d*\.?\d+),(\d*\.?\d+),(\d*\.?\d+)(?:,(\d*\.?\d+))?\)$/);
-  if (rgb) {
-    return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3]), rgb[4] === undefined ? 1 : Number(rgb[4])];
-  }
-
-  const hex = value.match(/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/);
-  if (hex) {
-    const digits = hex[1].length <= 4 ? [...hex[1]].map(char => char + char).join('') : hex[1];
-    return [
-      parseInt(digits.slice(0, 2), 16),
-      parseInt(digits.slice(2, 4), 16),
-      parseInt(digits.slice(4, 6), 16),
-      digits.length === 8 ? parseInt(digits.slice(6, 8), 16) / 255 : 1
-    ];
-  }
-  return null;
 }
 
 // Colour as it looks on a white page: translucent colours are blended.
 export function toVisibleRgb(color: [number, number, number, number]): number[] {
-  const alpha = Math.min(1, Math.max(0, color[3]));
-  return color.slice(0, 3).map(channel => channel * alpha + 255 * (1 - alpha));
+    const alpha = Math.min(1, Math.max(0, color[3]));
+    return color.slice(0, 3).map(channel => channel * alpha + 255 * (1 - alpha));
 }
 
 export function isSameVisibleColor(
-  first: string | null | undefined,
-  second: string | null | undefined,
-  tolerance = 2
+    first: string | null | undefined,
+    second: string | null | undefined,
+    tolerance = 2
 ): boolean {
-  const firstColor = parseCssColor(first ?? PAGE_BACKGROUND);
-  const secondColor = parseCssColor(second ?? PAGE_BACKGROUND);
-  if (!firstColor || !secondColor) {
-    return (first ?? PAGE_BACKGROUND) === (second ?? PAGE_BACKGROUND);
-  }
-  const a = toVisibleRgb(firstColor);
-  const b = toVisibleRgb(secondColor);
-  return a.every((channel, index) => Math.abs(channel - b[index]) <= tolerance);
+    const firstColor = parseCssColor(first ?? PAGE_BACKGROUND);
+    const secondColor = parseCssColor(second ?? PAGE_BACKGROUND);
+    if (!firstColor || !secondColor) {
+        return (first ?? PAGE_BACKGROUND) === (second ?? PAGE_BACKGROUND);
+    }
+    const a = toVisibleRgb(firstColor);
+    const b = toVisibleRgb(secondColor);
+    return a.every((channel, index) => Math.abs(channel - b[index]) <= tolerance);
 }
 
 // A border painted in the colour of a fill it touches is only the edge of
 // that fill, not a separate line. A missing fill (null) is the white page.
 export function isBorderAbsorbedByFills(
-  borderColor: string | null | undefined,
-  fills: Array<string | null | undefined>
+    borderColor: string | null | undefined,
+    fills: Array<string | null | undefined>
 ): boolean {
-  if (!borderColor) {
-    return true;
-  }
-  const parsed = parseCssColor(borderColor);
-  if (parsed && parsed[3] < 0.05) {
-    return true;
-  }
-  return fills.some(fill => isSameVisibleColor(borderColor, fill));
+    if (!borderColor) {
+        return true;
+    }
+    const parsed = parseCssColor(borderColor);
+    if (parsed && parsed[3] < 0.05) {
+        return true;
+    }
+    return fills.some(fill => isSameVisibleColor(borderColor, fill));
 }
