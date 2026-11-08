@@ -4376,18 +4376,7 @@ export function init({
                 }
                 const loser = isBetter(infos[i], infos[j]) ? infos[j] : infos[i];
                 removed.add(loser.index);
-                // TEMP DIAGNOSTIC
-                if (loggedRemovals < 12 && /^[\d\s().,\-–§*†‡]*$/.test(String(loser.item.str || ''))) {
-                  loggedRemovals++;
-                  const winner = loser === infos[i] ? infos[j] : infos[i];
-                  const box = (info: any) => [info.left, info.right, info.baseline, info.height].map((value: number) => +value.toFixed(2));
-                  console.error('[DEDUPE REMOVED]', JSON.stringify({
-                    loser: String(loser.item.str || '').trim(),
-                    winner: String(winner.item.str || '').trim(),
-                    loserBox: box(loser),
-                    winnerBox: box(winner)
-                  }));
-                }
+                
                 if (loser === infos[i]) {
                   break;
                 }
@@ -15473,22 +15462,6 @@ export function init({
     let documentLoadingTask = await pdfjs.getDocument(docParams);
     let documentProxy = await documentLoadingTask.promise;
     try {
-
-      // === diagnostics getOperatorList ===
-      const testPage = await documentProxy.getPage(1);
-      const testOpList = await testPage.getOperatorList();
-
-      const uniqueFns = [...new Set(testOpList.fnArray)].sort((a: any, b: any) => a - b);
-      console.error('[DIAG] fnArray length:', testOpList.fnArray.length);
-      console.error('[DIAG] unique fn values:', uniqueFns.join(', '));
-      console.error('[DIAG] has constructPath (91)?', uniqueFns.includes(91));
-      console.error('[DIAG] has rectangle (19)?', uniqueFns.includes(19));
-      console.error('[DIAG] has moveTo (13)?', uniqueFns.includes(13));
-      console.error('[DIAG] has lineTo (14)?', uniqueFns.includes(14));
-      console.error('[DIAG] has save (10)?', uniqueFns.includes(10));
-      console.error('[DIAG] has restore (11)?', uniqueFns.includes(11));
-      // ===================================
-
       let extractorResults = await extractor({ doc: documentProxy, onProgress, pages, debugOptions: debug });
       let results = { extractorResults, documentProxy };
       if (onSuccess) {
