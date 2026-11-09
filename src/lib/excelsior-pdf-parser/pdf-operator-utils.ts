@@ -387,11 +387,6 @@ export function extractClosedSubpathRectangles(
         // TEMP DIAGNOSTIC
         if (!hasCurves && legacySubpathLogged < 8 && subCoords.some((value, index) => value !== subCoordsExact[index])) {
             legacySubpathLogged++;
-            console.error('[LEGACY SUBPATH]', JSON.stringify({
-                closed,
-                ops: subOps.slice(0, 12),
-                exact: subCoordsExact.slice(0, 24).map((value) => +Number(value).toFixed(2))
-            }));
         }
 
         if (rect) {

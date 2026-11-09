@@ -31,6 +31,8 @@ export const OPS: { [key: string]: number } = {
   constructPath: 91, setStrokeTransparent: 92, setFillTransparent: 93
 }
 export const PAGE_BACKGROUND = 'rgb(255,255,255)';
+export const LINE_MAX_WIDTH = 5;//old:2.5;
+
 
 export const LEADER_CHARS = '[.\\u00B7\\u2022\\u2024\\u2026\\u2027\\u2219\\u22C5_\\-\\u2013\\u2014=~*]';
 export const LEADER_RUN = new RegExp(`(${LEADER_CHARS})(?:\\s?\\1){4,}`, 'u');

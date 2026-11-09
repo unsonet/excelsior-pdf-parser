@@ -4,7 +4,7 @@
 // import { dirname } from 'path';
 import { getTextDirection, findClosestIndex, parseRGB, getMergedArray, uniqueArr, findMod, findAverage, caseIndependentCompare, splitByIndex, checkRectangleRanges, removeByIndexes, getSplitEdgeRange, getOnePercentOfAbsoluteDifference, typeValue, sortArrayOfObjects, deepSet, stringifyPseudoJson, isSequentialIndexRow } from '@unsonet/js-utils'
 import { buildDebugReport, DebugOptions } from '../pdftrace-debug-kit/pdf-debug';
-import { headerIndicatorWords as _headerIndicatorWords, OPS as _OPS, isLeaderGlyph, isLeaderOnlyText, LEADER_CHARS, LEADER_RUN, LEADER_THEN_CONTENT, LEADER_TRAILING_RUN, materializeLeaderGaps } from '../constants';
+import { headerIndicatorWords as _headerIndicatorWords, OPS as _OPS, isLeaderGlyph, isLeaderOnlyText, LEADER_CHARS, LEADER_RUN, LEADER_THEN_CONTENT, LEADER_TRAILING_RUN, LINE_MAX_WIDTH, materializeLeaderGaps } from '../constants';
 import {
   applyTransformFn,
   extractArrayLike,
@@ -33,6 +33,10 @@ import {
   getAverageBorderSize,
   mergeCoordinates,
 } from './pdf-grid-utils';
+import { filterBlocks } from './filter-blocks';
+import { isHeaderIndicator } from './header-indicator';
+import { createRangeIndex, getBoxRange, getTextYRange } from './range-index';
+import { DEBUG_LOG, verifySameResult } from './pdf-log';
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = dirname(__filename);
 export function init({
@@ -97,7 +101,7 @@ export function init({
     const debugEnabled = typeof debugOptions?.onReport === 'function';
     var numPages = doc.numPages;
     var result: { pageTables: Array<any>, numPages: number, currentPage: number } = { pageTables: [], numPages: numPages, currentPage: 0, };
-    var lineMaxWidth = 5;//old:2.5;
+    var lineMaxWidth = LINE_MAX_WIDTH;
 
 
     // === CJK normalization utilities ===
@@ -149,9 +153,6 @@ export function init({
         let pageWidth = pageViewport.width;
         let pageHeight = pageViewport.height;
 
-        console.error(`[DEBUG Page ${pageNum}] getTextContent items:`, pageTextContent.items.length);
-        console.error(`[DEBUG Page ${pageNum}] first 3 items:`, pageTextContent.items.slice(0, 3).map(i => i ? { str: i.str, hasEOL: i.hasEOL, width: i.width, height: i.height } : 'NULL'));
-
         if (debugTrace) {
           debugTrace.pageSize = {
             width: pageViewport.width,
@@ -179,21 +180,27 @@ export function init({
           return prev;
         }, []);
 
-        console.error(`[DEBUG Page ${pageNum}] filtered items:`, pageTextContent.items.length);
+        const textItemsIndex = createRangeIndex(pageTextContent.items, (item: any) =>
+          getTextYRange(item.transform, item.width, item.height)
+        );
 
-
-
-        function getRelatedTextContentItems(element) {
-          return pageTextContent.items.filter((item, index) => {
+        function getRelatedTextContentItems(element: any, source: { transform: number[]; width: number; height: number }) {
+          const isRelated = (item: any): boolean => {
             if (!item) return false;
             const candidateBox = getDeviceBBox(item.transform, item.width, item.height);
-            return (checkRectangleRanges(
-              element,
-              candidateBox,
-              { axis: ['x', 'y'], strict: false, strictIntersecting: false }
-            ) as Array<any>).every(item => item.inRange)
-          });
-        };
+            return (
+              checkRectangleRanges(element, candidateBox, { axis: ['x', 'y'], strict: false, strictIntersecting: false }) as Array<any>
+            ).every(res => res.inRange);
+          };
+
+          const range = getTextYRange(source.transform, source.width, source.height);
+          const candidates = range
+            ? textItemsIndex.query(range[0], range[1]).map(i => pageTextContent.items[i])
+            : pageTextContent.items;
+          const related = candidates.filter(isRelated);
+          verifySameResult('related text items', related, () => pageTextContent.items.filter(isRelated));
+          return related;
+        }
 
 
 
@@ -412,13 +419,6 @@ export function init({
               };
 
               const continuation = findContinuationItem(flushed);
-              console.error('[STALE FLUSH]', {
-                text: flushed.str,
-                ownBaseline: reference.transform[5],
-                sourceBaseline,
-                usedBaseline: baseline,
-                mergedInto: continuation?.str || null
-              });
 
               if (continuation) {
                 attachToContinuation(continuation, flushed);
@@ -653,7 +653,6 @@ export function init({
           const _fnArray = Array.from(opList.fnArray || []);
           const _argsArray = Array.from(opList.argsArray || []);
 
-          console.error(`[DIAG Page ${pageNum}] total ops:`, _fnArray.length);
           let constructPathCount = 0;
           let rectOutsideLogged = 0;
           let outlineLogged = 0;
@@ -743,14 +742,6 @@ export function init({
                   pathCoords = rawThird;
                   bboxArr = normArgs.length >= 4 ? extractArrayLike(normArgs[3]) : [];
 
-                  if (constructPathCount === 1) {
-                    console.error(`[DIAG Page ${pageNum}] pdfjs6 format detected`);
-                    console.error(`[DIAG Page ${pageNum}] paintType:`, paintType);
-                    console.error(`[DIAG Page ${pageNum}] pathOps (first 10):`, pathOps.slice(0, 10));
-                    console.error(`[DIAG Page ${pageNum}] pathCoords (first 8):`, pathCoords.slice(0, 8));
-                    console.error(`[DIAG Page ${pageNum}] bboxArr:`, bboxArr);
-                  }
-
                   if (bboxArr.length >= 4) {
                     var rx = bboxArr[0];
                     var ry = bboxArr[1];
@@ -782,13 +773,6 @@ export function init({
                     for (var k = 0; k < segArr.length; k++) {
                       pathData.push(segArr[k]);
                     }
-                  }
-
-                  if (constructPathCount === 1) {
-                    console.error(`[DIAG Page ${pageNum}] normArgs[0]:`, normArgs[0]);
-                    console.error(`[DIAG Page ${pageNum}] segments count:`, segments.length);
-                    console.error(`[DIAG Page ${pageNum}] pathData length:`, pathData.length);
-                    console.error(`[DIAG Page ${pageNum}] pathData (first 20):`, pathData.slice(0, 20));
                   }
 
                   // Mapping pdf.js DrawOPS → old OPS: 0=moveTo, 1=lineTo, 2=curveTo, 3=quadraticCurveTo, 4=closePath
@@ -833,9 +817,7 @@ export function init({
 
                   // Restoring rectangle from bbox (args[2])
                   bboxArr = extractArrayLike(normArgs[2]);
-                  if (constructPathCount === 1) {
-                    console.error(`[DIAG Page ${pageNum}] bboxArr:`, bboxArr);
-                  }
+
                   if (isNewFormat && paintType != null && paintType !== OPS.endPath) {
                     const isFillOnlyPaint = paintType === OPS.fill || paintType === OPS.eoFill;
                     if (isFillOnlyPaint) {
@@ -845,17 +827,6 @@ export function init({
                       // The cell background is often drawn using a single fill path consisting of dozens of sub‑rectangles;
                       // each represents the geometry of a separate cell (including merged rowspan/colspan). 
                       const extracted = extractClosedSubpathRectangles(pathOps, pathCoords, OPS);
-
-                      if (i === 1021 || i === 807) {
-                        console.error('[EXTRACT RECTS]', JSON.stringify({
-                          op: i,
-                          beforeOps: beforeOps.slice(0, 14),
-                          beforeCoords: beforeCoords.slice(0, 24).map(round),
-                          afterOps: extracted.ops.slice(0, 14),
-                          afterCoords: extracted.coords.slice(0, 24).map(round)
-                        }));
-                      }
-
                       pathOps = extracted.ops;
                       pathCoords = extracted.coords;
                     }
@@ -895,11 +866,6 @@ export function init({
                   pathOps = [OPS.rectangle, OPS.closePath];
                   pathCoords = [...rectCoords];
                 }
-              }
-
-              if (constructPathCount === 1) {
-                console.error(`[DIAG Page ${pageNum}] constructPath #1 pathOps:`, pathOps);
-                console.error(`[DIAG Page ${pageNum}] constructPath #1 pathCoords (first 8):`, pathCoords.slice(0, 8));
               }
 
               const moveCurrentPointTo = (pointX: number, pointY: number): void => {
@@ -974,13 +940,6 @@ export function init({
                     if (rectOutsideLogged < 5) {
                       rectOutsideLogged++;
                       const round = (value: any): any => (Number.isFinite(Number(value)) ? +Number(value).toFixed(2) : value);
-                      console.error('[RECT OUTSIDE PATH BBOX]', {
-                        op: i,
-                        rect: [rx, ry, rwidth, rheight].map(round),
-                        bbox: pathBBox.map(round),
-                        pathOps: pathOps.slice(0, 12),
-                        pathData: (pathData || []).slice(0, 40).map(round)
-                      });
                     }
                     continue; // прямоугольник испорчен реконструкцией
                   }
@@ -1878,7 +1837,7 @@ export function init({
               }
 
               function trimTableContentItem(item, clearStart = true, clearEnd = true) {
-                item = JSON.parse(JSON.stringify(item));
+                item = { ...item }// old: item = JSON.parse(JSON.stringify(item));
                 let chars = clearChars({
                   chars: item.chars,
                   fullClear: true,
@@ -1916,14 +1875,6 @@ export function init({
               const textMatrixTail = textMatrix.slice(-2).toString();
               const contentItemTail = preliminaryItem.transform.slice(-2).toString();
               const tailsMatch = textMatrixTail === contentItemTail;
-
-              if (!tailsMatch) {
-                console.error('[ROTATED FINAL TRANSFORM MISMATCH]', {
-                  fontName: current.fontName,
-                  textMatrix: [...textMatrix],
-                  contentItemTransform: [...preliminaryItem.transform],
-                });
-              }
 
               let finalTransform = tailsMatch
                 ? preliminaryItem.transform
@@ -2044,6 +1995,7 @@ export function init({
 
               let relatedTextContentItems = getRelatedTextContentItems(
                 getDeviceBBox(preliminaryItem.transform, preliminaryItem.width, preliminaryItem.height),
+                preliminaryItem
               ).filter(item => {
                 if (!item) return false;
 
@@ -3001,37 +2953,10 @@ export function init({
                         fontSize: curEffectiveHeight
                       });
 
-                      console.error('[MERGE RANGE DEBUG]', {
-                        related: relatedTextContentItem?.str,
-                        cur: cur.str,
-                        useRelatedRange,
-                        curX: cur.transform[4],
-                        curRight:
-                          cur.transform[4] + cur.width,
-                        relatedX:
-                          relatedTextContentItem?.transform?.[4],
-                        relatedRight:
-                          relatedTextContentItem
-                            ? relatedTextContentItem.transform[4] +
-                            relatedTextContentItem.width
-                            : undefined,
-                        beforeClear:
-                          handledValues.charsRangesArrays[1]
-                            ?.map(g => g?.unicode || '')
-                            .join(''),
-                      });
-
                       chars = clearChars({
                         chars: handledValues.charsRangesArrays[1],
                         fullClear: false,
                         clearStart: true
-                      });
-
-                      console.error('[MERGE CLEAR DEBUG]', {
-                        afterClear:
-                          chars
-                            ?.map(g => g?.unicode || '')
-                            .join(''),
                       });
 
                       let mergedChars = handledValues.charsRangesArrays.flat();
@@ -3471,13 +3396,13 @@ export function init({
                       edges: visibleEdges,
                       tolerance: borderSize * 2,
                     }) : false;
-                    let topEdges = filterBlocks(visibleEdges, {
-                      'x': [newItem.transform[4], newItem.transform[4] + newItem.width],
-                      'y': [newItem.y, Infinity],
-                      strict: false,
-                      withoutOverlap: false,
-                      strictIntersecting: true
-                    });
+                    // let topEdges = filterBlocks(visibleEdges, {
+                    //   'x': [newItem.transform[4], newItem.transform[4] + newItem.width],
+                    //   'y': [newItem.y, Infinity],
+                    //   strict: false,
+                    //   withoutOverlap: false,
+                    //   strictIntersecting: true
+                    // });
 
                     let intersectingGridItemsObj = (() => {
                       let obj = {};
@@ -3945,20 +3870,7 @@ export function init({
               const textEnd = String(item.str).replace(/\s+$/, '').length;
               item.str = String(item.str).slice(0, textEnd) + missing + String(item.str).slice(textEnd);
               item.width = Math.max(item.width || 0, extent.right + tailWidth - item.transform[4]);
-
-              console.error('[TAIL RECOVERED]', {
-                before,
-                after: item.str,
-                reference: reference.str,
-                tailWidth: +tailWidth.toFixed(3),
-                // undefined => the item was built by mergeFragments (a new object), not by the interpreter
-                sourceOp: item.__pdfTraceOpIndex,
-              });
             });
-
-            if (skipped.length) {
-              console.error('[TAIL SKIPPED]', skipped.slice(0, 10));
-            }
           }
 
           function isRotatedText(item) {
@@ -4376,7 +4288,7 @@ export function init({
                 }
                 const loser = isBetter(infos[i], infos[j]) ? infos[j] : infos[i];
                 removed.add(loser.index);
-                
+
                 if (loser === infos[i]) {
                   break;
                 }
@@ -4397,10 +4309,6 @@ export function init({
               if (item.hasEOT && result.length) {
                 result[result.length - 1].hasEOT = true;
               }
-            });
-            console.error('[OVERLAY DUPLICATES REMOVED]', {
-              removed: removed.size,
-              sample: [...removed].slice(0, 8).map(index => items[index]?.str)
             });
             return result;
           }
@@ -4561,14 +4469,6 @@ export function init({
 
             const direction = positiveCount >= negativeCount ? 1 : -1;
 
-            console.error('[GLOBAL ROTATION DETECT]', {
-              totalRealTextItems: realTextItems.length,
-              rotatedItems: rotatedItems.length,
-              positiveCount,
-              negativeCount,
-              direction,
-            });
-
             return direction;
           }
 
@@ -4695,17 +4595,6 @@ export function init({
                 item.height = Math.max(item.height || 0, Math.hypot(newC, newD) || 0, 1);
               }
             }
-
-            console.error('[GLOBAL ROTATION APPLIED]', {
-              direction: globalRotationDirection,
-              shiftX,
-              shiftY,
-              sampleTextItems: tableContentItems
-                .filter(i => i?.str?.trim())
-                .slice(0, 5)
-                .map(i => ({ str: i.str, transform: i.transform })),
-              sampleEdges: edges.slice(0, 3),
-            });
           } else if (!globalRotationDirection) {
             for (const item of tableContentItems) {
               for (const glyph of item.chars || []) {
@@ -4741,61 +4630,6 @@ export function init({
                 previousItem,
                 currentItem
               );
-
-            if (
-              (
-                previousItem?.str?.includes('Comments') ||
-                currentItem?.str?.includes('West Bengal') ||
-                previousItem?.str?.includes('West Bengal') ||
-                currentItem?.str?.includes('Bihar') ||
-                previousItem?.str?.trim() === '1' ||
-                currentItem?.str?.trim() === '1'
-              )
-            ) {
-              console.log('[CELL-BOUNDARY-DIAG]', {
-                previous: {
-                  str: previousItem.str,
-                  x: previousItem.transform?.[4],
-                  y: previousItem.transform?.[5],
-                  width: previousItem.width,
-                  height: previousItem.height,
-                  hasEOT: previousItem.hasEOT,
-                  hasEOL: previousItem.hasEOL,
-                  rotated: isRotatedText(previousItem),
-                },
-
-                current: {
-                  str: currentItem.str,
-                  x: currentItem.transform?.[4],
-                  y: currentItem.transform?.[5],
-                  width: currentItem.width,
-                  height: currentItem.height,
-                  hasEOT: currentItem.hasEOT,
-                  hasEOL: currentItem.hasEOL,
-                  rotated: isRotatedText(currentItem),
-                },
-
-                hasVerticalSeparator:
-                  hasVerticalSeparatorBetween(
-                    previousItem,
-                    currentItem
-                  ),
-
-                hasHorizontalSeparator:
-                  hasHorizontalSeparatorBetween(
-                    previousItem,
-                    currentItem
-                  ),
-
-                hasSeparator,
-
-                sameRotatedCell:
-                  areInSameRotatedCell(
-                    previousItem,
-                    currentItem
-                  ),
-              });
-            }
 
             if (hasSeparator) {
               previousItem.hasEOT = true;
@@ -5076,10 +4910,6 @@ export function init({
               }
             }
           }
-
-          console.log(`[DIAG T]`, tableContentItems.length, tableContentItemsStr);
-          console.error(`[DIAG Page ${pageNum}] constructPath hits:`, constructPathCount);
-          console.error(`[DIAG Page ${pageNum}] edges after loop:`, edges.length, 'rectangles:', rectangles.length);
 
           function getSymbolsBetween(
             relatedStr: string,
@@ -5381,7 +5211,6 @@ export function init({
             }
 
             starts.sort((a, b) => a.x - b.x);
-            console.error('[COLUMN STARTS]', starts.map(start => +start.x.toFixed(1)));
             if (!starts.length) return items;
 
             const isColumnStart = (x: number) => starts.some(start => Math.abs(start.x - x) <= START_TOLERANCE);
@@ -5434,10 +5263,6 @@ export function init({
                 }
 
                 cutMap.set(current.sourceIndex, current.glyph.x);
-                console.error('[SINGLE-SPACE COLUMN CUT]', {
-                  text: String(item.str).trim().slice(0, 40),
-                  x: +current.glyph.x.toFixed(2),
-                });
               }
 
               // A source text item can encode different cells separated by a PDF line move.
@@ -5578,8 +5403,6 @@ export function init({
               // Nothing lies left of the first column start: the table edge is its border, not a column boundary.
               .filter((border, index) => index > 0 || border.hasContentOnTheLeft)
               .map(({ x, yFrom, yTo }) => ({ x, yFrom, yTo }));
-
-            console.error('[COLUMN BORDERS]', pageColumnBorders.map(border => +border.x.toFixed(1)));
             return result;
           }
 
@@ -6101,42 +5924,6 @@ export function init({
             return coordinates;
           }
 
-          function filterBlocks(blocks, options) {
-            const { x, y, withoutOverlap, strict, filterFn, strictIntersecting, tolerance } = options;
-            let blocksCopy = JSON.parse(JSON.stringify(blocks || '[]'));
-            let intersectsNextGridItem = false;
-            let filteredBlocks = blocksCopy.filter((block, index, arr) => {
-              const xInRange: any = checkRectangleRanges(block, { x, y }, { axis: 'x', strict, strictIntersecting, tolerance });
-              const yInRange: any = checkRectangleRanges(block, { x, y }, { axis: 'y', strict, strictIntersecting, tolerance });
-              block.contained = [xInRange, yInRange].every((item: any) => item.isContained && (item.biggestArgument == 1 || item.biggestArgument == null));
-              return xInRange?.inRange && yInRange?.inRange && (filterFn ? filterFn(block, index, arr) : true);
-            });
-
-            if (withoutOverlap && (x || y)) {
-              // Check overlap in x-axis or y-axis
-              const axis = x ? 'y' : 'x';
-              for (let i = 0; i < filteredBlocks.length; i++) {
-                for (let j = i + 1; j < filteredBlocks.length; j++) {
-                  if (
-                    (checkRectangleRanges(filteredBlocks[i], filteredBlocks[j], { axis, strictIntersecting: true }) as any).inRange &&
-                    (filteredBlocks[i].index != filteredBlocks[j].index)
-                  ) {
-                    intersectsNextGridItem = true;
-                  }
-                }
-              }
-            }
-
-            Object.defineProperty(filteredBlocks, 'intersectsNextGridItem', {
-              value: intersectsNextGridItem,
-              enumerable: false,
-              configurable: true,
-              writable: true
-            });
-
-            return filteredBlocks;
-          }
-
           function countProperties(arr) {
             const result = {};
 
@@ -6389,7 +6176,6 @@ export function init({
             return uniqueY.length >= 2;
           }
 
-
           function determineHeaderRows(options) {
             let {
               coordinates,
@@ -6401,23 +6187,6 @@ export function init({
               cols,
               separatorRows = [],
             } = options;
-
-            function isHeaderIndicator(str) {
-              str = str?.trim() || '';
-
-              let headerIndicatorWords: { [key: string]: Array<string> } = _headerIndicatorWords;
-              let headerIndicatorWordsArray = Object.keys(headerIndicatorWords).reduce((prev, cur) => {
-                return [...prev, ...headerIndicatorWords[cur]];
-              }, []);
-
-              let getParsedStrArray = (str) => str.split(/(?=\p{Lu})|-| |_|\./gum).filter(item => item && !/^[^\p{L}\d]$/ui.test(item)).map(item => item.toLowerCase());
-              //regular expression that finds strings containing the keyword, but only if there is a single word before or after it, or if the keyword stands alone.
-              let getHeaderTextRegExp = (keyWord) => new RegExp(`^(?:(?<![\\p{L}\\p{N}_])(?:(?:\\p{L}|\\p{N})+\\s+)?(?:${getParsedStrArray(keyWord).join(' ')})(?:\\s+(?:\\p{L}|\\p{N})+)?(?![\\p{L}\\p{N}_]))$`, 'ui');
-              return headerIndicatorWordsArray.some(item => (
-                caseIndependentCompare(item, str) ||
-                getHeaderTextRegExp(item).test(getParsedStrArray(str).join(' '))
-              ));
-            }
 
             let allPropertiesCounter = countProperties(coordinates?.filter(item => item?.str) || []);
 
@@ -6471,9 +6240,21 @@ export function init({
               return bins;
             }
 
-
-
             let cumulativeOccupiedCols = new Set();
+
+            const maxVerticalBorderWidth = (edges || []).reduce(
+              (max, edge) =>
+                isVisibleVector(edge) && edge.width < lineMaxWidth && edge.height > lineMaxWidth
+                  ? Math.max(edge.width, max)
+                  : max,
+              0
+            );
+
+            const taggedElements = [
+              ...(coordinates || []).map(item => Object.assign({}, item, { vectorType: 'coordinate' })),
+              ...(edges || []).map(item => Object.assign({}, item, { vectorType: 'edge' })),
+              ...(rectangles || []).map(item => Object.assign({}, item, { vectorType: 'rectangle' }))
+            ];
 
             let headerRows = rows.sort((a, b) => b - a).reduce((prev, item, index, arr) => {
               let nextItem = arr[index + 1];
@@ -6481,23 +6262,13 @@ export function init({
                 let range = [item, nextItem];
                 let rangeStr = range.join('-');
 
-                let medianBorderWidth = 0;
-                // Vertical table separators
-                let verticalEdges = edges.filter(e => {
-                  let res = isVisibleVector(e) && e.width < lineMaxWidth && e.height > lineMaxWidth;
-                  if (res) {
-                    medianBorderWidth = Math.max(e.width, medianBorderWidth);
-                  }
-                  return res;
-                });
+                const medianBorderWidth = maxVerticalBorderWidth;
 
                 const rangeMargin = Math.max(medianBorderWidth * 2, 0.5);//old:(medianBorderWidth * 2)
                 let textBlocks = filterBlocks(coordinates.filter(item => item?.str), {
                   'y': range.map((r, i) => (i == 0 ? r - rangeMargin : r + rangeMargin)),
                   strictIntersecting: true
                 });
-                console.error('[HEADER ROW TRACE] range', range.join('-').replace(/(?<=\.\d{3,})\d+/gim, ''), 'textBlocks:', textBlocks.map(tb => tb.str));
-
                 // GUARD: single-block line at the edge of the table = caption?
                 if (textBlocks.length === 1 && edges?.length) {
                   let isFirstOrLastRow = (index === 0) || (index >= arr.length - 2);
@@ -6608,22 +6379,28 @@ export function init({
                     textBlocks.length > 0 &&
                     numericBlocksCount > textBlocks.length / 2;
 
-                  console.error('[HEADER ROW TRACE] range', range.join('-'), 'isMajorityNumericRow:', isMajorityNumericRow, 'numericBlocksCount:', numericBlocksCount, 'of', textBlocks.length);
-
                   textBlocks?.forEach(textBlock => {
+
 
                     const boundaryY = (element: any) =>
                       element.vectorType === 'rectangle' && element.y + element.height <= textBlock.y + 0.5
                         ? element.y + element.height
                         : element.y;
 
-                    let bottomElements = filterBlocks([
-                      ...(coordinates || [])?.map(item => Object.assign({}, item, { vectorType: 'coordinate' })),
-                      ...(edges || [])?.map(item => Object.assign({}, item, { vectorType: 'edge' })),
-                      ...(rectangles || [])?.map(item => Object.assign({}, item, { vectorType: 'rectangle' })),
-                    ], { 'x': [textBlock.x, textBlock.x + textBlock.width], 'y': [textBlock.y, 0], strictIntersecting: true })
-                      ?.filter(item => item.vectorType == 'coordinate' ? true : isVisibleVector(item))//old:item.strokeColor || item.fillColor
-                      ?.sort((a, b) => boundaryY(b) - boundaryY(a)) || [];//old:  (b.y - a.y)
+                    let bottomElementsCache: any[] | null = null;
+                    const getBottomElements = (): any[] => {
+                      if (!bottomElementsCache) {
+                        bottomElementsCache = filterBlocks(taggedElements, {
+                          x: [textBlock.x, textBlock.x + textBlock.width],
+                          y: [textBlock.y, 0],
+                          strictIntersecting: true
+                        })
+                          .filter((item: any) => (item.vectorType == 'coordinate' ? true : isVisibleVector(item)))//old:item.strokeColor || item.fillColor
+                          .sort((a: any, b: any) => boundaryY(b) - boundaryY(a));//old:  (b.y - a.y)
+                      }
+                      return bottomElementsCache;
+                    };
+
 
                     if (customConditionFn) {
                       let customCondition = customConditionFn({
@@ -6704,84 +6481,72 @@ export function init({
                     }
 
                     let hasBottomBorder = true;
-                    if (edges || rectangles) {
-                      hasBottomBorder = [bottomElements[0], bottomElements[1]].some(item =>
-                        ['rectangle', 'edge'].includes(item?.vectorType)
-                      );
+                    const needsBottomBorder = !isMajorityNumericRow && hasMajorityStyle && hasDistinctStyle && hasUniformStr;
 
-                      // Multi-line header cell. The second line of this
-                      // cell appears below the first line (text within the current table row), and the border follows it.
-                      if (!hasBottomBorder) {
-                        const rowBottom = range[1] - medianBorderWidth * 2;
+                    if (needsBottomBorder) {
+                      if (edges || rectangles) {
+                        const bottomElements = getBottomElements();
+                        hasBottomBorder = [bottomElements[0], bottomElements[1]].some(item =>
+                          ['rectangle', 'edge'].includes(item?.vectorType)
+                        );
+                        // Multi-line header cell. The second line of this
+                        // cell appears below the first line (text within the current table row), and the border follows it.
 
-                        const isCurrentRowText = (item: any) =>
-                          item?.vectorType === 'coordinate' &&
-                          (item.index === textBlock.index || item.y >= rowBottom);
+                        if (!hasBottomBorder) {
+                          const rowBottom = range[1] - medianBorderWidth * 2;
 
-                        const hasStackedLines = bottomElements.some(
-                          (item: any) => isCurrentRowText(item) && item.index !== textBlock.index
+                          const isCurrentRowText = (item: any) =>
+                            item?.vectorType === 'coordinate' &&
+                            (item.index === textBlock.index || item.y >= rowBottom);
+
+                          const hasStackedLines = bottomElements.some(
+                            (item: any) => isCurrentRowText(item) && item.index !== textBlock.index
+                          );
+
+                          if (hasStackedLines) {
+                            const firstOutsideRow = bottomElements.find(
+                              (item: any) => !isCurrentRowText(item)
+                            );
+                            hasBottomBorder = ['rectangle', 'edge'].includes(firstOutsideRow?.vectorType);
+                          }
+                        }
+                      }
+                      // A row boundary synthesized from a full-width text gap separates this row
+                      // from the one below as reliably as a drawn line, even though no line exists.
+                      if (!hasBottomBorder && separatorRows.some(y => Math.abs(y - range[1]) < 0.01)) {
+                        hasBottomBorder = true;
+                      }
+                      // Text-only table: no visible rule or fill anywhere in the group, so a header has nothing to
+                      // rest on. The topmost range counts as a header when ALL hold:
+                      //   - it has at least 3 blocks and its font/colour differs from the body's dominant one;
+                      //   - at least 3 of the following ranges are populated and their typical block count
+                      //     (median) is not smaller than 80% of the header's, i.e. the body has the same columns.
+                      // A page of plain text (uniform style, few blocks per line) does not pass this.
+                      if (!hasBottomBorder && index === 0 && textBlocks.length >= 3 && arr.length >= 5) {
+                        const hasVisibleVectors = [...(edges || []), ...(rectangles || [])].some(vector =>
+                          isVisibleVector(vector),
+                        );
+                        const differsFromBody = ['fontName', 'fillColor', 'strokeColor'].some(
+                          prop => modeProperties[prop] !== undefined && textBlock?.[prop] !== modeProperties[prop],
                         );
 
-                        if (hasStackedLines) {
-                          const firstOutsideRow = bottomElements.find(
-                            (item: any) => !isCurrentRowText(item)
-                          );
-                          hasBottomBorder = ['rectangle', 'edge'].includes(firstOutsideRow?.vectorType);
+                        if (!hasVisibleVectors && differsFromBody) {
+                          const bodyBlockCounts: number[] = [];
+                          for (let next = 1; next < Math.min(arr.length - 1, 13); next++) {
+                            bodyBlockCounts.push(
+                              coordinates.filter(
+                                (block: any) => block?.str?.trim() && block.y <= arr[next] && block.y > arr[next + 1],
+                              ).length,
+                            );
+                          }
+                          const populated = bodyBlockCounts.filter(count => count > 0).sort((a, b) => a - b);
+                          const median = populated[Math.floor(populated.length / 2)] || 0;
+
+                          if (populated.length >= 3 && median >= textBlocks.length * 0.8) {
+                            hasBottomBorder = true;
+                          }
                         }
                       }
-                    }
-
-                    // A row boundary synthesized from a full-width text gap separates this row
-                    // from the one below as reliably as a drawn line, even though no line exists.
-                    if (!hasBottomBorder && separatorRows.some(y => Math.abs(y - range[1]) < 0.01)) {
-                      hasBottomBorder = true;
-                    }
-
-                    // Text-only table: no visible rule or fill anywhere in the group, so a header has nothing to
-                    // rest on. The topmost range counts as a header when ALL hold:
-                    //   - it has at least 3 blocks and its font/colour differs from the body's dominant one;
-                    //   - at least 3 of the following ranges are populated and their typical block count
-                    //     (median) is not smaller than 80% of the header's, i.e. the body has the same columns.
-                    // A page of plain text (uniform style, few blocks per line) does not pass this.
-                    if (!hasBottomBorder && index === 0 && textBlocks.length >= 3 && arr.length >= 5) {
-                      const hasVisibleVectors = [...(edges || []), ...(rectangles || [])].some(vector =>
-                        isVisibleVector(vector),
-                      );
-                      const differsFromBody = ['fontName', 'fillColor', 'strokeColor'].some(
-                        prop => modeProperties[prop] !== undefined && textBlock?.[prop] !== modeProperties[prop],
-                      );
-
-                      if (!hasVisibleVectors && differsFromBody) {
-                        const bodyBlockCounts: number[] = [];
-                        for (let next = 1; next < Math.min(arr.length - 1, 13); next++) {
-                          bodyBlockCounts.push(
-                            coordinates.filter(
-                              (block: any) => block?.str?.trim() && block.y <= arr[next] && block.y > arr[next + 1],
-                            ).length,
-                          );
-                        }
-                        const populated = bodyBlockCounts.filter(count => count > 0).sort((a, b) => a - b);
-                        const median = populated[Math.floor(populated.length / 2)] || 0;
-
-                        if (populated.length >= 3 && median >= textBlocks.length * 0.8) {
-                          hasBottomBorder = true;
-                        }
-                      }
-                    }
-                    if (range && range[0] >= 408 && range[0] <= 431) {
-                      console.error('[HASBOTTOMBORDER TRACE]', {
-                        range: range.join('-'),
-                        textBlockStr: textBlock?.str,
-                        textBlockY: textBlock?.y,
-                        hasBottomBorder,
-                        bottomElements: bottomElements.slice(0, 2).map(e => e && ({
-                          vectorType: e.vectorType,
-                          x: e.x,
-                          y: e.y,
-                          width: e.width,
-                          height: e.height
-                        })),
-                      });
                     }
 
                     let isIndicator = isHeaderIndicator(textBlock?.['str']);//cell value corresponds to a word in the indicator
@@ -6798,22 +6563,10 @@ export function init({
                         isIndicator
                       );
 
-                    console.error('[HEADER ROW TRACE] range', range.join('-'), 'textBlock:', textBlock?.str, {
-                      hasMajorityStyle,
-                      hasDistinctStyle,
-                      hasUniformStr,
-                      hasBottomBorder,
-                      isIndicator,
-                      isMajorityNumericRow,
-                      condition,
-                    });
-
                     headerConditions.push(condition);
                   });
 
                   let isHeader = continuesHeaderAsIndexRow || headerConditions.every(item => item);
-
-                  console.error('[HEADER ROW TRACE] range', range.join('-'), 'isHeader:', isHeader, 'conditions:', headerConditions);
 
                   if (isHeader) {
                     prev[rangeStr] = textBlocks;
@@ -6891,7 +6644,6 @@ export function init({
             const MAX_SPARSE_ROWS = 2;
 
             const reject = (reason: string, details: any = {}) => {
-              console.error('[TEXT GRID] skipped', { reason, ...details });
               return null;
             };
 
@@ -7073,12 +6825,6 @@ export function init({
                 block.x <= right
             );
 
-            console.error('[TEXT GRID] applied', {
-              columns: starts.length,
-              bodyRows: bodyRows.length,
-              currentColumns: currentColumnCount
-            });
-
             return {
               cols: bounds,
               rows: rowBoundaries,
@@ -7167,7 +6913,6 @@ export function init({
               separatorRows: group.synthesizedRows || [],
             });
 
-            console.error('[TITLE ROW]', { removed: titleBlocks.map((block: any) => block.str), newTop });
             return group;
           }
 
@@ -7297,8 +7042,6 @@ export function init({
               lineMaxWidth,
               separatorRows: group.synthesizedRows || [],
             });
-
-            console.error('[FILL SEAM ROWS]', { removed: seamRows.map(y => +y.toFixed(2)), rows: group.rows.length });
             return group;
           }
 
@@ -7389,8 +7132,6 @@ export function init({
               lineMaxWidth,
               separatorRows: group.synthesizedRows || [],
             });
-
-            console.error('[PAD COLUMNS]', { removed: removable.map(x => +x.toFixed(2)), cols: group.cols.length });
             return group;
           }
 
@@ -7453,8 +7194,6 @@ export function init({
               lineMaxWidth,
               separatorRows: group.synthesizedRows || [],
             });
-
-            console.error('[THIN EMPTY BANDS]', { removed: removed.map(y => +y.toFixed(2)), rows: group.rows.length });
             return group;
           }
 
@@ -7527,19 +7266,10 @@ export function init({
                   edgesInRange.length === 0 ||
                   (usedCols.size > 0 && usedCols.size < fullColsCount * 0.6)
                 );
-              console.error('[TRIM FIRST PASS]', {
-                rowRange: [sortedRows[i], sortedRows[i + 1]],
-                textBlocks: textBlocks.map(t => t.str),
-                usedColsSize: usedCols.size,
-                fullColsCount,
-                hasWideTextCoverage,
-                edgesInRangeCount: edgesInRange.length,
-                unsupported,
-              });
               if (!unsupported) { cutIndex = -1; continue; }
               if (cutIndex === -1) cutIndex = i;
             }
-            console.error('[TRIM] cutIndex after first pass:', cutIndex);
+
             // cutIndex now points to the FIRST line of the longest
             // unanchored tail, if it extends to the end of the group
             if (cutIndex === -1) return group;
@@ -7715,17 +7445,6 @@ export function init({
                 && tailColumns.size >= Math.max(2, Math.ceil(occupiedBodyColumns * 0.7))
                 && kindRatio >= 0.8
                 && (!groupHasLines || lineCoverage >= 0.85);
-
-              console.error('[SPLIT RESCUE]', {
-                tail: round(tail),
-                gap: +gap.toFixed(2),
-                tolerance: +tolerance.toFixed(2),
-                tailColumns: tailColumns.size,
-                bodyColumns: occupiedBodyColumns,
-                kindRatio: +kindRatio.toFixed(2),
-                lineCoverage: +lineCoverage.toFixed(2),
-                accepted,
-              });
 
               return accepted;
             };
@@ -8036,11 +7755,6 @@ export function init({
               additions.forEach(block => claimed.add(block.index));
               group.coordinates = [...(group.coordinates || []), ...additions];
 
-              console.error('[ABSORB BLOCKS]', {
-                added: additions.length,
-                sample: additions.slice(0, 6).map(block => block.str),
-                droppedFragments: tableGroups.length - groups.length,
-              });
             });
 
             return groups;
@@ -8207,17 +7921,6 @@ export function init({
               rowBlocksInGrid.length > 0
               && rowColumns.size >= Math.max(2, Math.ceil(occupiedBodyColumns * 0.7))
               && kindRatio >= 0.8;
-
-            console.error('[BOTTOM ROW EXTENSION]', {
-              topLine: +topLine.center.toFixed(2),
-              bottomLine: bottomLine ? +bottomLine.center.toFixed(2) : null,
-              gap: +(tableBottomText - topLine.center).toFixed(2),
-              blocks: rowBlocksInGrid.map(block => block.str),
-              columns: rowColumns.size,
-              bodyColumns: occupiedBodyColumns,
-              kindRatio: +kindRatio.toFixed(2),
-              accepted,
-            });
 
             if (!accepted) {
               return group;
@@ -8403,13 +8106,6 @@ export function init({
               separatorRows: group.synthesizedRows || [],
             });
 
-            console.error('[TEXT-ONLY TOP ROWS]', {
-              removedCaptions: [...captionBlocks].map(block => block.str),
-              synthesizedRows,
-              rows: [...group.rows].sort((a, b) => b - a).slice(0, 4),
-              headerRows: Object.keys(group.headerRows),
-            });
-
             return group;
           }
 
@@ -8540,13 +8236,6 @@ export function init({
             // Boundaries without a drawn rule must survive generateVirtualEdges()
             group.synthesizedRows = [...(group.synthesizedRows || []), ...midpoints];
             group.y = [Math.min(...group.rows), Math.max(...group.rows)];
-
-            console.error('[REBUILD ROWS]', {
-              tinyEmptyRows: tinyEmptyRows.length,
-              interiorRows,
-              midpoints: midpoints.length,
-              rows: group.rows.length,
-            });
 
             return group;
           }
@@ -8725,11 +8414,7 @@ export function init({
             }
 
             group.leaderBoundaries = result;
-            console.error('[LEADER ROWS]', {
-              lines: lines.length,
-              boundaries: result.length,
-              synthesized: synthesized.length
-            });
+
             return group;
           }
 
@@ -9052,10 +8737,6 @@ export function init({
             for (let index = 1; index < frames.length; index++) {
               bands.push({ top: frames[index - 1].bottom, bottom: frames[index].top });
             }
-            console.error('[RULE FRAMES]', {
-              frames: frames.map(frame => [+frame.top.toFixed(1), +frame.bottom.toFixed(1)]),
-              gapBands: bands.map(band => [+band.top.toFixed(1), +band.bottom.toFixed(1)])
-            });
             return bands;
           }
 
@@ -9066,7 +8747,6 @@ export function init({
 
             let pageGroups = createGroup({ edges, rectangles, coordinates, tolerance: Infinity });
             let tableGroups = createGroup({ edges, rectangles, coordinates, tolerance });
-            console.error('[GROUPS BEFORE SPLIT]', tableGroups.length, tolerance);
             tableGroups = splitGroups({ groups: tableGroups, globalGroup: pageGroups[0], downcheck: true });
             tableGroups = absorbEnclosedBlocks(tableGroups, pageGroups[0]);
             // Reconstruct missing row boundaries
@@ -9151,15 +8831,6 @@ export function init({
 
             tableGroups = tableGroups.filter(group => {
               const keep = isTableGroup(group, lineMaxWidth);
-
-              if (!keep) {
-                console.error('[DROPPED GROUP]', {
-                  x: group.x,
-                  y: group.y,
-                  blocks: group.coordinates?.length,
-                });
-              }
-
               return keep;
             });
 
@@ -9764,11 +9435,6 @@ export function init({
 
                 });
 
-                console.error(
-                  '[SPLIT RANGES RAW]',
-                  rowsRanges.map(range => range.map(value => +value.toFixed(2)))
-                );
-
                 // The range that lies entirely inside a gap band (titles, footnotes) is not a table.
                 rowsRanges = rowsRanges.filter(
                   range =>
@@ -9969,14 +9635,6 @@ export function init({
                   return prev;
                 }, []);
 
-                console.error('[SPLIT]', {
-                  headerRows: Object.keys(group.headerRows),
-                  rows: group.rows.length,
-                  cols: group.cols.length,
-                  rowsRanges: rowsRanges.map((range) => range.length),
-                  colsRangesGroups: colsRangesGroups.map((ranges) => ranges?.map((range) => range.length)),
-                });
-
                 for (let rowsRangeIndex = 0; rowsRangeIndex < rowsRanges.length; rowsRangeIndex++) {// needs improvement?
                   const rowsRange = rowsRanges[rowsRangeIndex];
                   for (let colsRangeIndex = 0; colsRangeIndex < colsRangesGroups[rowsRangeIndex]?.length || 0; colsRangeIndex++) {
@@ -10170,12 +9828,6 @@ export function init({
                     generatedGroups.length,
                     sourceGroup,
                   );
-
-                  console.error('[SPLIT REJECTED: DUPLICATED SOURCE ROW]', {
-                    generatedGroups: generatedGroups.length,
-                    sourceRows: sourceGroup.rows.length,
-                    sourceCols: sourceGroup.cols.length,
-                  });
                 }
 
                 // --- Safety net for nested rectangles --------------------------------
@@ -10197,7 +9849,6 @@ export function init({
                     const groupCoordinates = group.coordinates || [];
 
                     if (headerCoordinates.length && headerCoordinates.length !== groupCoordinates.length) {
-                      console.error(`[DIAG] splitGroups: fragments failed header filter, keeping original group (y=${group.y})`);
                       prev.push(group);
                     }
                   }
@@ -10274,16 +9925,6 @@ export function init({
                 });
                 if (tolerance !== Infinity && !assuredRows) {
                   const fmt = (values: number[] = []) => values.map(v => +v.toFixed(2));
-
-                  console.error('[M27 P2 CREATEGROUP ROWS]', {
-                    tolerance,
-                    x: fmt(group['x']),
-                    y: fmt(group['y']),
-                    assuredRows: fmt(group['assuredRows']),
-                    rowsBefore: fmt(group['rows']),
-                    rowsAfter: fmt(handledRows.gridItems),
-                    alias: handledRows.alias,
-                  });
                 }
                 alias['rows'] = handledRows.alias;
                 group['rows'] = handledRows.gridItems;
@@ -10320,10 +9961,6 @@ export function init({
 
                   group['coordinates'] = (group['coordinates'] || []).filter(block => !isOutsideBox(block));
                   increasedCoordinates = increasedCoordinates.filter(block => !isOutsideBox(block));
-
-                  if (outsideBlocks.length) {
-                    console.error('[OUTSIDE BOX]', outsideBlocks.map(block => block.str));
-                  }
                 }
 
                 // --- REMOVING CAPTION FROM COORDINATES ---
@@ -10413,15 +10050,6 @@ export function init({
                       ),
                       ruleExtent.right,
                     ])].sort((a, b) => a - b);
-
-                    if (before.length !== group['cols'].length) {
-                      console.error('[RULE EXTENT]', {
-                        left: +ruleExtent.left.toFixed(1),
-                        right: +ruleExtent.right.toFixed(1),
-                        before: before.map(value => +value.toFixed(1)),
-                        after: group['cols'].map(value => +value.toFixed(1)),
-                      });
-                    }
                   }
                 }
 
@@ -10440,16 +10068,6 @@ export function init({
 
                 const hasExcludedNestedRectangles = (group['rectangles'] || [])
                   .some(rect => nestedRectangles.has(rect));
-
-                console.error('[GROUP CANDIDATE]', {
-                  tolerance,
-                  x: group['x'],
-                  y: group['y'],
-                  rows: group['rows']?.length,
-                  cols: group['cols']?.length,
-                  coordinates: group['coordinates']?.length,
-                  headerRanges,
-                });
 
                 if (headerRanges.length || (tolerance == Infinity) || hasExcludedNestedRectangles) {
                   prev.push(group);
@@ -10820,17 +10438,6 @@ export function init({
               return [...new Set(gridItems)];
             }
 
-            console.error('[FINAL GROUPS]', tableGroups.map(group => ({
-              x: group.x?.map(value => +value.toFixed(1)),
-              y: group.y?.map(value => +value.toFixed(1)),
-              cols: group.cols?.map(value => +value.toFixed(1)),
-              assuredCols: group.assuredCols?.map(value => +value.toFixed(1)),
-              edgesCols: group.edgesCols?.map(value => +value.toFixed(1)),
-              rectanglesCols: group.rectanglesCols?.map(value => +value.toFixed(1)),
-              headerRows: Object.keys(group.headerRows || {}).length,
-              blocks: group.coordinates?.length,
-            })));
-
             return { tableGroups, pageGroups };
           }
 
@@ -11156,18 +10763,6 @@ export function init({
               }
 
               function isPhantomRow(rowY, inwardDir) {
-                if (rowY > 200 && rowY < 300) {
-                  console.error('[PHANTOM ROW CHECK]', {
-                    rowY,
-                    inwardDir,
-                    hasRealEdge: horizontalAssuredEdges.some(edge => Math.abs(edge.y - rowY) <= edgeTolerance),
-                    edgeTolerance,
-                    detachTolerance,
-                    horizontalAssuredEdgesNearby: horizontalAssuredEdges
-                      .filter(edge => Math.abs(edge.y - rowY) <= 20)
-                      .map(edge => ({ y: edge.y, x: edge.x, width: edge.width })),
-                  });
-                }
                 // The bottom line is phantom only if there is no real line behind the table.
                 const hasRealEdge = horizontalAssuredEdges.some(
                   edge => Math.abs(edge.y - rowY) <= edgeTolerance
@@ -11238,10 +10833,7 @@ export function init({
               return filtered.length >= 2 ? filtered : gridRows;
             }
 
-            console.error('[PHANTOM ROWS TRACE] rows before:', JSON.parse(JSON.stringify(rows)));
             rows = removePhantomBoundaryRows(rows);//!BUG sales_order.pdf
-            console.error('[PHANTOM ROWS TRACE] rows after:', JSON.parse(JSON.stringify(rows)));
-
 
             // inside generateVirtualEdges — immediately after removePhantomBoundaryRows(rows)
             // intersectingElements depends ONLY on the textBlock, not on the position in the grid.
@@ -11250,26 +10842,30 @@ export function init({
             // (fake lines) are not drawn lines: counting them made every row of a table with
             // visible cell fills look "crossed by 3+ lines" and all text-inferred column
             // boundaries were deleted.
-            let verticalIntersectorsByCoordinate = coordinates.map(textBlock => {
-              return (
-                verticalAssuredEdges?.filter(vector => {
-                  if (vector['_isFakeLine']) {//!BUG wrong column length (background_lines_2.pdf)
-                    return false;
-                  }
-                  let res: any = checkRectangleRanges(
-                    vector,
-                    { y: [textBlock.y, textBlock.y + textBlock.height] },
-                    { axis: 'y', strict: true, strictIntersecting: true }
-                  );
-                  return res.isContained || (!res.biggestArgument && res.isIntersecting);
-                }) || []
-              );
+            const verticalEdgesIndex = createRangeIndex(verticalAssuredEdges, (v: any) => getBoxRange(v.y, v.height));
+            const verticalIntersectorsByCoordinate = coordinates.map(textBlock => {
+              const isIntersector = (vector: any): boolean => {
+                if (vector['_isFakeLine']) return false; //!BUG wrong column length (background_lines_2.pdf)
+                const res: any = checkRectangleRanges(vector, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true });
+                return res.isContained || (!res.biggestArgument && res.isIntersecting);
+              };
+              const [from, to] = getBoxRange(textBlock.y, textBlock.height);
+              const found = verticalEdgesIndex.query(from, to).map(i => verticalAssuredEdges[i]).filter(isIntersector);
+              verifySameResult('vertical intersectors', found, () => verticalAssuredEdges.filter(isIntersector));
+              return found;
             });
-            let horizontalIntersectorsByCoordinate = coordinates.map((textBlock) => {
-              return horizontalAssuredEdges?.filter((vector) => {
-                let res: any = checkRectangleRanges(vector, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true });
-                return res.isContained || !res.biggestArgument && res.isIntersecting;
-              }) || [];
+
+            const horizontalEdgesIndex = createRangeIndex(horizontalAssuredEdges, (v: any) => getBoxRange(v.x, v.width));
+            const horizontalIntersectorsByCoordinate = coordinates.map(textBlock => {
+              const isIntersector = (vector: any): boolean => {
+                //if (vector['_isFakeLine']) return false;
+                const res: any = checkRectangleRanges(vector, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true });
+                return res.isContained || (!res.biggestArgument && res.isIntersecting);
+              };
+              const [from, to] = getBoxRange(textBlock.x, textBlock.width);
+              const found = horizontalEdgesIndex.query(from, to).map(i => horizontalAssuredEdges[i]).filter(isIntersector);
+              verifySameResult('horizontal intersectors', found, () => horizontalAssuredEdges.filter(isIntersector));
+              return found;
             });
 
             let isIntersecting = (rect1, rect2) => {
@@ -11671,6 +11267,9 @@ export function init({
                 : null;
             }
 
+            const verticalBlockers = coordinates.filter(
+              (_, k) => uniqueArr(verticalIntersectorsByCoordinate[k], 'x').length > 2
+            );
             let verticalEdges = [];
             for (let i = 0; i < cols.length; i++) {
               // The left and right boundaries of the table are not suppressed
@@ -11740,34 +11339,18 @@ export function init({
 
                 if (isSuppressedByMerge) {
                   deletedEdges.push(edge);
-                  console.error('[VIRTUAL EDGE MERGE]', {
-                    reason: mergeReason,
-                    col: i,
-                    rowFrom: +y.toFixed(2),
-                    rowTo: +nextY.toFixed(2),
-                  });
                 }
 
-                for (let k = 0; k < coordinates.length && !isProtectedEdge; k++) {
-                  let textBlock = coordinates[k];
-                  let intersectingElements = verticalIntersectorsByCoordinate[k];
-
-                  let edgeOnSameAxis = (() => {
-                    let res: any = checkRectangleRanges(
-                      edge,
-                      { y: [textBlock.y, textBlock.y + textBlock.height] },
-                      { axis: 'y', strict: true, strictIntersecting: true }
-                    );
-                    return res.isIntersecting;
-                  })();
-
-                  let intersectingGridItems = uniqueArr(intersectingElements, 'x');
-
-                  // old: ... && !relatedAssuredEdge  (This is now taken into account in `isProtectedEdge`)
-                  if (intersectingGridItems.length > 2 && edgeOnSameAxis) {
-                    isIntersectingTextBlock = true;
-                    deletedEdges.push(edge);
-                    break;
+                if (!isProtectedEdge) {
+                  for (const textBlock of verticalBlockers) {
+                    const edgeOnSameAxis = (
+                      checkRectangleRanges(edge, { y: [textBlock.y, textBlock.y + textBlock.height] }, { axis: 'y', strict: true, strictIntersecting: true }) as any
+                    ).isIntersecting;
+                    if (edgeOnSameAxis) {
+                      isIntersectingTextBlock = true;
+                      deletedEdges.push(edge);
+                      break;
+                    }
                   }
                 }
 
@@ -11788,6 +11371,20 @@ export function init({
             let yProximityTolerance = modalRowHeightForSuppression * 1.5;
 
             let leaderProtectedCount = 0;
+            const horizontalBlockers = coordinates.filter((textBlock, k) => {
+              let intersectingGridItems = uniqueArr(horizontalIntersectorsByCoordinate[k], 'y');
+              if (!isHeader(textBlock)) {
+                intersectingGridItems = intersectingGridItems.filter(
+                  item =>
+                    !headerRowsKeys.some(key =>
+                      (checkRectangleRanges({ y: item.y }, { y: key }, { axis: ['y'], strictIntersecting: true, tolerance: 1 }) as Array<any>).every(
+                        res => res.isIntersecting
+                      )
+                    )
+                );
+              }
+              return intersectingGridItems.length > 3;
+            });
             let horizontalEdges = [];
             for (let i = 0; i < rows.length; i++) {
               for (let j = 0; j < cols.length - 1; j++) {
@@ -11830,38 +11427,16 @@ export function init({
                   isLeaderBoundary ||
                   isEdgeBackedByRealLine(edge, relatedAssuredEdge, true);
 
-                for (let k = 0; k < coordinates.length && !isProtectedEdge; k++) {
-                  let textBlock = coordinates[k];
-                  let intersectingElements = horizontalIntersectorsByCoordinate[k];
-
-                  let edgeOnSameAxis = (() => {
-                    let res: any = checkRectangleRanges(
-                      edge,
-                      { x: [textBlock.x, textBlock.x + textBlock.width] },
-                      { axis: 'x', strict: true, strictIntersecting: true }
-                    );
-                    return res.isIntersecting;
-                  })();
-
-                  let intersectingGridItems = uniqueArr(intersectingElements, 'y');
-
-                  if (!isHeader(textBlock)) {
-                    intersectingGridItems = intersectingGridItems.filter(item => {
-                      return !headerRowsKeys.some(key =>
-                        (checkRectangleRanges(
-                          { y: item.y },
-                          { y: key },
-                          { axis: ['y'], strictIntersecting: true, tolerance: 1 }
-                        ) as Array<any>).every(res => res.isIntersecting)
-                      );
-                    });
-                  }
-
-                  // old: !isOuterBoundary && ... && !relatedAssuredEdge
-                  if (intersectingGridItems.length > 3 && edgeOnSameAxis) {
-                    isIntersectingTextBlock = textBlock;
-                    deletedEdges.push(edge);
-                    break;
+                if (!isProtectedEdge) {
+                  for (const textBlock of horizontalBlockers) {
+                    const edgeOnSameAxis = (
+                      checkRectangleRanges(edge, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true }) as any
+                    ).isIntersecting;
+                    if (edgeOnSameAxis) {
+                      isIntersectingTextBlock = true;
+                      deletedEdges.push(edge);
+                      break;
+                    }
                   }
                 }
 
@@ -11876,12 +11451,6 @@ export function init({
             }
 
             let edges = [...verticalEdges, ...horizontalEdges];
-            console.error('[LEADER PROTECTED]', {
-              boundaries: leaderBoundaries.length,
-              boundaryYs: leaderBoundaries.slice(0, 6).map(boundary => +boundary.y.toFixed(2)),
-              protectedEdges: leaderProtectedCount,
-              rowsSample: rows.slice(0, 6).map(y => +y.toFixed(2))
-            });
             return edges;
           }
 
@@ -11910,11 +11479,10 @@ export function init({
           //     }
           // });
 
-          console.error(`[DEBUG Page ${pageNum}] edges:`, edges.length, 'rectangles:', rectangles.length, 'tableContentItems:', tableContentItems.length);
-
-          let intersections = (() => {
+          /*intersections*/
+          (() => {
             let watermarksIndexes = [];
-            let array = [];
+            //let array = [];
 
             const findPreviousRelatedItem = (mainIndex, removedItem) => {
               const removedX = removedItem?.x ?? removedItem?.transform?.[4] ?? 0;
@@ -11998,96 +11566,66 @@ export function init({
               return null;
             };
 
-            for (
-              let mainIndex = 0;
-              mainIndex < tableContentItems.length;
-              mainIndex++
-            ) {
-              let item = tableContentItems[mainIndex];
+            const getObj = (obj: any) =>
+              Object.assign({}, obj, (() => {
+                let [a, b, c, d, x, y] = obj.transform;
+                x = obj.x || x;
+                y = obj.y || y;
+                return { x, y };
+              })());
 
-              let getObj = (obj) => {
-                return Object.assign({}, obj, (() => {
-                  let [a, b, c, d, x, y] = obj.transform;
+            const getYRange = (obj: any): [number, number] | null => {
+              const y = obj.y || obj.transform?.[5];
+              return Number.isFinite(y) && Number.isFinite(obj.height) ? getBoxRange(y, obj.height) : null;
+            };
 
-                  x = obj.x || x;
-                  y = obj.y || y;
+            const visibleEdges = [...(edges || []), ...(rectanglesEdges || [])].filter(item => isVisibleVector(item));
+            const itemsIndex = createRangeIndex(tableContentItems, getYRange);
+            const edgesIndex = createRangeIndex(visibleEdges, getYRange);
 
-                  return { x, y };
-                })());
+            for (let mainIndex = 0; mainIndex < tableContentItems.length; mainIndex++) {
+              const item = tableContentItems[mainIndex];
+              const itemBox = getObj(item);
+              const yRange = getYRange(item);
+
+              const isNeighbour = (index: number): boolean => {
+                if (index === mainIndex) return false;
+                const cur = tableContentItems[index];
+                // An image never turns text into a watermark: text drawn over pictures
+                // (a starry background, a logo behind a table) is ordinary content.
+                // A watermark IMAGE is still removed: it is checked as `item` itself
+                // (it intersects many text items).
+                if (cur?.imageName && !item?.imageName) return false;
+                return (
+                  checkRectangleRanges(getObj(cur), itemBox, { strict: true, strictIntersecting: true, axis: ['x', 'y'] }) as Array<any>
+                ).every(res => res.inRange);
               };
-
-              let data = {
-                index: mainIndex,
-                intersectionsIndexes: tableContentItems.reduce(
-                  (prev, cur, index) => {
-                    if (index != mainIndex) {
-                      // An image never turns text into a watermark: text drawn over pictures
-                      // (a starry background, a logo behind a table) is ordinary content.
-                      // A watermark IMAGE is still removed: it is checked as `item` itself
-                      // (it intersects many text items).
-                      if (cur?.imageName && !item?.imageName) {
-                        return prev;
-                      }
-
-                      let inRange = (
-                        checkRectangleRanges(
-                          getObj(cur),
-                          getObj(item),
-                          { strict: true, strictIntersecting: true, axis: ['x', 'y'] }
-                        ) as Array<any>
-                      ).every(item => item.inRange);
-
-                      if (inRange) {
-                        prev.push(index);
-                      }
-                    }
-
-                    return prev;
-                  },
-                  []
-                )
-              };
-
-              let isIntersectsEdge = (() => {
-                let visibleEdges = [
-                  ...(edges || []),
-                  ...(rectanglesEdges || [])
-                ].filter(item => isVisibleVector(item));
-
-                return visibleEdges.filter(edge => {
-                  let inRange = (
-                    checkRectangleRanges(
-                      getObj(edge),
-                      getObj(item),
-                      {
-                        strict: true,
-                        strictIntersecting: false,
-                        axis: ['x', 'y'],
-                        tolerance: -(Math.min(edge.width, edge.height))
-                      }
-                    ) as Array<any>
-                  ).every(item => item.inRange);
-
-                  return inRange;
-                });
-              })();
+              const neighbourCandidates = yRange ? itemsIndex.query(yRange[0], yRange[1]) : tableContentItems.map((_, i) => i);
+              const intersectionsIndexes = neighbourCandidates.filter(isNeighbour);
+              verifySameResult('intersections', intersectionsIndexes, () => tableContentItems.map((_, i) => i).filter(isNeighbour));
 
               if (
-                data.intersectionsIndexes.length > 1 &&
-                !isOverlayOnSameTextLine(item, data.intersectionsIndexes.map((index: number) => tableContentItems[index]))
+                intersectionsIndexes.length > 1 &&
+                !isOverlayOnSameTextLine(item, intersectionsIndexes.map(index => tableContentItems[index]))
               ) {
-                if (!watermarksIndexes.includes(mainIndex)) {
-                  watermarksIndexes.push(mainIndex);
-                }
+                if (!watermarksIndexes.includes(mainIndex)) watermarksIndexes.push(mainIndex);
               }
 
-              let isWatermark =
-                (isIntersectsEdge.length && isEmptyCoordinate(tableContentItems[mainIndex])) ||
-                (
-                  tableContentItems[mainIndex]?.str == ' ' &&
-                  tableContentItems[mainIndex].hasEOT
-                );
+              const touchesVisibleEdge = (): boolean => {
+                const touches = (edge: any) =>
+                  (
+                    checkRectangleRanges(getObj(edge), itemBox, {
+                      strict: true,
+                      strictIntersecting: false,
+                      axis: ['x', 'y'],
+                      tolerance: -Math.min(edge.width, edge.height)
+                    }) as Array<any>
+                  ).every(res => res.inRange);
+                const candidates = yRange ? edgesIndex.query(yRange[0], yRange[1]).map(i => visibleEdges[i]) : visibleEdges;
+                return candidates.some(touches);
+              };
 
+              const isWatermark = (isEmptyCoordinate(item) && touchesVisibleEdge()) || (item?.str == ' ' && item.hasEOT);
               if (isWatermark) {
                 let removedItem = tableContentItems[mainIndex];
 
@@ -12116,23 +11654,18 @@ export function init({
                   watermarksIndexes.push(mainIndex);
                 }
               }
-
-              array.push(data);
             }
 
-            console.error('[WATERMARK REMOVED]', watermarksIndexes.map(index => ({
-              str: tableContentItems[index]?.str,
-              y: tableContentItems[index]?.transform?.[5],
-              intersects: (array.find(entry => entry.index === index)?.intersectionsIndexes || [])
-                .map(other => ({
-                  str: tableContentItems[other]?.str,
-                  image: tableContentItems[other]?.imageName,
-                })),
-            })));
-
+            // DEBUG_LOG && console.error('[WATERMARK REMOVED]', watermarksIndexes.map(index => ({
+            //   str: tableContentItems[index]?.str,
+            //   y: tableContentItems[index]?.transform?.[5],
+            //   intersects: (array.find(entry => entry.index === index)?.intersectionsIndexes || [])
+            //     .map(other => ({
+            //       str: tableContentItems[other]?.str,
+            //       image: tableContentItems[other]?.imageName,
+            //     })),
+            // })));
             removeByIndexes(tableContentItems, watermarksIndexes);
-
-            return array;
           })();
 
           /*FOR DEBUGGING
@@ -12153,11 +11686,6 @@ export function init({
 
           let coordinates = extractCoordinates(tableContentItems);
 
-          console.error(`[DEBUG Page ${pageNum}] coordinates:`, coordinates.length);
-          if (coordinates.length > 0) {
-            console.error(`[DEBUG Page ${pageNum}] first coord:`, { str: coordinates[0].str?.substring(0, 30), x: coordinates[0].x, y: coordinates[0].y });
-          }
-
           // Nested decoration rectangles: fully contained in another visible rectangle
           // of the same fill color. They keep the group spatially united but must not
           // contribute their borders to the table grid (rows/cols/rectanglesEdges).
@@ -12173,7 +11701,6 @@ export function init({
               }
             }
           }
-          console.error(`[DEBUG Page ${pageNum}] nested rectangles:`, nestedRectangles.size);
 
           if (debugTrace) {
             // These are copies made before grouping and before replacing the edges with virtual edges.
@@ -12197,11 +11724,6 @@ export function init({
             debugTrace.pageGroups = pageGroups;
             debugTrace.cleanupRoots.push(tableGroups, pageGroups);
           }
-
-          console.error(`[DEBUG Page ${pageNum}] tableGroups:`, tableGroups.length);
-          tableGroups.forEach((g, i) => {
-            console.error(`[DEBUG Page ${pageNum}] tableGroup[${i}]: rows=${g.rows?.length}, cols=${g.cols?.length}, coords=${g.coordinates?.length}`);
-          });
 
           for (let tableIndex = 0; tableIndex < tableGroups.length; tableIndex++) {
             let tableGroup = tableGroups[tableIndex];
@@ -12230,9 +11752,7 @@ export function init({
             const badVirtualEdges = virtualEdges.filter(
               edge => ![edge.x, edge.y, edge.width, edge.height].every(Number.isFinite)
             );
-            if (badVirtualEdges.length) {
-              console.error('[BAD VIRTUAL EDGES]', badVirtualEdges.slice(0, 5));
-            }
+
             edges = virtualEdges.filter(
               edge => [edge.x, edge.y, edge.width, edge.height].every(Number.isFinite)
             );
@@ -12322,9 +11842,6 @@ export function init({
               return {};
             }
             horizons.push({ y: current['y'], lines: lines });
-            console.error('[DIAG final horizons near 673]',
-              horizons.find(h => Math.abs(h.y - 673.53) < 2)
-            );
 
             function parseId(str) {
               let [row, col] = str.split('-').map(item => item ? +item : undefined);
@@ -12473,7 +11990,6 @@ export function init({
                 arr.forEach(cellKey => {
                   if (cellKey !== rootKey) mergeAlias[cellKey] = rootKey;
                 });
-                console.error('[HEADER ROW SPAN]', { col, rows: textRow + 1 });
               }
             }
 
@@ -12497,13 +12013,8 @@ export function init({
               const { tableGroup, verticles, horizons, merges, mergeAlias, lineMaxWidth } = options;
               const rowsCount = horizons.length - 1;
               const colsCount = verticles.length - 1;
-              const early = (reason: string, extra?: any) =>
-                console.error('[HEADER SPANS]', { status: 'skipped', reason, ...extra });
 
               if (!tableGroup?.headerRows || rowsCount < 2 || colsCount < 2) {
-                early('no headerRows or grid too small', {
-                  headerRows: Object.keys(tableGroup?.headerRows || {}),
-                });
                 return;
               }
 
@@ -12534,7 +12045,7 @@ export function init({
                 .sort((a: any, b: any) => b.top - a.top);
 
               if (!ranges.length) {
-                early('no parseable ranges');
+                //no parseable ranges
                 return;
               }
 
@@ -12551,7 +12062,7 @@ export function init({
                 rangeCount++;
               }
               if (!rangeCount) {
-                early('all leading ranges look like data rows', { tops: ranges.map((r: any) => r.top) });
+                //all leading ranges look like data rows
                 return;
               }
 
@@ -12561,7 +12072,7 @@ export function init({
                   h.y > chainEdge + lineMaxWidth && horizons[i + 1].y <= firstTop + lineMaxWidth
               ).length;
               if (!headerRowCount) {
-                early('no grid rows intersect the header span', { firstTop, chainEdge });
+                //no grid rows intersect the header span
                 return;
               }
 
@@ -12759,7 +12270,6 @@ export function init({
                 }
               });
 
-              console.error('[HEADER SPANS]', { headerRowCount, created, candidates });
             }
 
             function inferMergesFromFillRectangles(options: {
@@ -13355,20 +12865,6 @@ export function init({
                 const occupiedCells =
                   getOccupiedCells(span);
 
-                console.error(
-                  '[MERGE FROM FILL]',
-                  {
-                    rectangle: normalizeRect(rectangle),
-                    rowStart: span.rowStart,
-                    rowEnd: span.rowEnd,
-                    colStart: span.colStart,
-                    colEnd: span.colEnd,
-                    rowSpan,
-                    colSpan,
-                    occupiedCells,
-                  }
-                );
-
                 /*
                * The merged rectangle must have one anchor-content.
                * This cuts off the usual large background rectangles.
@@ -13456,14 +12952,6 @@ export function init({
                     span.colEnd
                   );
 
-                console.error(
-                  '[MERGE FROM FILL CREATED]',
-                  {
-                    created,
-                    anchor,
-                    span,
-                  }
-                );
               }
             }
 
@@ -13550,12 +13038,6 @@ export function init({
                 });
 
                 if (!anyItemSpansMultipleColumns && subColumnsUsed.size > 1) {
-                  console.error('[UNMERGE COLUMNS]', {
-                    root: rootKey,
-                    width: merge.width,
-                    height: merge.height,
-                    columnsUsed: [...subColumnsUsed]
-                  });
 
                   delete merges[rootKey];
                   (merge.arr || []).forEach((cellKey: string) => {
@@ -13954,14 +13436,6 @@ export function init({
               return { matrix, merges, mergeAlias };
             }
 
-            console.error('[DIAG all horizons]', horizons.map(h => ({ y: h.y, lines: h.lines })));
-            // The grid must not contain lines with non-numeric coordinates
-            if (horizons.some(item => !Number.isFinite(item.y))) {
-              console.error(
-                '[BAD HORIZON]',
-                horizons.filter(item => !Number.isFinite(item.y))
-              );
-            }
             horizons = horizons.filter(item => Number.isFinite(item.y));
             verticles = verticles.filter(item => Number.isFinite(item.x));
 
@@ -13984,15 +13458,6 @@ export function init({
               verticles,
               horizons
             );
-            console.error('[GRID CHECK]', {
-              horizons: horizons.length,
-              verticles: verticles.length,
-              horizonsY: horizons.map(item => +item?.y?.toFixed(2)),
-              verticlesX: verticles.map(item => +item?.x?.toFixed(2)),
-            });
-
-            console.error('[DIAG raw matrix merges]', JSON.parse(JSON.stringify(matrixData.merges)));
-            console.error('[DIAG raw matrix mergeAlias]', JSON.parse(JSON.stringify(matrixData.mergeAlias)));
 
             inferMergesFromFillRectangles({
               tableGroup,
@@ -14013,16 +13478,6 @@ export function init({
               lineMaxWidth
             });
 
-            console.error('[HEADER MERGES BEFORE]', {
-              merges: JSON.parse(JSON.stringify(matrixData.merges)),
-              mergeAlias: { ...matrixData.mergeAlias },
-              headerRows: tableGroup.headerRows,
-              grid: {
-                x: verticles.map((item: any) => item.x),
-                y: horizons.map((item: any) => item.y),
-              },
-            });
-
             inferHeaderSpansFromText({
               tableGroup,
               verticles,
@@ -14030,11 +13485,6 @@ export function init({
               merges: matrixData.merges,
               mergeAlias: matrixData.mergeAlias,
               lineMaxWidth,
-            });
-
-            console.error('[HEADER MERGES AFTER VALIDATION]', {
-              merges: JSON.parse(JSON.stringify(matrixData.merges)),
-              mergeAlias: { ...matrixData.mergeAlias },
             });
 
             validateColumnMerges({
@@ -14223,14 +13673,6 @@ export function init({
                   }
 
                   if (col === -1) {
-                    if (isInsideTableVertically(y)) {
-                      console.error('[TEXT NOT PLACED]', {
-                        reason: 'row or column not found',
-                        str: (item?.str || '').slice(0, 40),
-                        x,
-                        y
-                      });
-                    }
                     continue;
                   }
 
@@ -14253,14 +13695,6 @@ export function init({
                     }
                   }
                   if (row === -1) {
-                    if (isInsideTableVertically(y)) {
-                      console.error('[TEXT NOT PLACED]', {
-                        reason: 'row or column not found',
-                        str: (item?.str || '').slice(0, 40),
-                        x,
-                        y
-                      });
-                    }
                     continue;
                   }
 
@@ -14279,7 +13713,6 @@ export function init({
 
                   // Protection from going abroad
                   if (row < 0 || row >= rowsCount || col < 0 || col >= colsCount || !table.array[row] || !table.array[row][col]) {
-                    console.error(`[WARN] Coordinate out of bounds or cell undefined: row=${row}, col=${col}, str="${item?.str?.substring(0, 30)}"`);
                     continue;
                   }
 
@@ -14351,63 +13784,6 @@ export function init({
                         tableGroup?.borderSize || 0.57
                       );
 
-                      if (table.array[row][col]['str'].includes('Sl.')) {
-                        console.error('[SL NO FILL DEBUG]', {
-                          row,
-                          col,
-
-                          cell: {
-                            x1: cellX1,
-                            x2: cellX2,
-                            y1: cellY1,
-                            y2: cellY2,
-                            width: cellX2 - cellX1,
-                            height: cellY2 - cellY1
-                          },
-
-                          mergeInfo,
-
-                          rectangles: (rectangles || [])
-                            .map(rectangle => {
-                              const rectX1 = Number(
-                                rectangle?.x ?? rectangle?.transform?.[4]
-                              );
-                              const rectY1 = Number(
-                                rectangle?.y ?? rectangle?.transform?.[5]
-                              );
-                              const rectWidth = Math.abs(
-                                Number(rectangle?.width) || 0
-                              );
-                              const rectHeight = Math.abs(
-                                Number(rectangle?.height) || 0
-                              );
-
-                              const rectX2 = rectX1 + rectWidth;
-                              const rectY2 = rectY1 + rectHeight;
-
-                              const intersects =
-                                rectX2 >= cellX1 &&
-                                rectX1 <= cellX2 &&
-                                rectY2 >= cellY1 &&
-                                rectY1 <= cellY2;
-
-                              return intersects
-                                ? {
-                                  x: rectX1,
-                                  y: rectY1,
-                                  width: rectWidth,
-                                  height: rectHeight,
-                                  x2: rectX2,
-                                  y2: rectY2,
-                                  fillColor: rectangle?.fillColor,
-                                  fillRGBColor: rectangle?.fillRGBColor
-                                }
-                                : null;
-                            })
-                            .filter(Boolean)
-                        });
-                      }
-
                       const cellArea =
                         (cellX2 - cellX1) * (cellY2 - cellY1);
 
@@ -14477,8 +13853,6 @@ export function init({
 
                 }
               } catch (err) {
-                console.error(`[FATAL] Error in coordinate placement phase:`, err.message);
-                console.error(`[FATAL] Stack:`, err.stack);
                 throw err;
               }
 
@@ -14610,38 +13984,6 @@ export function init({
 
                 return Math.min(count, gridRowsInChain);
               })();
-
-
-              console.error('[M27 FINAL STRUCTURE]', {
-                headerRows,
-                topHeaderRowCount,
-                groupRows: tableGroup?.rows,
-                groupCols: tableGroup?.cols,
-                horizons: horizons.map((item: any) => item.y),
-                verticles: verticles.map((item: any) => item.x),
-                text: coordinates
-                  .filter((item: any) =>
-                    /LICENSE|NUMBER|632426|FRESCOS|19 INC|604941|PREMISE|ALPHABETIC/i
-                      .test(item?.str || '')
-                  )
-                  .map((item: any) => ({
-                    index: item.index,
-                    str: item.str,
-                    x: item.x,
-                    y: item.y,
-                    width: item.width,
-                    height: item.height,
-                    transform: item.transform,
-                  })),
-                topText: coordinates
-                  .filter((item: any) => item.y > 480)
-                  .map((item: any) => [
-                    (item.str || '').slice(0, 25),
-                    +item.x.toFixed(1),
-                    +item.y.toFixed(1),
-                    +item.height.toFixed(1),
-                  ]),
-              });
 
               const COLLAPSE_GUTTER_COLUMNS = true;
               const modalTextHeight = +findMod(coordinates.map(item => item.height)) || 0;
@@ -14817,16 +14159,6 @@ export function init({
                       const axisMatch =
                         Math.abs(edgeAxis - lineAxis) <= allowedOffset &&
                         isNearestGridAxis(edgeCenter, lineAxis, isHorizontalIdeal ? horizontalAxes : verticalAxes);
-
-                      // TEMP DIAGNOSTIC
-                      if (isHorizontalIdeal && !axisMatch && Math.abs(edgeAxis - lineAxis) <= tolerance) {
-                        console.error('[THIN EDGE REJECTED]', JSON.stringify({
-                          axis: +lineAxis.toFixed(2),
-                          edge: [edge.x, edge.y, edge.width, edge.height].map((value: number) => +value.toFixed(2)),
-                          fill: edge.fillColor || null,
-                          stroke: edge.strokeColor || null
-                        }));
-                      }
 
                       if (!axisMatch) return;
 
@@ -15143,7 +14475,6 @@ export function init({
 
                   for (let r = 0; r < table.array.length; r++) {
                     if (!table.array[r]) {
-                      console.error(`[WARN HTML] table.array[${r}] is undefined, skipping row`);
                       continue;
                     }
                     let tagName = r < headerRowCount ? 'th' : 'td';
@@ -15157,7 +14488,6 @@ export function init({
                       if (mergeAlias[r_c]) continue;
 
                       if (!table.array[r][c]) {
-                        console.error(`[WARN HTML] table.array[${r}][${c}] is undefined, skipping cell`);
                         continue;
                       }
 
@@ -15235,8 +14565,6 @@ export function init({
                   html += '</tbody>\n</table>';
                   return html;
                 } catch (err) {
-                  console.error(`[FATAL] Error in HTML generation phase:`, err.message);
-                  console.error(`[FATAL] Stack:`, err.stack);
                   throw err;
                 }
               })();
@@ -15258,7 +14586,6 @@ export function init({
                   Object.keys(merges).forEach((key) => {
                     const { row, col, arr } = merges[key];
                     if (!clonedArray[row] || !clonedArray[row][col]) {
-                      console.error(`[WARN JSON] merge source cell [${row}][${col}] undefined, key=${key}`);
                       return;
                     }
                     const mainContent = clonedArray[row][col]['str'] || '';
@@ -15267,7 +14594,6 @@ export function init({
                       if (clonedArray[mergeRow] && clonedArray[mergeRow][mergeCol]) {
                         clonedArray[mergeRow][mergeCol]['str'] = mainContent;
                       } else {
-                        console.error(`[WARN JSON] merge target cell [${mergeRow}][${mergeCol}] undefined, key=${cellKey}`);
                       }
                     });
                   });
@@ -15315,7 +14641,6 @@ export function init({
                     let obj = {};
                     row.forEach((col, colIndex) => {
                       if (!headerPaths[colIndex]) {
-                        console.error(`[WARN JSON] headerPaths[${colIndex}] undefined for row ${rowIdx}`);
                         return;
                       }
                       let str = row[colIndex]?.str
@@ -15333,8 +14658,6 @@ export function init({
                   });
                   return jsonData;
                 } catch (err) {
-                  console.error(`[FATAL] Error in JSON generation phase:`, err.message);
-                  console.error(`[FATAL] Stack:`, err.stack);
                   throw err;
                 }
               })();
