@@ -119,13 +119,30 @@ export function createRangeIndex<T>(
   };
 }
 
-/** [start, start + size] normalised and widened by `margin` (size may be negative). */
+/**
+ * Range exactly as `checkRectangleRanges` reads a block along one axis:
+ *  - a falsy start (0, NaN, undefined) means "unbounded" on that axis,
+ *  - a falsy size counts as 0.
+ * Returns null for "unbounded": the index then treats the item as a candidate
+ * for every query, and a null query range must be answered with "everything".
+ * Use this one for every index that pre-filters a checkRectangleRanges call.
+ */
+export function getCheckedRange(start: number | undefined, size: number | undefined): [number, number] | null {
+  return start ? [start, start + (size || 0)] : null;
+}
+
+/**
+ * @deprecated not exact for start === 0 / NaN (checkRectangleRanges treats those as unbounded).
+ * Use getCheckedRange. [start, start + size] normalised and widened by `margin`.
+ */
 export function getBoxRange(start: number, size: number, margin: number = 1): [number, number] {
   const end = start + size;
   return [Math.min(start, end) - margin, Math.max(start, end) + margin];
 }
 
 /**
+ * @deprecated guesses the device box; with getDeviceBBox available use
+ * getCheckedRange(box.y, box.height) on the real box instead.
  * Y-range that surely contains the glyph box of a pdf.js-style text item
  * (`transform`, `width` along the reading direction, `height` along the ascent
  * direction), for horizontal and rotated text alike. The padding is generous on
