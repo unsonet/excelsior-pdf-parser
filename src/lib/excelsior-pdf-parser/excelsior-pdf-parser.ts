@@ -6045,8 +6045,19 @@ export function init({
                   checkRectangleRanges(getObj(cur), itemBox, { strict: true, strictIntersecting: true, axis: ['x', 'y'] }) as Array<any>
                 ).every(res => res.inRange);
               };
-              const neighbourCandidates = yRange ? itemsIndex.query(yRange[0], yRange[1]) : tableContentItems.map((_, i) => i);
-              const intersectionsIndexes = neighbourCandidates.filter(isNeighbour);
+              //const neighbourCandidates = yRange ? itemsIndex.query(yRange[0], yRange[1]) : tableContentItems.map((_, i) => i);
+              //const intersectionsIndexes = neighbourCandidates.filter(isNeighbour);//!BUG in m27.pdf (wrong header)
+              const intersectionsIndexes = tableContentItems.reduce(
+                (prev, cur, index) => {
+
+                  if (isNeighbour(index)) {
+                    prev.push(index);
+                  }
+
+                  return prev;
+                },
+                []
+              );
               verifySameResult('intersections', intersectionsIndexes, () => tableContentItems.map((_, i) => i).filter(isNeighbour));
 
               if (
