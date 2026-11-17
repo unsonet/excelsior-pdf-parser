@@ -8,7 +8,7 @@
  */
 
 /** Wrap-target for every console.* diagnostic. Set to true while debugging one PDF. */
-export const DEBUG_LOG: boolean = false;
+export const DEBUG_LOG: boolean = true;
 
 /** Collect per-stage timings (see startStage / flushStageReport). */
 export const PERF_LOG: boolean = false;

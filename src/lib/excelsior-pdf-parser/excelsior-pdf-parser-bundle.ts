@@ -4,7 +4,7 @@
 // import { dirname } from 'path';
 import { getTextDirection, findClosestIndex, parseRGB, getMergedArray, uniqueArr, findMod, findAverage, caseIndependentCompare, splitByIndex, checkRectangleRanges, removeByIndexes, getSplitEdgeRange, getOnePercentOfAbsoluteDifference, typeValue, sortArrayOfObjects, deepSet, stringifyPseudoJson, isSequentialIndexRow } from '@unsonet/js-utils'
 import { buildDebugReport, DebugOptions } from '../pdftrace-debug-kit/pdf-debug';
-import { headerIndicatorWords as _headerIndicatorWords, OPS as _OPS, isLeaderGlyph, isLeaderOnlyText, LEADER_CHARS, LEADER_RUN, LEADER_THEN_CONTENT, LEADER_TRAILING_RUN, LINE_MAX_WIDTH, materializeLeaderGaps } from '../constants';
+import { headerIndicatorWords as _headerIndicatorWords, OPS as _OPS, isLeaderGlyph, isLeaderOnlyText, LEADER_CHARS, LEADER_RUN, LEADER_THEN_CONTENT, LEADER_TRAILING_RUN, LINE_MAX_WIDTH, materializeLeaderGaps, materializeWordGaps } from '../constants';
 import {
   applyTransformFn,
   extractArrayLike,
@@ -35,7 +35,7 @@ import {
 } from './pdf-grid-utils';
 import { filterBlocks } from './filter-blocks';
 import { isHeaderIndicator } from './header-indicator';
-import { createRangeIndex, getBoxRange, getTextYRange } from './range-index';
+import { createRangeIndex, getBoxRange, getCheckedRange, getTextYRange } from './range-index';
 import { DEBUG_LOG, verifySameResult } from './pdf-log';
 // const __filename = fileURLToPath(import.meta.url);
 // const __dirname = dirname(__filename);
@@ -1263,6 +1263,7 @@ export function init({
               current.pendingClip = true;
             } else if (fn === OPS.paintFormXObjectBegin) {
               clipBoxStack.push(current.clipBox ? [...current.clipBox] : null);
+              DEBUG_LOG && console.error('[FORM BEGIN]', args?.[0], args?.[1]);
             } else if (fn === OPS.paintFormXObjectEnd) {
               current.clipBox = clipBoxStack.length ? clipBoxStack.pop() ?? null : current.clipBox;
             } else if (fn === OPS.transform) {
@@ -1532,7 +1533,7 @@ export function init({
               let contentItem = current.contentItem;
               Object.assign(contentItem, {
                 transform: [
-                  ...contentItem.transform.slice(0, 4),
+                  ...(contentItem?.transform || textMatrix).slice(0, 4),
                   ...(textMatrixChanged ? [textMatrix[4], textMatrix[5]] : normLeadArgs)
                 ]
               });
@@ -1546,7 +1547,10 @@ export function init({
               }
               let contentItem = current.contentItem;
               Object.assign(contentItem, {
-                transform: [...contentItem.transform.slice(0, 4), ...(textMatrixChanged ? [textMatrix[4], textMatrix[5]] : normMoveArgs)]
+                transform: [
+                  ...(contentItem?.transform || textMatrix).slice(0, 4),
+                  ...(textMatrixChanged ? [textMatrix[4], textMatrix[5]] : normMoveArgs)
+                ]
               });
             } else if (fn === OPS.setLeading) {
               // TL: pdf.js stores leading with a “downward shift” sign
@@ -1570,7 +1574,7 @@ export function init({
               let contentItem = current.contentItem;
               Object.assign(contentItem, {
                 transform: [
-                  ...contentItem.transform.slice(0, 4),
+                  ...(contentItem?.transform || textMatrix).slice(0, 4),
                   ...(textMatrixChanged ? [textMatrix[4], textMatrix[5]] : lineShift),
                 ],
               });
@@ -1947,6 +1951,14 @@ export function init({
               const spacingScale = fontSize > 0 ? effectiveHeight / fontSize : 1;
 
               normalizedShowText = materializeLeaderGaps(normalizedShowText, {//!Bug in column_span_2.pdf (wrong leader detect?)
+                fontSize: effectiveHeight,
+                charSpacing: charSpacing * spacingScale,
+                fontDirection,
+                vertical: _vertical,
+              });
+
+              // Spaces encoded by offset within TJ
+              normalizedShowText = materializeWordGaps(normalizedShowText, {
                 fontSize: effectiveHeight,
                 charSpacing: charSpacing * spacingScale,
                 fontDirection,
@@ -3694,7 +3706,7 @@ export function init({
             };
           }
 
-          function getTextDirection(item) {
+          function getTextTransformDirection(item) {
             const transform = item?.transform;
 
             if (!transform || transform.length < 4) {
@@ -3717,7 +3729,7 @@ export function init({
           }
 
           function getTextNormal(item) {
-            const [x, y] = getTextDirection(item);
+            const [x, y] = getTextTransformDirection(item);
 
             return [
               -y,
@@ -3851,6 +3863,82 @@ export function init({
                 edgeBottom >= minY - lineMaxWidth &&
                 edgeTop <= maxY + lineMaxWidth
               );
+            });
+          }
+
+          /**
+           * The boundary of a filled cell between two fragments of the same line.
+           *
+           * If the vertical side of the fill lies exactly between the end of the first
+           * fragment and the beginning of the second, the fragments are in different cells—
+           * even when there are no actual lines between them.
+           *
+           * Safeguards against false positives:
+           *  - only fragments within the same line (based on the baseline);
+           *  - the gap must be at least half the font height: a regular space within
+           *    a sentence (e.g., a highlighted word) is not considered a boundary;
+           *  - only filled rectangles are taken into account.
+           */
+          function hasFillBoundaryBetween(firstItem: any, secondItem: any): boolean {
+            if (
+              !firstItem?.transform ||
+              !secondItem?.transform ||
+              firstItem.imageName ||
+              secondItem.imageName
+            ) {
+              return false;
+            }
+
+            if (!isHorizontalText(firstItem) || !isHorizontalText(secondItem)) {
+              return false;
+            }
+
+            const firstEnd = getVisibleGlyphEdge(firstItem, true);
+            const secondStart = getVisibleGlyphEdge(secondItem, false);
+
+            if (!firstEnd || !secondStart) {
+              return false;
+            }
+
+            const height = Math.max(
+              Math.abs(secondItem.transform[3]) || secondItem.height || 1,
+              1
+            );
+
+            // only one line of text
+            if (Math.abs(firstEnd.y - secondStart.y) > Math.max(height * 0.15, 0.3)) {
+              return false;
+            }
+
+            // A regular space between words is not the same as the gap between cells
+            const gap = secondStart.left - firstEnd.right;
+
+            if (gap < height * 0.5) {
+              return false;
+            }
+
+            const margin = 0.5;
+            const baseline = secondStart.y;
+
+            const isBetweenFragments = (x: number): boolean =>
+              x > firstEnd.right + margin && x < secondStart.left - margin;
+
+            return rectangles.some((rect: any) => {
+              if (!rect?.fillColor || !isVisibleVector(rect)) {
+                return false;
+              }
+
+              const rectLeft = Math.min(rect.x, rect.x + rect.width);
+              const rectRight = Math.max(rect.x, rect.x + rect.width);
+              const rectBottom = Math.min(rect.y, rect.y + rect.height);
+              const rectTop = Math.max(rect.y, rect.y + rect.height);
+
+              // The fill should cover the baseline of the text
+              if (baseline < rectBottom - margin || baseline > rectTop + margin) {
+                return false;
+              }
+
+              return isBetweenFragments(rectLeft) || isBetweenFragments(rectRight);
             });
           }
 
@@ -4421,14 +4509,9 @@ export function init({
              * they belong to different cells.
              */
             const hasSeparator =
-              hasVerticalSeparatorBetween(
-                previousItem,
-                currentItem
-              ) ||
-              hasHorizontalSeparatorBetween(
-                previousItem,
-                currentItem
-              );
+              hasVerticalSeparatorBetween(previousItem, currentItem) ||
+              hasHorizontalSeparatorBetween(previousItem, currentItem) ||
+              hasFillBoundaryBetween(previousItem, currentItem);
 
             if (hasSeparator) {
               previousItem.hasEOT = true;
@@ -4678,20 +4761,19 @@ export function init({
                   !hasInlineWhitespace &&
                   horizontalGap > maxHeight * 1.5;
               } else {
-                const horizontalOverlap =
-                  Math.min(chain.right, currentBox.right) -
-                  Math.max(chain.left, currentBox.left);
-
+                const horizontalOverlap = Math.min(chain.right, currentBox.right) - Math.max(chain.left, currentBox.left);
                 const verticalGap =
-                  currentBox.bottom >= chain.top
-                    ? currentBox.bottom - chain.top
-                    : currentBox.top <= chain.bottom
-                      ? chain.bottom - currentBox.top
-                      : 0;
+                  currentBox.bottom >= chain.top ? currentBox.bottom - chain.top : currentBox.top <= chain.bottom ? chain.bottom - currentBox.top : 0;
+
+                // A wide line in a clearly larger font above a smaller, narrower one is a title above a cell, not a wrapped line.
+                const isTitleOverSmallerText =
+                  previousBox.h >= currentBox.h * 1.25 &&
+                  previousBox.right - previousBox.left > currentBox.right - currentBox.left;
 
                 isSeparateCell =
                   horizontalOverlap < 0 ||
                   verticalGap > maxHeight * 1.25 ||
+                  isTitleOverSmallerText ||
                   areStaleItemsOnSeparateRows(previousItem, currentItem);
               }
 
@@ -5997,6 +6079,7 @@ export function init({
             };
 
             let targetProperties = Object.keys(targetPropertiesWeight).filter(prop => Object.keys(allPropertiesCounter?.[prop] || {})?.length > 1);
+            let headerContinuationClosed = false;
             let modeProperties = targetProperties.reduce((prev, cur) => {
               let keys = Object.keys(allPropertiesCounter[cur]);
               let values = Object.values(allPropertiesCounter[cur]) as Array<any>;
@@ -6055,6 +6138,25 @@ export function init({
               ...(rectangles || []).map(item => Object.assign({}, item, { vectorType: 'rectangle' }))
             ];
 
+            const TOP_ROW_UNIFORM_SHARE = 0.75;
+
+            // Index of the first row range that has several cells. A thin empty sliver above the header
+            // or a one-cell title must not take the "top row" role away from the real header row.
+            let firstTableRowIndex = -1;
+
+            // A row may continue the header only if it looks like the header: same fill or same font.
+            // Two rows without any fill say nothing about each other, so an empty fill is not a match.
+            const getDominantValue = (blocks: any[], property: string) => {
+              const counts = new Map<any, number>();
+              blocks.forEach(block => {
+                const value = block?.[property] ?? null;
+                counts.set(value, (counts.get(value) || 0) + 1);
+              });
+              return [...counts.entries()].sort((first, second) => second[1] - first[1])[0]?.[0];
+            };
+
+            const modalTextHeight = +findMod((coordinates || []).filter(item => item?.str?.trim()).map(item => item.height)) || 0;
+
             let headerRows = rows.sort((a, b) => b - a).reduce((prev, item, index, arr) => {
               let nextItem = arr[index + 1];
               if (nextItem) {
@@ -6064,10 +6166,37 @@ export function init({
                 const medianBorderWidth = maxVerticalBorderWidth;
 
                 const rangeMargin = Math.max(medianBorderWidth * 2, 0.5);//old:(medianBorderWidth * 2)
-                let textBlocks = filterBlocks(coordinates.filter(item => item?.str), {
-                  'y': range.map((r, i) => (i == 0 ? r - rangeMargin : r + rangeMargin)),
+
+                const rowBlocks = filterBlocks(coordinates, {//!BUGFIX no json data inside colums without titles //old:.filter(item => item?.str)
+                  y: range.map((r, i) => (i == 0 ? r - rangeMargin : r + rangeMargin)),
                   strictIntersecting: true
                 });
+
+                // An image cell (without text) can be a column header, but only when placed next to
+                // actual text headers. A row consisting solely of images or of a single
+                // text block with an image is considered decoration (a banner, frame, or logo), not a header.
+                // Furthermore, an image would make the row length 2 and bypass the check
+                // for “a single block at the edge—caption” below.
+                const MIN_TITLES_NEXT_TO_IMAGE = 2;
+                const rowTextBlocks = rowBlocks.filter((item: any) => item?.str);
+
+                let textBlocks =
+                  rowTextBlocks.length >= MIN_TITLES_NEXT_TO_IMAGE ? rowBlocks : rowTextBlocks;
+
+                DEBUG_LOG &&
+                  rowBlocks.length !== rowTextBlocks.length &&
+                  console.error('[HEADER IMAGE CELLS]', {
+                    range: range.map((value: number) => +value.toFixed(2)),
+                    titles: rowTextBlocks.length,
+                    images: rowBlocks.length - rowTextBlocks.length,
+                    imagesAccepted: textBlocks === rowBlocks,
+                  });
+
+                if (firstTableRowIndex === -1 && textBlocks.length >= 3) {
+                  firstTableRowIndex = index;
+                }
+                const isTopTableRow = index === firstTableRowIndex;
+
                 // GUARD: single-block line at the edge of the table = caption?
                 if (textBlocks.length === 1 && edges?.length) {
                   let isFirstOrLastRow = (index === 0) || (index >= arr.length - 2);
@@ -6083,6 +6212,13 @@ export function init({
                   })) {
                     return prev;
                   }
+                } else if (
+                  textBlocks.length === 1 &&
+                  modalTextHeight > 0 &&
+                  textBlocks[0].height >= modalTextHeight * 1.3
+                ) {
+                  // A lone block in a noticeably larger font above a table without any rules is its title.
+                  return prev;
                 }
                 // --- END GUARD ---
 
@@ -6108,7 +6244,6 @@ export function init({
                 let hasColsInfo = Array.isArray(cols) && cols.length > 1;
                 let rowOccupiedCols = hasColsInfo ? getOccupiedColumnBins(textBlocks, cols) : null;
                 let fullColsCount = hasColsInfo ? (cols.length - 1) : 0;
-
 
                 let isSequential = isSequentialIndexRow(
                   [...textBlocks]
@@ -6145,17 +6280,56 @@ export function init({
                   !isIndexRow
                 );
 
+
+
+
+
+                // A row below the header continues it only if it looks like the header: same fill or same font.
+                // Two rows without fills say nothing about each other, so an empty fill is not a match.
+                // A one-cell row above (a title) is not a header to compare with: no check, as before.
+                const looksLikeHeaderRow =
+                  followsHeader &&
+                  ['fillColor', 'fontName'].some(property => {
+                    const headerValue = getDominantValue(currentHeaderCombo.textBlocks, property);
+                    const rowValue = getDominantValue(textBlocks, property);
+                    return headerValue === rowValue && !(property === 'fillColor' && headerValue == null);
+                  });
+
+                // Header cells of a ruled table are separated by visible vertical rules running through the row.
+                // Stacked lines of a paragraph (footnotes, captions) have none.
+                let rowHasColumnRules = false;
+                if (isTopTableRow && textBlocks.length >= 4) {
+                  const rowLeft = Math.min(...textBlocks.map(block => block.x));
+                  const rowRight = Math.max(...textBlocks.map(block => block.x + block.width));
+                  const rowHeight = range[0] - range[1];
+                  const dividerXs = new Set<number>();
+
+                  for (const edge of edges || []) {
+                    const isVerticalRule =
+                      isVisibleVector(edge) && !edge['_isFakeLine'] && edge.width < lineMaxWidth && edge.height > lineMaxWidth;
+                    if (!isVerticalRule) {
+                      continue;
+                    }
+                    const center = edge.x + edge.width / 2;
+                    const overlap = Math.min(edge.y + edge.height, range[0]) - Math.max(edge.y, range[1]);
+                    if (overlap >= rowHeight * 0.5 && center > rowLeft + 1 && center < rowRight - 1) {
+                      dividerXs.add(Math.round(center));
+                    }
+                  }
+                  rowHasColumnRules = dividerXs.size >= 3;
+                }
+
                 if (
-                  textBlocks?.length && !columnsSignalHeaderEnded
-                  && (//The number of text items in the current row is greater than the number of items in the previous row (merged headings indicator)
-                    continuesHeaderAsIndexRow
-                    || (
-                      followsHeader
-                        ? (currentHeaderCombo.textBlocks.length < textBlocks.length || hasDuplicateCopies)
-                        : true
-                    )
+                  textBlocks?.length &&
+                  !columnsSignalHeaderEnded &&
+                  (//The number of text items in the current row is greater than the number of items in the previous row (merged headings indicator)
+                    continuesHeaderAsIndexRow ||
+                    (followsHeader
+                      ? hasDuplicateCopies || (currentHeaderCombo.textBlocks.length < textBlocks.length && looksLikeHeaderRow)
+                      : true)
                   )
                 ) {
+
 
                   let propertiesCounter = countProperties(textBlocks);
                   let currentTargetProperties = targetProperties.filter(prop => Object.keys(propertiesCounter?.[prop] || {})?.length > 1);
@@ -6253,14 +6427,24 @@ export function init({
                             return true;
                           }
 
-                          let weight = 1 - targetPropertiesWeight[prop];
-                          let total = Number(
-                            Object.values(propertiesCounter?.[prop] || {})
-                              .reduce((p, c) => Number(p) + Number(c), 0) || 0
-                          );
-                          let count = Number(propertiesCounter?.[prop]?.[textBlock?.[prop]] || 0);
+                          const weight = 1 - targetPropertiesWeight[prop];
+                          const counts = Object.values(propertiesCounter?.[prop] || {}) as number[];
+                          const total = counts.reduce((sum, value) => sum + Number(value), 0);
+                          const count = Number(propertiesCounter?.[prop]?.[textBlock?.[prop]] || 0);
 
-                          return count > (total * (weight || 1));//the number of cells with target properties exceeds the number of cells with other properties
+                          // Top row only: a minority of cells may use another font/fill (here "вес кг/м2" in a larger,
+                          // different font) as long as the bulk of the row shares one style.
+                          const topRowIsMostlyUniform =
+                            isTopTableRow &&
+                            textBlocks.length >= 4 &&
+                            rowHasColumnRules &&
+                            total > 0 &&
+                            Math.max(...counts) / total >= TOP_ROW_UNIFORM_SHARE;
+
+                          return count > total * (weight || 1) //the number of cells with target properties exceeds the number of cells with other properties
+                            || topRowIsMostlyUniform;
+
+
                         });
                       } else if (targetProperties.length) {
                         // currentTargetProperties is empty: within THIS line, none of the
@@ -6361,6 +6545,19 @@ export function init({
                           hasBottomBorder) ||
                         isIndicator
                       );
+
+                    DEBUG_LOG &&
+                      console.error('[HEADER FIRST ROW]', {
+                        range,
+                        isTopTableRow,
+                        rowHasColumnRules,
+                        cell: textBlock.str,
+                        hasMajorityStyle,
+                        hasDistinctStyle,
+                        hasUniformStr,
+                        hasBottomBorder,
+                        condition
+                      });
 
                     headerConditions.push(condition);
                   });
@@ -6674,6 +6871,13 @@ export function init({
               return group;
             }
 
+            const modalHeight = +findMod(textBlocks.map((block: any) => block.height)) || 0;
+            const isOversizedLoneTitle =
+              !(group.edges || []).length &&
+              titleBlocks.length === 1 &&
+              modalHeight > 0 &&
+              titleBlocks[0].height >= modalHeight * 1.3;
+
             // 3. The text crosses every interior column boundary.
             const margin = Math.max(lineMaxWidth * 0.1, 0.3);
             const colsAsc = [...group.cols].sort((a, b) => a - b);
@@ -6684,7 +6888,7 @@ export function init({
             );
             const isCrossed = (x: number) =>
               titleBlocks.some((block: any) => block.x + margin < x && x < block.x + block.width - margin);
-            if (!interiorCols.every(isCrossed)) {
+            if (!interiorCols.every(isCrossed) && !isOversizedLoneTitle) {
               return group;
             }
 
@@ -6702,6 +6906,158 @@ export function init({
               }
             });
             group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: [...group.rows],
+              cols: group.cols || [],
+              lineMaxWidth,
+              separatorRows: group.synthesizedRows || [],
+            });
+
+            return group;
+          }
+
+          /**
+         * Report header above the table header.
+         *
+         * Rows such as “FOREST LABORATORIES, INC. DISCLOSURE REPORT” / “Calendar Year - 2012”
+         * are inside the table border: each has its own block, and the internal vertical lines
+         * do not extend into them (merged cell). They break the header chain: topHeaderRowCount
+         * counts only consecutive ranges starting from the top, and the actual header moves into the body.
+         *
+         * Header rows are discarded only if the row below them has already been recognized as a header.
+         */
+          function trimTitleBand(group: any, lineMaxWidth: number): any {
+            const MAX_BAND_ROWS = 3;
+            const MIN_HEADER_BLOCKS = 3;
+
+            if (
+              !group?.rows?.length ||
+              !group?.cols?.length ||
+              group.rows.length < 6 ||
+              group.cols.length < 4 ||
+              !group?.headerRows
+            ) {
+              return group;
+            }
+
+            const tolerance = Math.max(lineMaxWidth * 0.5, 1);
+            const rowsDesc = [...group.rows].sort((a, b) => b - a);
+
+            const textBlocks = (group.coordinates || []).filter(
+              (block: any) =>
+                block?.str?.trim() &&
+                [block.x, block.y, block.width, block.height].every(Number.isFinite)
+            );
+
+            const countBlocks = (rowIndex: number): number =>
+              textBlocks.filter(
+                (block: any) =>
+                  block.y >= rowsDesc[rowIndex + 1] - 0.01 && block.y < rowsDesc[rowIndex]
+              ).length;
+
+            // The first row contains multiple cells; above it, there are only rows with a single block
+            let firstTableRow = -1;
+
+            for (
+              let index = 0;
+              index < rowsDesc.length - 1 && index <= MAX_BAND_ROWS;
+              index++
+            ) {
+              const blocksCount = countBlocks(index);
+
+              if (blocksCount >= MIN_HEADER_BLOCKS) {
+                firstTableRow = index;
+                break;
+              }
+
+              if (blocksCount > 1) {
+                return group;
+              }
+            }
+
+            if (firstTableRow < 1) {
+              return group;
+            }
+
+            const newTop = rowsDesc[firstTableRow];
+            const bandTop = rowsDesc[0];
+
+            const bandBlocks = textBlocks.filter((block: any) => block.y >= newTop);
+
+            if (!bandBlocks.length) {
+              return group;
+            }
+
+            // The line below the heading is already recognized as a header
+            const isHeaderRecognised = Object.keys(group.headerRows).some((key) => {
+              const edges = key.split('-').map(Number).filter(Number.isFinite);
+
+              return edges.length && Math.abs(Math.max(...edges) - newTop) <= tolerance * 2;
+            });
+
+            if (!isHeaderRecognised) {
+              return group;
+            }
+
+            // The internal vertical lines do not extend into the header (merged cell)
+            const left = Math.min(...group.cols);
+            const right = Math.max(...group.cols);
+            const outerPad = lineMaxWidth * 1.3;
+
+            const crossesBand = (group.edges || []).some((edge: any) => {
+              if (!isVisibleVector(edge) || edge['_isFakeLine']) {
+                return false;
+              }
+
+              if (!(edge.width < lineMaxWidth && edge.height > lineMaxWidth)) {
+                return false;
+              }
+
+              const x = edge.x + edge.width / 2;
+
+              if (x <= left + outerPad || x >= right - outerPad) {
+                return false;
+              }
+
+              const overlap =
+                Math.min(edge.y + edge.height, bandTop) - Math.max(edge.y, newTop);
+
+              return overlap > Math.max(lineMaxWidth, 1);
+            });
+
+            if (crossesBand) {
+              return group;
+            }
+
+            DEBUG_LOG &&
+              console.error('[TITLE BAND TRIMMED]', {
+                rows: firstTableRow,
+                titles: bandBlocks.map((block: any) => String(block.str).trim()),
+                newTop: +newTop.toFixed(3),
+              });
+
+            const isBelowNewTop = (item: any): boolean =>
+              item.y + (item.height || 0) / 2 <= newTop + tolerance;
+
+            group.rows = group.rows.filter((y: number) => y <= newTop + 1e-6);
+            group.coordinates = (group.coordinates || []).filter(
+              (block: any) => !bandBlocks.includes(block)
+            );
+            group.edges = (group.edges || []).filter(isBelowNewTop);
+            group.rectangles = (group.rectangles || []).filter(isBelowNewTop);
+            group.rectanglesEdges = (group.rectanglesEdges || []).filter(isBelowNewTop);
+
+            ['edgesRows', 'rectanglesRows', 'synthesizedRows'].forEach((key) => {
+              if (Array.isArray(group[key])) {
+                group[key] = group[key].filter((y: number) => y <= newTop + 0.5);
+              }
+            });
+
+            group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+
             group.headerRows = determineHeaderRows({
               coordinates: group.coordinates || [],
               edges: group.edges || [],
@@ -7281,6 +7637,368 @@ export function init({
             return result;
           }
 
+          /**
+         * A header row that appears ABOVE the first horizontal line of the table.
+         *
+         * Sometimes, a table has borders only below the rows (border-bottom),
+         * but the header has no top border. In that case, the header text is above the first line and
+         * does not fall within the group—the first row of data becomes the header.
+         *
+         * Conditions (all required):
+         *  - the top of the group is a true horizontal line;
+         *  - the row of text immediately above it consists of at least 2 blocks and lies entirely
+         *    within the width of the table;
+         *  - the gap to the line is no greater than the font height (the page header or caption
+         *    is positioned further away);
+         *  - the blocks in the row extend at least 80% of the occupied columns in the table body
+         *    (the page header has 1–2 blocks, and the footer has one block per column);
+         *  - no block spans multiple columns (this is what a full-width header looks like,
+         *    not a footer cell);
+         *  - the text does not belong to another table found in the document.
+         */
+          function extendGroupTopHeaderRow(
+            group: any,
+            pageGroup: any,
+            allGroups: any[],
+            lineMaxWidth: number
+          ): any {
+            if (
+              !pageGroup?.coordinates?.length ||
+              !group?.rows?.length ||
+              !group?.cols?.length
+            ) {
+              return group;
+            }
+
+            const currentTop = Math.max(...group.rows);
+
+            const hasRuleOnTop = (group.edgesRows || []).some(
+              (y: number) => Math.abs(y - currentTop) <= 1.5
+            );
+
+            if (!hasRuleOnTop) {
+              return group;
+            }
+
+            const colsAsc = [...group.cols].sort((a, b) => a - b);
+            const tableLeft = colsAsc[0];
+            const tableRight = colsAsc[colsAsc.length - 1];
+            const columnCount = colsAsc.length - 1;
+
+            const bodyBlocks = (group.coordinates || []).filter(
+              (block: any) =>
+                block?.str?.trim() &&
+                [block.x, block.y, block.width, block.height].every(Number.isFinite)
+            );
+
+            if (!bodyBlocks.length || columnCount < 2) {
+              return group;
+            }
+
+            // text that already belongs to other tables
+            const claimed = new Set<number>();
+
+            allGroups.forEach((other: any) => {
+              if (other === group) {
+                return;
+              }
+
+              (other.coordinates || []).forEach((block: any) => {
+                claimed.add(block.index);
+              });
+            });
+
+            const above = pageGroup.coordinates.filter(
+              (block: any) =>
+                block?.str?.trim() &&
+                !block.images?.length &&
+                !String(block.str).trim().includes('\n') &&
+                [block.x, block.y, block.width, block.height].every(Number.isFinite) &&
+                isHorizontalText(block) &&
+                block.y > currentTop &&
+                // Text that appears entirely to the side of the table is not part of it
+                block.x < tableRight &&
+                block.x + block.width > tableLeft &&
+                !claimed.has(block.index)
+            );
+
+            if (!above.length) {
+              return group;
+            }
+
+            // the line of text closest to the line
+            const nearestBaseline = Math.min(...above.map((block: any) => block.y));
+
+            const line = above
+              .filter(
+                (block: any) =>
+                  Math.abs(block.y - nearestBaseline) <=
+                  Math.max(block.height * 0.3, 0.5)
+              )
+              .sort((a: any, b: any) => a.x - b.x);
+
+            if (line.length < 2) {
+              return group;
+            }
+
+            const isInsideTable = line.every(
+              (block: any) =>
+                block.x >= tableLeft - 1 && block.x + block.width <= tableRight + 1
+            );
+
+            if (!isInsideTable) {
+              return group;
+            }
+
+            const lineHeight = Math.max(...line.map((block: any) => block.height));
+            const lineTop = Math.max(
+              ...line.map((block: any) => block.y + block.height)
+            );
+            const gap = nearestBaseline - currentTop;
+
+            // 1. The header is flush with the line
+            if (gap > Math.max(lineHeight, 2)) {
+              return group;
+            }
+
+            // Table body columns that contain text (centered within the block)
+            const getColumn = (block: any): number => {
+              const center = block.x + block.width / 2;
+
+              for (let index = 0; index < columnCount; index++) {
+                if (center >= colsAsc[index] && center < colsAsc[index + 1]) {
+                  return index;
+                }
+              }
+
+              return -1;
+            };
+
+            const occupiedColumns = new Set<number>();
+
+            bodyBlocks.forEach((block: any) => {
+              const column = getColumn(block);
+
+              if (column >= 0) {
+                occupiedColumns.add(column);
+              }
+            });
+
+            if (occupiedColumns.size < 2) {
+              return group;
+            }
+
+            // 2. The header covers almost all of the columns in use
+            const headerColumns = new Set<number>();
+
+            line.forEach((block: any) => {
+              const column = getColumn(block);
+
+              if (occupiedColumns.has(column)) {
+                headerColumns.add(column);
+              }
+            });
+
+            const requiredColumns = Math.max(2, Math.ceil(occupiedColumns.size * 0.8));
+
+            if (headerColumns.size < requiredColumns) {
+              return group;
+            }
+
+            // 3. No header block spans multiple columns
+            const columnCenters = [...occupiedColumns].map(
+              (column) => (colsAsc[column] + colsAsc[column + 1]) / 2
+            );
+
+            const spansSeveralColumns = line.some(
+              (block: any) =>
+                columnCenters.filter(
+                  (center) => center > block.x && center < block.x + block.width
+                ).length >= 2
+            );
+
+            if (spansSeveralColumns) {
+              return group;
+            }
+
+            // The top border of the header is virtual, with the same indentation as the bottom
+            const newTop = lineTop + gap;
+
+            DEBUG_LOG &&
+              console.error('[TOP HEADER ROW]', {
+                cells: line.map((block: any) => block.str),
+                gap: +gap.toFixed(2),
+                newTop: +newTop.toFixed(2),
+                headerColumns: headerColumns.size,
+                occupiedColumns: occupiedColumns.size,
+              });
+
+            group.rows = [...new Set([...group.rows, newTop])].sort((a, b) => a - b);
+            group.coordinates = uniqueArr(
+              [...(group.coordinates || []), ...line],
+              ['x', 'y', 'width', 'height']
+            );
+            group.y = [Math.min(...group.y, newTop), Math.max(...group.y, newTop)];
+
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: [...group.rows],
+              cols: group.cols || [],
+              lineMaxWidth,
+              separatorRows: group.synthesizedRows || [],
+            });
+
+            return group;
+          }
+
+          /**
+         * Empty columns between text columns in a table that has only
+         * horizontal lines.
+         *
+         * Without vertical lines, column boundaries are taken from the edges of the text, so
+         * the space between columns becomes a separate empty column.
+         * We collapse such a column (in which no text block begins):
+         * both of its boundaries are replaced by a single one—the middle of the space.
+         *
+         * This does not apply if there is at least one vertical column boundary
+         * (a vertical line or a fill border inside the table) or if there are no
+         * lines at all (such tables collapse empty columns when rendering HTML).
+         */
+          function collapseEmptyGutterColumns(group: any, lineMaxWidth: number): any {
+            if (
+              !group?.cols?.length ||
+              group.cols.length < 4 ||
+              !group?.coordinates?.length ||
+              !(group.edgesRows || []).length
+            ) {
+              return group;
+            }
+
+            const cols = [...group.cols].sort((a, b) => a - b);
+            const left = cols[0];
+            const right = cols[cols.length - 1];
+            const tolerance = Math.max(lineMaxWidth * 1.3, 2);
+
+            const isInterior = (x: number): boolean =>
+              x > left + tolerance && x < right - tolerance;
+
+            if (
+              (group.edgesCols || []).some(isInterior) ||
+              (group.rectanglesCols || []).some(isInterior)
+            ) {
+              return group;
+            }
+
+            const columnCount = cols.length - 1;
+            const SNAP_TOLERANCE = 1.5;
+
+            // The same block-to-column mapping as in `extractTableData`
+            const getColumn = (x: number): number => {
+              for (let index = 0; index < columnCount; index++) {
+                if (x >= cols[index] && x < cols[index + 1]) {
+                  const isJustBeforeNextBorder =
+                    index + 1 < columnCount && cols[index + 1] - x <= SNAP_TOLERANCE;
+
+                  return isJustBeforeNextBorder ? index + 1 : index;
+                }
+              }
+
+              return -1;
+            };
+
+            const textBlocks = group.coordinates.filter(
+              (block: any) =>
+                block?.str?.trim() &&
+                Number.isFinite(block.x) &&
+                Number.isFinite(block.width)
+            );
+
+            const occupied = new Set<number>();
+
+            textBlocks.forEach((block: any) => {
+              const column = getColumn(block.x);
+
+              if (column >= 0) {
+                occupied.add(column);
+              }
+            });
+
+            // серии подряд идущих пустых внутренних колонок
+            const runs: Array<[number, number]> = [];
+
+            for (let column = 1; column < columnCount - 1; column++) {
+              if (occupied.has(column)) {
+                continue;
+              }
+
+              const lastRun = runs[runs.length - 1];
+
+              if (lastRun && lastRun[1] === column - 1) {
+                lastRun[1] = column;
+              } else {
+                runs.push([column, column]);
+              }
+            }
+
+            const applied = runs
+              .map(([first, last]) => ({
+                first,
+                last,
+                middle: (cols[first] + cols[last + 1]) / 2,
+              }))
+              // The new border should not cut off any text that overlaps the gap
+              .filter(
+                ({ middle }) =>
+                  !textBlocks.some(
+                    (block: any) =>
+                      block.x < middle - 0.5 && block.x + block.width > middle + 0.5
+                  )
+              );
+
+            if (!applied.length) {
+              return group;
+            }
+
+            const newCols: number[] = [];
+
+            cols.forEach((value, index) => {
+              const run = applied.find(
+                (item) => index >= item.first && index <= item.last + 1
+              );
+
+              if (!run) {
+                newCols.push(value);
+                return;
+              }
+
+              if (index === run.first) {
+                newCols.push(run.middle);
+              }
+            });
+
+            DEBUG_LOG &&
+              console.error('[COLLAPSE EMPTY GUTTER COLUMNS]', {
+                before: cols.map((value) => +value.toFixed(2)),
+                after: newCols.map((value) => +value.toFixed(2)),
+              });
+
+            group.cols = newCols;
+
+            group.headerRows = determineHeaderRows({
+              coordinates: group.coordinates || [],
+              edges: group.edges || [],
+              rectangles: group.rectangles || [],
+              rows: [...(group.rows || [])],
+              cols: group.cols,
+              lineMaxWidth,
+              separatorRows: group.synthesizedRows || [],
+            });
+
+            return group;
+          }
+
           function extendGroupTopBorder(group, pageGroup, lineMaxWidth) {
             if (!pageGroup || !group.rows?.length || !group.cols?.length) return group;
 
@@ -7738,8 +8456,36 @@ export function init({
               topLine.y,
               ...(bottomLine ? [bottomLine.y] : []),
             ])].sort((a, b) => a - b);
+            // Vertical lines for the added row. Without them, the cells in that row lose
+            // their left and right borders: the function used to add only horizontal lines.
+            const bandVerticalEdges = bottomLine
+              ? (pageGroup.edges || []).filter((edge: any) => {
+                if (!isVisibleVector(edge) || edge['_isFakeLine']) {
+                  return false;
+                }
+
+                if (!(edge.width < lineMaxWidth && edge.height > lineMaxWidth)) {
+                  return false;
+                }
+
+                const overhang = Math.max(lineMaxWidth, 1);
+
+                return (
+                  edge.y >= bottomLine.y - overhang &&
+                  edge.y + edge.height <= topLine.center + overhang &&
+                  edge.x + edge.width >= tableLeft - overhang &&
+                  edge.x <= tableRight + overhang
+                );
+              })
+              : [];
+
             group.edges = uniqueArr(
-              [...(group.edges || []), ...topLine.edges, ...(bottomLine ? bottomLine.edges : [])],
+              [
+                ...(group.edges || []),
+                ...topLine.edges,
+                ...(bottomLine ? bottomLine.edges : []),
+                ...bandVerticalEdges,
+              ],
               ['x', 'y', 'width', 'height']
             );
             group.coordinates = uniqueArr(
@@ -8612,7 +9358,10 @@ export function init({
             tableGroups = tableGroups.map(group => constrainGroupToRuledFrame(group));
             tableGroups = tableGroups.map(group => extendGroupTopBorder(group, pageGroups[0], lineMaxWidth));
             tableGroups = tableGroups.map(group => extendGroupBottomRow(group, pageGroups[0], lineMaxWidth));
+            tableGroups = tableGroups.map(group => extendGroupTopHeaderRow(group, pageGroups[0], tableGroups, lineMaxWidth));
+            tableGroups = tableGroups.map(group => collapseEmptyGutterColumns(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => trimUnsupportedTrailingRows(group, lineMaxWidth));//!BUG fpdf_example-1.pdf (the last row of the table is missing)
+            tableGroups = tableGroups.map((group) => trimTitleBand(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => trimFullWidthTitleRow(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => removeFillSeamRows(group, lineMaxWidth));
             tableGroups = tableGroups.map(group => removeFillPadColumns(group, lineMaxWidth));
@@ -8632,6 +9381,21 @@ export function init({
               const keep = isTableGroup(group, lineMaxWidth);
               return keep;
             });
+
+            // Tables without visible borders: search only within text that is not occupied by the found tables
+            const recoveredGroups = recoverBorderlessTextTables({
+              coordinates,
+              tableGroups,
+            });
+
+            if (recoveredGroups.length) {
+              const getTop = (group: any): number =>
+                group.rows?.length ? Math.max(...group.rows) : group.y ? group.y[1] : 0;
+
+              tableGroups = [...tableGroups, ...recoveredGroups].sort(
+                (a, b) => getTop(b) - getTop(a)
+              );
+            }
 
             tableGroups.forEach(group => {
               group.assuredCols = group.cols;
@@ -8687,13 +9451,13 @@ export function init({
                       edge.width < lineMaxWidth &&
                       edge.height > lineMaxWidth
                     );
+                    const realVerticalEdges = visibleVerticalEdges.filter(edge => !edge['_isFakeLine']);
 
-                    function getSideEdges(element: any) {
+                    function getSideEdges(element: any, pool: any[] = visibleVerticalEdges) {
                       if (!element) {
                         return [];
                       }
-
-                      const edges = visibleVerticalEdges.filter(edge => {
+                      const edges = pool.filter(edge => {
                         const tolerance = -Math.min(edge.width, edge.height);
                         edgeTolerance = (tolerance < edgeTolerance) || !edgeTolerance ? tolerance : edgeTolerance;
                         const result = checkRectangleRanges(
@@ -8707,7 +9471,9 @@ export function init({
                           }
                         ) as Array<any>;
 
-                        return result.some(item => item.inRange);
+                        // Side rules of a row are the vertical rules that run alongside it (overlap its y-range).
+                        // A rule overlapping only in x passes through this column somewhere else (another row, another table).
+                        return result.find(item => item.axis === 'y')?.inRange === true; //old:return result.some(item => item.inRange);
                       });
 
                       if (!edges.length) {
@@ -8733,6 +9499,68 @@ export function init({
                           uniqueEdges[0]
                         ),
                       ];
+                    }
+
+                    /**
+                     * A fill that covers only part of a row (the highlighted cell) creates
+                     * “side edges” that are NOT part of the table's sides.
+                     * Returns true if the bottom border meets the following criteria:
+                     *  - both sides of the bottom border lie within the width of the header's sides;
+                     *  - in the same row, below the header, there is text outside these sides.
+                     */
+                    function isPartialFillBand(options: {
+                      headerSides: any[];
+                      bottomSides: any[];
+                      rowTop: number;
+                      rowBottom: number;
+                    }): boolean {
+                      const { headerSides, bottomSides, rowTop, rowBottom } = options;
+
+                      if (!Number.isFinite(rowTop) || !Number.isFinite(rowBottom)) {
+                        return false;
+                      }
+
+                      const tolerance = Math.max(lineMaxWidth, 1);
+                      const headerLeft = headerSides[0].x;
+                      const headerRight = headerSides[headerSides.length - 1].x;
+                      const bottomLeft = bottomSides[0].x;
+                      const bottomRight = bottomSides[bottomSides.length - 1].x;
+
+                      const isInsideHeaderSpan =
+                        bottomLeft >= headerLeft - tolerance &&
+                        bottomRight <= headerRight + tolerance;
+
+                      if (!isInsideHeaderSpan) {
+                        return false;
+                      }
+
+                      return (globalGroup.coordinates || []).some((block: any) => {
+                        if (!block?.str?.trim()) {
+                          return false;
+                        }
+
+                        if (![block.x, block.y, block.width].every(Number.isFinite)) {
+                          return false;
+                        }
+
+                        // The block belongs to this line (based on the baseline)
+                        if (block.y > rowTop || block.y <= rowBottom) {
+                          return false;
+                        }
+
+                        const blockLeft = block.x;
+                        const blockRight = block.x + block.width;
+
+                        const isUnderHeader =
+                          blockLeft >= headerLeft - tolerance &&
+                          blockRight <= headerRight + tolerance;
+
+                        const isOutsideBottomSides =
+                          blockRight <= bottomLeft + tolerance ||
+                          blockLeft >= bottomRight - tolerance;
+
+                        return isUnderHeader && isOutsideBottomSides;
+                      });
                     }
 
                     textBlocks?.forEach(textBlock => {
@@ -8767,8 +9595,14 @@ export function init({
                         //   continue;
                         // }
 
-                        const textBlockSideEdges = getSideEdges(textBlock);
-                        const bottomTextBlockSideEdges = getSideEdges(bottomElements[0]);
+                        // Rows with and without cell fills must be compared by the same kind of lines: fill outlines are
+                        // fake edges that exist only where a cell is filled. Use real rules when both rows have them.
+                        const realTextSides = getSideEdges(textBlock, realVerticalEdges);
+                        const realBottomSides = getSideEdges(bottomElements[0], realVerticalEdges);
+                        const compareRealOnly = realTextSides.length >= 2 && realBottomSides.length >= 2;
+
+                        const textBlockSideEdges = compareRealOnly ? realTextSides : getSideEdges(textBlock);
+                        const bottomTextBlockSideEdges = compareRealOnly ? realBottomSides : getSideEdges(bottomElements[0]);
 
                         const isSameSideEdges = (() => {
                           /*
@@ -8778,25 +9612,65 @@ export function init({
                            * This is important: the absence of an edge != proof
                            * that the table is over.
                            */
+                          if (textBlockSideEdges.length < 2 || bottomTextBlockSideEdges.length < 2) {
+                            return null;
+                          }
+
+                          // The sides of the bottom row are derived solely from the fake fill edges,
+                          // and the fill covers only part of the row (the highlighted cell)—
+                          // this is not a side of another table; the comparison is not meaningful.
                           if (
-                            textBlockSideEdges.length < 2 ||
-                            bottomTextBlockSideEdges.length < 2
+                            !compareRealOnly &&
+                            realBottomSides.length === 0 &&
+                            isPartialFillBand({
+                              headerSides: textBlockSideEdges,
+                              bottomSides: bottomTextBlockSideEdges,
+                              rowTop: row,
+                              rowBottom: nextRow,
+                            })
                           ) {
+                            DEBUG_LOG &&
+                              console.error('[PARTIAL FILL BAND]', {
+                                row,
+                                cell: textBlock.str,
+                                headerSides: textBlockSideEdges.map((edge: any) => +edge.x.toFixed(1)),
+                                bottomSides: bottomTextBlockSideEdges.map((edge: any) => +edge.x.toFixed(1)),
+                              });
                             return null;
                           }
 
                           if (textBlockSideEdges?.length && bottomTextBlockSideEdges?.length) {
-                            let firstDiff = Math.abs(textBlockSideEdges[0].x - bottomTextBlockSideEdges[0].x);
-                            let lastDiff = Math.abs(textBlockSideEdges[textBlockSideEdges.length - 1].x - bottomTextBlockSideEdges[bottomTextBlockSideEdges.length - 1].x);
-                            let tolerance = Math.max(lineMaxWidth, 1);//edgeTolerance ? Math.abs(edgeTolerance) : Math.max(lineMaxWidth, 1);
-                            return (firstDiff <= tolerance) && (lastDiff <= tolerance);
+                            let firstDiff = Math.abs(
+                              textBlockSideEdges[0].x - bottomTextBlockSideEdges[0].x
+                            );
+                            let lastDiff = Math.abs(
+                              textBlockSideEdges[textBlockSideEdges.length - 1].x -
+                              bottomTextBlockSideEdges[bottomTextBlockSideEdges.length - 1].x
+                            );
+                            let tolerance = Math.max(lineMaxWidth, 1);
+                            return firstDiff <= tolerance && lastDiff <= tolerance;
                           } else {
                             return true;
                           }
                         })();
 
                         if (isSameSideEdges === false) {
-                          forcedRowSplits.add(row);
+                          DEBUG_LOG &&
+                            console.error('[FORCED SPLIT]', {
+                              row,
+                              cell: textBlock.str,
+                              headerCells: textBlocks.length,
+                              atHeaderBottom: index === startIndex,
+                              headerSides: textBlockSideEdges.map((edge: any) => +edge.x.toFixed(1)),
+                              bottomSides: bottomTextBlockSideEdges.map((edge: any) => +edge.x.toFixed(1))
+                            });
+
+                          // A header row made of several cells is never cut off from its body just because one of the rows
+                          // has filled cells and the other has none. A lone title/caption block still is.
+                          const headerRowHasSeveralCells = textBlocks.length >= 3;
+                          if (!(headerRowHasSeveralCells && index === startIndex)) {
+                            forcedRowSplits.add(row);
+                          }
                           break;
                         }
 
@@ -9150,6 +10024,28 @@ export function init({
                     }
                   );
                 };
+
+                const traceRanges = (stage: string): void => {
+                  DEBUG_LOG &&
+                    console.error(
+                      '[ROWS RANGES]',
+                      stage,
+                      rowsRanges.map((range: number[]) => ({
+                        top: +range?.[0]?.toFixed(3),
+                        bottom: +range?.[range.length - 1]?.toFixed(3),
+                        rows: range.length,
+                      }))
+                    );
+                };
+
+                DEBUG_LOG &&
+                  console.error('[GROUP ROWS]', {
+                    groupRows: groupRows.map((row: number) => +row.toFixed(3)),
+                    headerRanges: headerRanges.map((item: any) =>
+                      item.range.map((value: number) => +value.toFixed(3))
+                    ),
+                  });
+
                 groupRows.slice(0, -1).forEach((firstRow, rowIndex) => {
                   let secondRow = groupRows[rowIndex + 1];
                   let targetRange = headerRanges.find(item => {
@@ -9207,6 +10103,17 @@ export function init({
                   const forcedSplit =
                     forcedRowSplits.has(firstRow);
 
+                  DEBUG_LOG &&
+                    console.error('[ROW INTERVAL]', {
+                      firstRow: +firstRow.toFixed(3),
+                      secondRow: +secondRow.toFixed(3),
+                      textBlocks: textBlocksLength,
+                      edges: edgesLength,
+                      targetRange: !!targetRange,
+                      splitRowsCondition,
+                      forcedSplit,
+                    });
+
                   if (
                     rowsRanges.length ? (
                       forcedSplit ||
@@ -9234,6 +10141,8 @@ export function init({
 
                 });
 
+                traceRanges('loop');
+
                 // The range that lies entirely inside a gap band (titles, footnotes) is not a table.
                 rowsRanges = rowsRanges.filter(
                   range =>
@@ -9244,7 +10153,11 @@ export function init({
                     )
                 );
 
+                traceRanges('gapBands');
+
                 rowsRanges = rescueContinuationRanges({ rowsRanges, group, globalGroup });
+
+                traceRanges('rescue')
 
                 rowsRanges = rowsRanges.reduce((prev, range) => {
                   if (range.length > 2) {
@@ -9254,6 +10167,8 @@ export function init({
                   }
                   return prev;
                 }, []);
+
+                traceRanges('reduce');
 
 
 
@@ -9334,6 +10249,18 @@ export function init({
                     }
                   }
                 }
+
+                traceRanges('chain');
+
+                DEBUG_LOG &&
+                  console.error('[ROWS RANGES]', {
+                    ranges: rowsRanges.map((range: number[]) => ({
+                      top: +range?.[0]?.toFixed(3),
+                      bottom: +range?.[range.length - 1]?.toFixed(3),
+                      rows: range.length,
+                    })),
+                    forcedRowSplits: [...forcedRowSplits].map((value: any) => +Number(value).toFixed(3)),
+                  });
 
                 let colsRangesGroups = [...Array(rowsRanges.length)].map(() => []);
                 let groupCols = group.cols.sort((a, b) => b - a);
@@ -9449,6 +10376,42 @@ export function init({
                       return res.isContained && (res.biggestArgument == 1 || res.biggestArgument == null)
                       //&& (block.y + block.height <= rowsRange[0] && block.y >= rowsRange[rowsRange.length - 1]); //BUGFIX for 06-sales-order
                     }) || [];
+                    // Edges that extend beyond the range by a fraction of a point (rounding error)
+                    // should not be omitted from the table: `strictContained` discards them.
+                    // A typical example is the vertical lines of the bottom row, which end
+                    // at the same point as the bottom horizontal line.
+                    const EDGE_OVERHANG = 0.5;
+                    const rangeTop = Math.max(rowsRange[0], rowsRange[rowsRange.length - 1]);
+                    const rangeBottom = Math.min(rowsRange[0], rowsRange[rowsRange.length - 1]);
+                    const rangeLeft = Math.min(colsRange[0], colsRange[colsRange.length - 1]);
+                    const rangeRight = Math.max(colsRange[0], colsRange[colsRange.length - 1]);
+
+                    const keptEdges = new Set(edges);
+
+                    const overhangingEdges = (globalGroup.edges || []).filter(
+                      (edge: any) =>
+                        !keptEdges.has(edge) &&
+                        [edge.x, edge.y, edge.width, edge.height].every(Number.isFinite) &&
+                        edge.y >= rangeBottom - EDGE_OVERHANG &&
+                        edge.y + edge.height <= rangeTop + EDGE_OVERHANG &&
+                        edge.x + edge.width >= rangeLeft - 2 &&
+                        edge.x <= rangeRight + 2
+                    );
+
+                    if (overhangingEdges.length) {
+                      DEBUG_LOG &&
+                        console.error('[OVERHANGING EDGES]', {
+                          count: overhangingEdges.length,
+                          sample: overhangingEdges.slice(0, 3).map((edge: any) => ({
+                            x: +edge.x.toFixed(3),
+                            height: +edge.height.toFixed(3),
+                            belowBottom: (rangeBottom - edge.y).toExponential(2),
+                            aboveTop: (edge.y + edge.height - rangeTop).toExponential(2),
+                          })),
+                        });
+
+                      edges = [...edges, ...overhangingEdges];
+                    }
                     let rectangles = globalGroup.rectangles?.filter(block => {
                       let res: any = checkRectangleRanges(
                         block,
@@ -9467,6 +10430,43 @@ export function init({
                       return res.isContained && (res.biggestArgument == 1 || res.biggestArgument == null)
                       //&& (block.y + block.height <= rowsRange[0] && block.y >= rowsRange[rowsRange.length - 1]);//BUGFIX for 06-sales-order
                     }) || [];
+
+                    // The filters above only consider the Y range. A table located NEXT TO IT
+                    // (same rows, different columns) would otherwise end up in a subgroup, receive someone else’s
+                    // assuredRows, and turn into unnecessary junk data.
+                    // A subgroup cannot extend beyond the horizontal boundaries of the group
+                    // from which it was extracted.
+                    const sourceLeft = sourceGroup.x?.[0];
+                    const sourceRight = sourceGroup.x?.[1];
+
+                    if (Number.isFinite(sourceLeft) && Number.isFinite(sourceRight)) {
+                      const widthSlack = Math.max(lineMaxWidth, 1);
+
+                      const isInsideSourceWidth = (item: any): boolean =>
+                        !Number.isFinite(item?.x) ||
+                        (item.x + (item.width || 0) >= sourceLeft - widthSlack &&
+                          item.x <= sourceRight + widthSlack);
+
+                      const totalBefore = edges.length + rectangles.length + coordinates.length;
+
+                      edges = edges.filter(isInsideSourceWidth);
+                      rectangles = rectangles.filter(isInsideSourceWidth);
+                      coordinates = coordinates.filter(isInsideSourceWidth);
+
+                      const skipped =
+                        totalBefore - (edges.length + rectangles.length + coordinates.length);
+
+                      DEBUG_LOG &&
+                        skipped > 0 &&
+                        console.error('[SPLIT: FOREIGN ITEMS SKIPPED]', {
+                          skipped,
+                          groupX: [+sourceLeft.toFixed(2), +sourceRight.toFixed(2)],
+                          rowsRange: [
+                            +rowsRange[0].toFixed(2),
+                            +rowsRange[rowsRange.length - 1].toFixed(2),
+                          ],
+                        });
+                    }
 
                     let newTableGroups = createGroup({
                       edges: edges, //101
@@ -9657,6 +10657,280 @@ export function init({
               }, []);
             }
 
+
+            /**
+  * Tables without visible borders (no lines or fills).
+  *
+  * The grid for such tables cannot be found using vectors, so we search for it in the text
+  * that is not occupied by any of the tables we've found:
+  *  - a line of text = blocks on a single baseline;
+  *  - a series = consecutive lines with the same number of blocks (>= 3),
+  *    equal spacing, and columns that overlap each other;
+  *  - we construct row and column boundaries based on the text and pass them to createGroup
+  *    as assuredRows / assuredCols (just as splitGroups does).
+  *
+  * A group is accepted only if determineHeaderRows finds a header row within it
+  * (different font or style for the first row)—this is a safeguard against false positives
+  * in multi-column layouts and lists.
+  */
+            function recoverBorderlessTextTables(options: {
+              coordinates: any[];
+              tableGroups: any[];
+            }): any[] {
+              const { coordinates, tableGroups } = options;
+
+              const MIN_COLUMNS = 3;
+              const MIN_LINES = 4;
+              const PITCH_TOLERANCE = 0.3;
+              const MAX_PITCH_IN_HEIGHTS = 6;
+
+              const median = (values: number[]): number => {
+                const sorted = [...values].sort((a, b) => a - b);
+                return sorted[Math.floor(sorted.length / 2)];
+              };
+
+              // 1. Text already occupied by the tables found
+              const claimedIndexes = new Set<number>();
+              const boxes: Array<{
+                left: number;
+                right: number;
+                bottom: number;
+                top: number;
+              }> = [];
+
+              tableGroups.forEach((group: any) => {
+                (group.coordinates || []).forEach((block: any) => {
+                  claimedIndexes.add(block.index);
+                });
+
+                if (group?.x?.length === 2 && group?.y?.length === 2) {
+                  boxes.push({
+                    left: group.x[0],
+                    right: group.x[1],
+                    bottom: group.y[0],
+                    top: group.y[1],
+                  });
+                }
+              });
+
+              const isClaimed = (block: any): boolean => {
+                if (claimedIndexes.has(block.index)) {
+                  return true;
+                }
+
+                const centerX = block.x + block.width / 2;
+                const centerY = block.y + block.height / 2;
+
+                return boxes.some(
+                  (box) =>
+                    centerX >= box.left - 1 &&
+                    centerX <= box.right + 1 &&
+                    centerY >= box.bottom - 1 &&
+                    centerY <= box.top + 1
+                );
+              };
+
+              const freeBlocks = (coordinates || []).filter(
+                (block: any) =>
+                  block?.str?.trim() &&
+                  !block.images?.length &&
+                  !String(block.str).trim().includes('\n') &&
+                  [block.x, block.y, block.width, block.height].every(Number.isFinite) &&
+                  block.width > 0 &&
+                  block.height > 0 &&
+                  isHorizontalText(block) &&
+                  !isClaimed(block)
+              );
+
+              if (freeBlocks.length < MIN_COLUMNS * MIN_LINES) {
+                return [];
+              }
+
+              // 2. Lines of text at the baseline (the blocks are sorted by y, so
+              //    it is sufficient to compare with the last line)
+              const lines: any[] = [];
+
+              [...freeBlocks]
+                .sort((a: any, b: any) => b.y - a.y || a.x - b.x)
+                .forEach((block: any) => {
+                  const lastLine = lines[lines.length - 1];
+
+                  if (
+                    lastLine &&
+                    Math.abs(lastLine.baseline - block.y) <= Math.max(block.height * 0.3, 0.5)
+                  ) {
+                    lastLine.blocks.push(block);
+                  } else {
+                    lines.push({ baseline: block.y, blocks: [block] });
+                  }
+                });
+
+              lines.forEach((line) => {
+                line.blocks.sort((a: any, b: any) => a.x - b.x);
+                line.top = Math.max(...line.blocks.map((block: any) => block.y + block.height));
+                line.bottom = Math.min(...line.blocks.map((block: any) => block.y));
+                line.height = Math.max(...line.blocks.map((block: any) => block.height));
+              });
+
+              // 3. A sequence of consecutive lines with the same structure
+              const runs: any[][] = [];
+              let run: any[] = [];
+              let columnRanges: Array<{ left: number; right: number }> = [];
+              let pitches: number[] = [];
+
+              const closeRun = (): void => {
+                if (run.length >= MIN_LINES) {
+                  runs.push(run);
+                }
+                run = [];
+                columnRanges = [];
+                pitches = [];
+              };
+
+              const startRun = (line: any): void => {
+                run = [line];
+                columnRanges = line.blocks.map((block: any) => ({
+                  left: block.x,
+                  right: block.x + block.width,
+                }));
+                pitches = [];
+              };
+
+              const continuesRun = (line: any): boolean => {
+                const previous = run[run.length - 1];
+
+                if (line.blocks.length !== previous.blocks.length) {
+                  return false;
+                }
+
+                const pitch = previous.baseline - line.baseline;
+
+                if (pitch <= 0 || pitch > previous.height * MAX_PITCH_IN_HEIGHTS) {
+                  return false;
+                }
+
+                if (pitches.length) {
+                  const reference = median(pitches);
+
+                  if (Math.abs(pitch - reference) > reference * PITCH_TOLERANCE) {
+                    return false;
+                  }
+                }
+
+                // The kth block of a row must be above or below the kth column of the series
+                const slack = line.height * 0.5;
+
+                return line.blocks.every(
+                  (block: any, index: number) =>
+                    block.x < columnRanges[index].right + slack &&
+                    block.x + block.width > columnRanges[index].left - slack
+                );
+              };
+
+              lines.forEach((line) => {
+                if (line.blocks.length < MIN_COLUMNS) {
+                  closeRun();
+                  return;
+                }
+
+                if (run.length && continuesRun(line)) {
+                  pitches.push(run[run.length - 1].baseline - line.baseline);
+
+                  line.blocks.forEach((block: any, index: number) => {
+                    columnRanges[index].left = Math.min(columnRanges[index].left, block.x);
+                    columnRanges[index].right = Math.max(
+                      columnRanges[index].right,
+                      block.x + block.width
+                    );
+                  });
+
+                  run.push(line);
+                  return;
+                }
+
+                closeRun();
+                startRun(line);
+              });
+
+              closeRun();
+
+              // 4. Text-based grid -> createGroup with assuredRows / assuredCols
+              const recovered: any[] = [];
+
+              runs.forEach((lineRun) => {
+                const blocks = lineRun.flatMap((line: any) => line.blocks);
+                const columnCount = lineRun[0].blocks.length;
+
+                const ranges = Array.from({ length: columnCount }, (_, index) => ({
+                  left: Math.min(...lineRun.map((line: any) => line.blocks[index].x)),
+                  right: Math.max(
+                    ...lineRun.map((line: any) => line.blocks[index].x + line.blocks[index].width)
+                  ),
+                }));
+
+                // There must be a space between the columns
+                const hasGutters = ranges.every(
+                  (range, index) => index === 0 || ranges[index - 1].right < range.left
+                );
+
+                if (!hasGutters) {
+                  return;
+                }
+
+                const pitch = median(
+                  lineRun.slice(1).map((line: any, index: number) => lineRun[index].baseline - line.baseline)
+                );
+                const lineHeight = Math.max(...lineRun.map((line: any) => line.height));
+                const rowPad = Math.max((pitch - lineHeight) / 2, 0);
+                const colPad = Math.max(lineHeight * 0.5, 2);
+
+                const rows = [lineRun[0].top + rowPad];
+
+                for (let index = 1; index < lineRun.length; index++) {
+                  rows.push((lineRun[index - 1].bottom + lineRun[index].top) / 2);
+                }
+
+                rows.push(lineRun[lineRun.length - 1].bottom - rowPad);
+
+                const cols = [ranges[0].left - colPad];
+
+                for (let index = 1; index < ranges.length; index++) {
+                  cols.push((ranges[index - 1].right + ranges[index].left) / 2);
+                }
+
+                cols.push(ranges[ranges.length - 1].right + colPad);
+
+                const groups = createGroup({
+                  edges: [],
+                  rectangles: [],
+                  coordinates: blocks,
+                  tolerance: Infinity,
+                  assuredRows: rows,
+                  assuredCols: cols,
+                });
+
+                groups.forEach((group: any) => {
+                  // Without a header, this is not a table (multi-column text, list, etc.)
+                  if (!Object.keys(group.headerRows || {}).length) {
+                    return;
+                  }
+
+                  DEBUG_LOG &&
+                    console.error('[BORDERLESS TABLE RECOVERED]', {
+                      lines: lineRun.length,
+                      columns: columnCount,
+                      headerRows: Object.keys(group.headerRows),
+                      rows: rows.map((value) => +value.toFixed(2)),
+                      cols: cols.map((value) => +value.toFixed(2)),
+                    });
+
+                  recovered.push(group);
+                });
+              });
+
+              return recovered;
+            }
+
             function createGroup(options) {
               let { edges, rectangles, coordinates, tolerance, assuredRows, assuredCols } = options;
               let groups = [];
@@ -9708,9 +10982,14 @@ export function init({
                     })
                     .map((border) => border.x);
 
-                  if (borders.length) {
-                    group['assuredCols'] = [...new Set([...group['assuredCols'], ...borders])]
-                      .sort((a: number, b: number) => a - b);
+                  // Fills or rules already define at least as many interior columns as the text-based guesses.
+                  // pageColumnBorders come from the text of the whole page and may belong to a neighbouring table.
+                  const interiorAssuredCols = group['assuredCols'].filter(
+                    (x: number) => x > groupX0 + lineMaxWidth && x < groupX1 - lineMaxWidth
+                  );
+
+                  if (borders.length && interiorAssuredCols.length < borders.length) {
+                    group['assuredCols'] = [...new Set([...group['assuredCols'], ...borders])].sort((a: number, b: number) => a - b);
                   }
                 }
 
@@ -10045,7 +11324,13 @@ export function init({
                       let averageDistance = distances.reduce((prev, cur) => prev + cur, 0) / distances.filter(item => item > 0).length;
                       let maxDistance = (modeTextHeight * 2);
 
-                      if (averageDistance > maxDistance) {//Spaces are too large, boundaries need to be locked in
+                      // An assured border (a real gap between rule segments) already separates the columns around this empty gap.
+                      // Creating "gutter" borders at +/- padding from the neighbouring texts would only make a sliver column.
+                      const gapHasAssuredBorder = paddingBorders.some(border => assuredGridItems.includes(border));
+                      DEBUG_LOG &&
+                        console.error('[PADDING GAP]', { paddingBorders, averageDistance, maxDistance, assured: paddingBorders.filter(b => assuredGridItems.includes(b)) });
+
+                      if (averageDistance > maxDistance && !gapHasAssuredBorder) {//Spaces are too large, boundaries need to be locked in
                         let distancesIndexes = distances.map((item, index) => index);
                         let firstSplitIndex = distances.findIndex(item => item > maxDistance);
                         let secondSplitIndex = distances.findLastIndex(item => item > maxDistance);
@@ -10529,6 +11814,11 @@ export function init({
             });
 
             let borderSize = getAverageBorderSize(assuredEdges, lineMaxWidth);
+
+            // For a table with no edges, there is nothing to base the average line thickness on
+            if (!Number.isFinite(borderSize)) {
+              borderSize = 0.57;
+            }
             let deletedEdges = [];
 
             /**
@@ -11168,22 +12458,30 @@ export function init({
             let rowGapsForSuppression = sortedRowsForGap.slice(1).map((y, i) => y - sortedRowsForGap[i]).filter(g => g > 0);
             let modalRowHeightForSuppression = +findMod(rowGapsForSuppression) || findAverage(rowGapsForSuppression) || 20;
             let yProximityTolerance = modalRowHeightForSuppression * 1.5;
-
             let leaderProtectedCount = 0;
-            const horizontalBlockers = coordinates.filter((textBlock, k) => {
-              let intersectingGridItems = uniqueArr(horizontalIntersectorsByCoordinate[k], 'y');
-              if (!isHeader(textBlock)) {
-                intersectingGridItems = intersectingGridItems.filter(
-                  item =>
-                    !headerRowsKeys.some(key =>
-                      (checkRectangleRanges({ y: item.y }, { y: key }, { axis: ['y'], strictIntersecting: true, tolerance: 1 }) as Array<any>).every(
-                        res => res.isIntersecting
+
+            const headerBandTop = headerRowsKeys.length ? Math.max(...headerRowsKeys) : Infinity;
+            const headerBandBottom = headerRowsKeys.length ? Math.min(...headerRowsKeys) : -Infinity;
+
+            const horizontalBlockers = coordinates
+              .map((textBlock, k) => {
+                const headerBlock = isHeader(textBlock);
+                let intersectingGridItems = uniqueArr(horizontalIntersectorsByCoordinate[k], 'y');
+
+                if (!headerBlock) {
+                  intersectingGridItems = intersectingGridItems.filter(
+                    item =>
+                      !headerRowsKeys.some(key =>
+                        (checkRectangleRanges({ y: item.y }, { y: key }, { axis: ['y'], strictIntersecting: true, tolerance: 1 }) as Array<any>).every(
+                          res => res.isIntersecting
+                        )
                       )
-                    )
-                );
-              }
-              return intersectingGridItems.length > 3;
-            });
+                  );
+                }
+
+                return intersectingGridItems.length > 3 ? { textBlock, headerBlock } : null;
+              })
+              .filter(Boolean) as Array<{ textBlock: any; headerBlock: boolean }>;
             let horizontalEdges = [];
             for (let i = 0; i < rows.length; i++) {
               for (let j = 0; j < cols.length - 1; j++) {
@@ -11227,12 +12525,17 @@ export function init({
                   isEdgeBackedByRealLine(edge, relatedAssuredEdge, true);
 
                 if (!isProtectedEdge) {
-                  for (const textBlock of horizontalBlockers) {
+                  for (const { textBlock, headerBlock } of horizontalBlockers) {
+                    // A header cell can span several header rows. It says nothing about the borders of the body rows below it.
+                    if (headerBlock && !(edge.y <= headerBandTop + lineMaxWidth && edge.y >= headerBandBottom - lineMaxWidth)) {
+                      continue;
+                    }
+
                     const edgeOnSameAxis = (
                       checkRectangleRanges(edge, { x: [textBlock.x, textBlock.x + textBlock.width] }, { axis: 'x', strict: true, strictIntersecting: true }) as any
                     ).isIntersecting;
                     if (edgeOnSameAxis) {
-                      isIntersectingTextBlock = true;
+                      isIntersectingTextBlock = textBlock;
                       deletedEdges.push(edge);
                       break;
                     }
@@ -11378,7 +12681,7 @@ export function init({
 
             const getYRange = (obj: any): [number, number] | null => {
               const y = obj.y || obj.transform?.[5];
-              return Number.isFinite(y) && Number.isFinite(obj.height) ? getBoxRange(y, obj.height) : null;
+              return getCheckedRange(obj.y || obj.transform?.[5], obj.height);
             };
 
             const visibleEdges = [...(edges || []), ...(rectanglesEdges || [])].filter(item => isVisibleVector(item));
@@ -11390,6 +12693,18 @@ export function init({
               const itemBox = getObj(item);
               const yRange = getYRange(item);
 
+              // Flip to true to get the previous behaviour back (compare HTML on the regression set).
+              const LEGACY_ZERO_NEIGHBOURS = false;
+
+              // checkRectangleRanges reads a start of 0 (or NaN) as "unbounded": such a block overlaps everything.
+              // For the block being tested that is kept as before (page footers at y = 0 are removed by it: m27.pdf).
+              // As somebody else's NEIGHBOUR it is meaningless: it is an item on the page edge (tested on its own)
+              // or a block that never got a real position (fabre-prices.pdf: two blocks at 0,0 made every cell a watermark).
+              const hasNoRealPosition = (block: any): boolean => {
+                const box = getObj(block);
+                return !box.x || !box.y;
+              };
+
               const isNeighbour = (index: number): boolean => {
                 if (index === mainIndex) return false;
                 const cur = tableContentItems[index];
@@ -11398,23 +12713,50 @@ export function init({
                 // A watermark IMAGE is still removed: it is checked as `item` itself
                 // (it intersects many text items).
                 if (cur?.imageName && !item?.imageName) return false;
+                if (!LEGACY_ZERO_NEIGHBOURS && hasNoRealPosition(cur)) return false;
                 return (
                   checkRectangleRanges(getObj(cur), itemBox, { strict: true, strictIntersecting: true, axis: ['x', 'y'] }) as Array<any>
                 ).every(res => res.inRange);
               };
-              //const neighbourCandidates = yRange ? itemsIndex.query(yRange[0], yRange[1]) : tableContentItems.map((_, i) => i);
-              //const intersectionsIndexes = neighbourCandidates.filter(isNeighbour);//!BUG in m27.pdf (wrong header)
-              const intersectionsIndexes = tableContentItems.reduce(
-                (prev, cur, index) => {
 
-                  if (isNeighbour(index)) {
-                    prev.push(index);
-                  }
+              const neighbourCandidates = yRange ? itemsIndex.query(yRange[0], yRange[1]) : tableContentItems.map((_, i) => i);
+              const intersectionsIndexes = neighbourCandidates.filter(isNeighbour);//!BUG in m27.pdf (wrong header)
 
-                  return prev;
-                },
-                []
-              );
+              // const intersectionsIndexes = tableContentItems.reduce(//!BUG in fabre-prices.pdf (no table)
+              //   (prev, cur, index) => {
+              //     if (isNeighbour(index)) {
+              //       prev.push(index);
+              //     }
+              //     return prev;
+              //   },
+              //   []
+              // );
+              if (DEBUG_LOG) {
+                const trueBox = (obj: any) => {
+                  const geometry = getObj(obj);
+                  return { x: [geometry.x, geometry.x + (geometry.width || 0)], y: [geometry.y, geometry.y + (geometry.height || 0)] };
+                };
+                const realNeighbours = tableContentItems.map((_, i) => i).filter(index => {
+                  if (index === mainIndex) return false;
+                  const cur = tableContentItems[index];
+                  if (cur?.imageName && !item?.imageName) return false;
+                  return (
+                    checkRectangleRanges(trueBox(cur), trueBox(item), { strict: true, strictIntersecting: true, axis: ['x', 'y'] }) as any[]
+                  ).every(res => res.inRange);
+                });
+                const flagged = (indexes: number[]) =>
+                  indexes.length > 1 && !isOverlayOnSameTextLine(item, indexes.map(i => tableContentItems[i]));
+
+                if (flagged(intersectionsIndexes) !== flagged(realNeighbours)) {
+                  console.error('[WATERMARK ONLY BECAUSE OF 0]', {
+                    str: item.str,
+                    x: itemBox.x,
+                    y: itemBox.y,
+                    viaQuirk: intersectionsIndexes.map(i => tableContentItems[i].str),
+                    viaRealGeometry: realNeighbours.map(i => tableContentItems[i].str)
+                  });
+                }
+              }
               verifySameResult('intersections', intersectionsIndexes, () => tableContentItems.map((_, i) => i).filter(isNeighbour));
 
               if (
@@ -11757,6 +13099,45 @@ export function init({
                 return covered >= (right - left) * 0.5;
               };
 
+              const rulePositionTolerance = Math.max(lineMaxWidth * 0.5, 1.5);
+              const tableLeft = verticles[0].x;
+              const tableRight = verticles[colsCount].x;
+              const tableWidth = Math.max(tableRight - tableLeft, 1);
+              const boundaryCoverageCache = new Map<number, number>();
+
+              // Share of the table width covered by real rules on the boundary above `row`.
+              // It is the same for every column, so it is computed once per boundary, not once per column.
+              const getBoundaryCoverage = (row: number): number => {
+                let coverage = boundaryCoverageCache.get(row);
+                if (coverage === undefined) {
+                  const y = horizons[row].y;
+                  let covered = 0;
+                  realRules.forEach((edge: any) => {
+                    if (Math.abs(edge.y + edge.height / 2 - y) <= rulePositionTolerance) {
+                      covered += Math.max(0, Math.min(edge.x + edge.width, tableRight) - Math.max(edge.x, tableLeft));
+                    }
+                  });
+                  coverage = covered / tableWidth;
+                  boundaryCoverageCache.set(row, coverage);
+                }
+                return coverage;
+              };
+
+              // One merged cell of a single column, rows firstRow..lastRow.
+              const mergeColumnCells = (col: number, firstRow: number, lastRow: number): void => {
+                const rootKey = `${firstRow}-${col}`;
+                const arr: string[] = [];
+                for (let row = firstRow; row <= lastRow; row++) {
+                  arr.push(`${row}-${col}`);
+                }
+                merges[rootKey] = { row: firstRow, col, arr, widthArr: [rootKey], heightArr: arr, width: 1, height: lastRow - firstRow + 1 };
+                arr.forEach(cellKey => {
+                  if (cellKey !== rootKey) {
+                    mergeAlias[cellKey] = rootKey;
+                  }
+                });
+              };
+
               for (let col = 0; col < colsCount; col++) {
                 let textRow = -1;
                 for (let row = 0; row < headerRowCount; row++) {
@@ -11765,33 +13146,38 @@ export function init({
                     break;
                   }
                 }
-                if (textRow < 1) continue;
 
-                // The rows above the label must be free and not separated from it by a rule.
-                let free = true;
-                for (let row = 0; row <= textRow && free; row++) {
-                  const key = `${row}-${col}`;
-                  if (merges[key] || mergeAlias[key]) free = false;
-                  if (row > 0 && hasRuleAt(horizons[row].y, col)) free = false;
+                if (textRow >= 1) {
+                  // The text sits below empty header cells: the cell grows upwards
+                  // The rows above the label must be free and not separated from it by a rule.
+                  let free = true;
+                  for (let row = 0; row <= textRow && free; row++) {
+                    const key = `${row}-${col}`;
+                    if (merges[key] || mergeAlias[key]) free = false;
+                    if (row > 0 && hasRuleAt(horizons[row].y, col)) free = false;
+                  }
+                  if (free) {
+                    mergeColumnCells(col, 0, textRow);
+                    DEBUG_LOG && console.error('[HEADER ROW SPAN]', { col, rows: textRow + 1 });
+                  }
+                } else if (textRow === 0) {
+                  // Text in two header rows and no rule between them under this column
+                  // (e.g. "Total Plan &" / "Non-Plan"): one cell written on two lines.
+                  for (let row = 0; row < headerRowCount - 1; row++) {
+                    const upperKey = `${row}-${col}`;
+                    const lowerKey = `${row + 1}-${col}`;
+                    if (!occupied.has(upperKey) || !occupied.has(lowerKey)) continue;
+                    if (merges[upperKey] || mergeAlias[upperKey] || merges[lowerKey] || mergeAlias[lowerKey]) continue;
+                    // cheap cached check first: a boundary without rules gives nothing to compare with
+                    if (getBoundaryCoverage(row + 1) < 0.3 || hasRuleAt(horizons[row + 1].y, col)) continue;
+
+                    mergeColumnCells(col, row, row + 1);
+                    DEBUG_LOG && console.error('[HEADER ROW SPAN: MISSING RULE]', { col, row });
+                  }
                 }
-                if (!free) continue;
-
-                const rootKey = `0-${col}`;
-                const arr: string[] = [];
-                for (let row = 0; row <= textRow; row++) arr.push(`${row}-${col}`);
-                merges[rootKey] = {
-                  row: 0,
-                  col,
-                  arr,
-                  widthArr: [rootKey],
-                  heightArr: arr,
-                  width: 1,
-                  height: textRow + 1
-                };
-                arr.forEach(cellKey => {
-                  if (cellKey !== rootKey) mergeAlias[cellKey] = rootKey;
-                });
               }
+
+
             }
 
             /**
@@ -11999,6 +13385,43 @@ export function init({
                     Math.abs(rule.from - cellLeft) <= tolerance &&
                     rule.to - rule.from < tableWidth * 0.9
                 );
+                // Text centred over several columns: the rule above it starts to the left of the column the text is in,
+                // but it holds the whole text.
+                const holdingSegment = segment
+                  ? null
+                  : rules.find(
+                    (rule: any) =>
+                      Math.abs(rule.y - rowTopY) <= tolerance &&
+                      rule.from < cellLeft - tolerance &&
+                      rule.from <= info.left + tolerance &&
+                      rule.to >= info.right - tolerance &&
+                      rule.to - rule.from < tableWidth * 0.9
+                  );
+
+                if (holdingSegment) {
+                  let startCol = info.colFrom;
+                  while (startCol > 0 && verticles[startCol].x > holdingSegment.from + tolerance) {
+                    startCol--;
+                  }
+                  let endCol = info.colFrom;
+                  for (let col = info.colFrom + 1; col < colsCount; col++) {
+                    if (verticles[col + 1].x <= holdingSegment.to + tolerance) endCol = col;
+                    else break;
+                  }
+
+                  const spanFree = (): boolean => {
+                    for (let col = startCol; col <= endCol; col++) {
+                      if (col !== info.colFrom && !isFree(`${info.row}-${col}`)) return false;
+                    }
+                    return true;
+                  };
+
+                  if (endCol > startCol && spanFree() && createMerge(info.row, info.row + 1, startCol, endCol + 1)) {
+                    created.push({ root: `${info.row}-${startCol}`, rows: 1, cols: endCol - startCol + 1, kind: 'colspan-centred' });
+                    candidates.push({ cell: rootKey, text: info.text, result: 'colspan from the rule holding the text' });
+                    return;
+                  }
+                }
                 let ruleEndCol = info.colFrom;
                 if (segment) {
                   for (let col = info.colFrom + 1; col < colsCount; col++) {
@@ -13806,6 +15229,26 @@ export function init({
               // Generate HTML table
               table.html = (() => {
                 try {
+
+                  DEBUG_LOG &&
+                    console.error('[LAST ROW EDGES]', {
+                      bottom: Math.min(...tableGroup.rows),
+                      inGroup: (edges || [])
+                        .filter(
+                          (edge: any) =>
+                            edge.width < lineMaxWidth &&
+                            edge.height > lineMaxWidth &&
+                            edge.y < Math.min(...tableGroup.rows) + 25
+                        )
+                        .map((edge: any) => ({
+                          x: +edge.x.toFixed(3),
+                          y: edge.y,
+                          height: +edge.height.toFixed(3),
+                          fake: !!edge._isFakeLine,
+                          visible: isVisibleVector(edge),
+                        })),
+                    });
+
                   const headerRowCount = topHeaderRowCount; //Object.keys(headerRows).length;
 
                   const bandRectangles = uniqueArr(
@@ -14271,6 +15714,36 @@ export function init({
                   const verticalPlan = verticles.map((_: any, index: number) => planGridLine(false, index));
                   // --- END EDGES LOGIC ---
 
+                  // A row carries nothing: no text, no fill, no side borders, and no merged cell of another row reaches into it.
+                  // Its top and bottom lines stay on the neighbouring rows (their own borders), so nothing visible is lost.
+                  const isBlankRow = (r: number): boolean => {
+                    for (let c = 0; c < colsCount; c++) {
+                      const key = `${r}-${c}`;
+                      const root = mergeAlias[key];
+                      if (root) {
+                        if (!root.startsWith(`${r}-`)) return false; // covered by a cell from another row
+                        continue;
+                      }
+                      const cell = table.array[r]?.[c];
+                      if (!cell || (cell['str'] || '').trim() || cell['fillColor'] || cell['images']?.length) return false;
+
+                      const merge = merges[key];
+                      if (merge && merge.height > 1) return false;
+                      const colSpan = merge?.width || 1;
+                      if (pickSideColor(verticalPlan[c]?.slice(r, r + 1)) || pickSideColor(verticalPlan[c + colSpan]?.slice(r, r + 1))) {
+                        return false;
+                      }
+                    }
+                    return true;
+                  };
+
+                  // Only the blank rows right after the header (the case at hand). Remove `break` to drop blank rows anywhere in the body.
+                  const blankRows = new Set<number>();
+                  for (let r = headerRowCount; r < table.array.length; r++) {
+                    if (!isBlankRow(r)) break;
+                    blankRows.add(r);
+                  }
+
                   let html = `<table style="border-collapse:collapse;">` + '\n';
                   html += '<thead>\n';
 
@@ -14281,6 +15754,9 @@ export function init({
                     let tagName = r < headerRowCount ? 'th' : 'td';
                     if (r === headerRowCount) {
                       html += '</thead>\n<tbody>\n';
+                    }
+                    if (blankRows.has(r)) {
+                      continue;
                     }
                     html += `<tr>\n`;
 
@@ -14328,11 +15804,10 @@ export function init({
 
                       const cellData = table.array[r][c];
                       const lineBreaksToHtml = (text: string) => text.replace(/\n/gim, '<br>');
-
-                      let safeStr = lineBreaksToHtml(cellData['str'] || '');
+                      const text = cellData['str'] || ' ';
+                      let safeStr = lineBreaksToHtml(text);
 
                       if (cellData['sup']?.length) {
-                        const text = cellData['str'] || '';
                         let html = '';
                         let position = 0;
 
@@ -14428,27 +15903,44 @@ export function init({
                     return paths;
                   }
 
+                  function addDuplicateIndexes(paths, separator?) {
+                    const counts = new Map();
+                    separator = separator || '.'
+                    for (const path of paths) {
+                      counts.set(path, (counts.get(path) ?? 0) + 1);
+                    }
+
+                    const indexes = new Map();
+
+                    return paths.map(path => {
+                      if (counts.get(path) === 1) return path;
+
+                      const index = indexes.get(path) ?? 0;
+                      indexes.set(path, index + 1);
+
+                      return `${path}${separator}${index}`;
+                    });
+                  }
 
                   // A numbering row labels the columns for the reader, it must not leak into the keys
                   const headerRowsForPaths = clonedArray
                     .slice(0, topHeaderRowCount) //.slice(0, headerRowsKeys.length)
                     .filter(row => !isSequentialIndexRow(
-                      row.map(cell => (cell?.str || '').trim()).filter(Boolean)
+                      row.map(cell => (cell?.str || '').trim())//!BUGFIX no json data inside colums without titles //old:.filter(Boolean)
                     ));
 
-                  let headerPaths = generateHeaderPaths(headerRowsForPaths);
+                  let headerPaths = addDuplicateIndexes(generateHeaderPaths(headerRowsForPaths), PATH_SEP);
 
                   let jsonData = clonedArray.slice(headerRowCount).map((row, rowIdx) => {
                     let obj = {};
                     row.forEach((col, colIndex) => {
-                      if (!headerPaths[colIndex]) {
-                        return;
-                      }
+                      let key = headerPaths[colIndex];
+                      //if (!headerPaths[colIndex]) { return;} //!BUGFIX no json data inside colums without titles
                       let str = row[colIndex]?.str
                         ?.trim()
                         ?.replace(LEADER_TRAILING_RUN, '') || '';
                       if (str) {
-                        deepSet(obj, headerPaths[colIndex], str, {
+                        deepSet(obj, key, str, {
                           create: true,
                           separator: PATH_SEP,
                           customSplitRegExp: PATH_SPLIT_RE
@@ -14456,7 +15948,8 @@ export function init({
                       }
                     });
                     return obj;
-                  });
+                  })
+                    .filter(row => Object.keys(row).length > 0);//remove empty rows data
                   return jsonData;
                 } catch (err) {
                   throw err;

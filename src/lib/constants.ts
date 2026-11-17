@@ -1,5 +1,5 @@
 export const headerIndicatorWords: { [key: string]: Array<string> } = {
-  eng: ['name', 'surname', 'last name', 'first name', 'full name', 'user name', 'age', 'gender', 'sex', 'relationship', 'nationality', 'status', 'time', 'timeframe', 'period', 'duration', 'dilution', 'viscosity', 'resistance', 'density', 'destination', 'term', 'deadline', 'release', 'released', 'receive', 'received', 'effective', 'date', 'dates', 'start date', 'end date', 'birth day', 'date of birth', 'dob', 'description', 'title', 'label', 'subject', 'interest', 'experience', 'note', 'notes', 'comment', 'comments', 'header', 'column', 'col', 'area', 'country', 'city', 'town', 'zip', 'zip code', 'postal code', 'code', 'location', 'region', 'address', 'address line', 'street address', 'mail', 'e-mail', 'email', 'email address', 'phone', 'phone number', 'mobile', 'tel', 'telephone', 'contact', 'contacts', 'site', 'website', 'web', 'url', 'uri', 'path', 'parent', 'parents', 'operation', 'source', 'education', 'position', 'occupation', 'role', 'team', 'designation', 'department', 'volume', 'sold', 'unsold', 'average', 'span', 'currency', 'cost', 'price', 'unit price', 'price per unit', 'offer', 'order', 'budget', 'total', 'sub total', 'total price', 'discount', 'donation', 'quality', 'quantity', 'amount', 'salary', 'revenue', 'color', 'colour', 'speed', 'distance', 'valuation', 'value', 'size', 'width', 'height', 'length', 'weight', 'depth', 'population', 'range', 'queue', 'index', 'id', '#', '№', 'no', 'number', 'hash', 'year', 'month', 'day', 'height', 'weight', 'length', 'model', 'category', 'ticker', 'employee', 'artist', 'author', 'director', 'owner', 'genre', 'commodity', 'product', 'item', 'freight', 'feature', 'plan', 'task', 'issue', 'group', 'company', 'sector', 'division', 'district', 'customer', 'vendor', 'brand', 'salesman', 'assignee', 'requester', 'contributor', 'office', 'rate', 'balance', 'rating', 'rank', 'fee', 'score', 'grade', 'type', 'class', 'count', 'runs', 'progress', 'points', 'coins', 'expenses', 'priority', 'trend', 'engagement', 'percentage', 'profit', 'locale', 'language', 'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sun', 'mon', 'tues', 'wed', 'thur', 'fri', 'sat', 'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'],
+  eng: ['name', 'surname', 'last name', 'first name', 'full name', 'user name', 'age', 'gender', 'sex', 'relationship', 'nationality', 'status', 'time', 'timeframe', 'period', 'duration', 'dilution', 'viscosity', 'resistance', 'density', 'destination', 'term', 'deadline', 'release', 'released', 'receive', 'received', 'effective', 'date', 'dates', 'start date', 'end date', 'birth day', 'date of birth', 'dob', 'description', 'title', 'label', 'subject', 'interest', 'experience', 'note', 'notes', 'comment', 'comments', 'header', 'column', 'reason', 'col', 'area', 'country', 'city', 'town', 'zip', 'zip code', 'postal code', 'code', 'location', 'region', 'address', 'address line', 'street address', 'mail', 'e-mail', 'email', 'email address', 'phone', 'phone number', 'mobile', 'tel', 'telephone', 'contact', 'contacts', 'site', 'website', 'web', 'url', 'uri', 'path', 'parent', 'parents', 'operation', 'source', 'education', 'position', 'occupation', 'role', 'team', 'designation', 'department', 'volume', 'sold', 'unsold', 'average', 'span', 'currency', 'cost', 'price', 'unit price', 'price per unit', 'offer', 'order', 'budget', 'total', 'sub total', 'total price', 'discount', 'donation', 'quality', 'quantity', 'amount', 'salary', 'revenue', 'color', 'colour', 'speed', 'distance', 'valuation', 'value', 'size', 'width', 'height', 'length', 'weight', 'depth', 'population', 'range', 'queue', 'index', 'id', '#', '№', 'no', 'number', 'hash', 'year', 'month', 'day', 'height', 'weight', 'length', 'model', 'category', 'ticker', 'employee', 'artist', 'author', 'director', 'owner', 'genre', 'commodity', 'product', 'item', 'freight', 'feature', 'plan', 'task', 'issue', 'group','grouping', 'company', 'sector', 'division', 'district', 'customer', 'vendor', 'brand', 'salesman', 'assignee', 'requester', 'contributor', 'office', 'rate', 'balance', 'rating', 'rank', 'fee', 'score', 'grade', 'type', 'sub-type', 'class', 'count', 'runs', 'progress', 'points', 'coins', 'expenses', 'priority', 'trend', 'engagement', 'percentage', 'profit', 'locale', 'language', 'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sun', 'mon', 'tues', 'wed', 'thur', 'fri', 'sat', 'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'],
   zho: ['稀釋倍數'],
 };
 
@@ -120,5 +120,101 @@ export function materializeLeaderGaps(
   });
 
   return changed ? result : entries;
+}
+
+/**
+ * Пробелы, закодированные смещением внутри TJ.
+ *
+ * Многие генераторы отчётов не пишут символ пробела, а раздвигают слова числом
+ * в массиве TJ: [(Forest) -278 (Laboratories,) -278 (Inc.)] TJ.
+ * Число сдвигает позицию, но в текст ничего не добавляет, и слова склеиваются.
+ * Здесь смещение, похожее на пробел, превращается в настоящий пробельный символ.
+ *
+ *  - меньше MIN_WORD_GAP_EM - кернинг, остаётся числом;
+ *  - больше maxWordGapEm - зазор между ячейками, его по-прежнему режет
+ *    segmentPreliminaryItem (порог max(высота * 0.6, 2)), не трогаем;
+ *  - ширина строки (advance) не меняется: у пробела ширина равна смещению.
+ */
+export function materializeWordGaps(
+  glyphs: any[],
+  options: {
+    fontSize: number;
+    charSpacing: number;
+    fontDirection: number;
+    vertical: boolean;
+  }
+): any[] {
+  const { fontSize, charSpacing, fontDirection, vertical } = options;
+
+  if (!Array.isArray(glyphs) || vertical || !(fontSize > 0)) {
+    return glyphs;
+  }
+
+  const MIN_WORD_GAP_EM = 0.18;
+  const maxWordGapEm = Math.max(0.6, 2 / fontSize);
+  const glyphScale = fontSize * 0.001;
+  const CJK = /[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFFEF]/;
+
+  const isGlyph = (item: any): boolean =>
+    !!item && typeof item === 'object' && typeof item.unicode === 'string';
+
+  const isBlank = (glyph: any): boolean => !glyph.unicode.trim();
+
+  const result: any[] = [];
+  let previousGlyph: any = null;
+  let pendingNumbers: number[] = [];
+
+  const flushNumbers = (): void => {
+    result.push(...pendingNumbers);
+    pendingNumbers = [];
+  };
+
+  for (const item of glyphs) {
+    if (typeof item === 'number') {
+      pendingNumbers.push(item);
+      continue;
+    }
+
+    if (isGlyph(item) && previousGlyph && pendingNumbers.length) {
+      const adjustment = pendingNumbers.reduce((sum, value) => sum + value, 0);
+      const gapEm = -adjustment / 1000;
+
+      const isWordGap =
+        gapEm >= MIN_WORD_GAP_EM &&
+        gapEm < maxWordGapEm &&
+        !isBlank(previousGlyph) &&
+        !isBlank(item) &&
+        !CJK.test(previousGlyph.unicode) &&
+        !CJK.test(item.unicode);
+
+      // продвижение, которое давали числа, должно остаться тем же
+      const width = -adjustment - (charSpacing * fontDirection) / glyphScale;
+
+      if (isWordGap && width > 0) {
+        result.push({
+          originalCharCode: 32,
+          fontChar: ' ',
+          unicode: ' ',
+          accent: null,
+          width,
+          isSpace: false, // пробел-смещение не получает word spacing
+          isInFont: true,
+          isLineBreak: false,
+        });
+        pendingNumbers = [];
+      }
+    }
+
+    flushNumbers();
+    result.push(item);
+
+    if (isGlyph(item)) {
+      previousGlyph = item;
+    }
+  }
+
+  flushNumbers();
+
+  return result;
 }
 

@@ -5,6 +5,7 @@ import { addToGridList } from "./group-lists";
 import { determineHeaderRows } from "./header-rows";
 import { calculateToleranceValue } from "./pdf-grid-utils";
 import { isVisibleVector, isSameFillColor } from "./pdf-vector-utils";
+import { DEBUG_LOG } from "./pdf-log";
 
 /**
  * A title row ("Table: 5 Public Health Outlay ...") is a single line of text whose
@@ -72,6 +73,158 @@ export function trimFullWidthTitleRow(group: any, lineMaxWidth: number): any {
         }
     });
     group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+    group.headerRows = determineHeaderRows({
+        coordinates: group.coordinates || [],
+        edges: group.edges || [],
+        rectangles: group.rectangles || [],
+        rows: [...group.rows],
+        cols: group.cols || [],
+        lineMaxWidth,
+        separatorRows: group.synthesizedRows || [],
+    });
+
+    return group;
+}
+
+/**
+        * Report header above the table header.
+        *
+        * Rows such as “FOREST LABORATORIES, INC. DISCLOSURE REPORT” / “Calendar Year - 2012”
+        * are inside the table border: each has its own block, and the internal vertical lines
+        * do not extend into them (merged cell). They break the header chain: topHeaderRowCount
+        * counts only consecutive ranges starting from the top, and the actual header moves into the body.
+        *
+        * Header rows are discarded only if the row below them has already been recognized as a header.
+        */
+export function trimTitleBand(group: any, lineMaxWidth: number): any {
+    const MAX_BAND_ROWS = 3;
+    const MIN_HEADER_BLOCKS = 3;
+
+    if (
+        !group?.rows?.length ||
+        !group?.cols?.length ||
+        group.rows.length < 6 ||
+        group.cols.length < 4 ||
+        !group?.headerRows
+    ) {
+        return group;
+    }
+
+    const tolerance = Math.max(lineMaxWidth * 0.5, 1);
+    const rowsDesc = [...group.rows].sort((a, b) => b - a);
+
+    const textBlocks = (group.coordinates || []).filter(
+        (block: any) =>
+            block?.str?.trim() &&
+            [block.x, block.y, block.width, block.height].every(Number.isFinite)
+    );
+
+    const countBlocks = (rowIndex: number): number =>
+        textBlocks.filter(
+            (block: any) =>
+                block.y >= rowsDesc[rowIndex + 1] - 0.01 && block.y < rowsDesc[rowIndex]
+        ).length;
+
+    // The first row contains multiple cells; above it, there are only rows with a single block
+    let firstTableRow = -1;
+
+    for (
+        let index = 0;
+        index < rowsDesc.length - 1 && index <= MAX_BAND_ROWS;
+        index++
+    ) {
+        const blocksCount = countBlocks(index);
+
+        if (blocksCount >= MIN_HEADER_BLOCKS) {
+            firstTableRow = index;
+            break;
+        }
+
+        if (blocksCount > 1) {
+            return group;
+        }
+    }
+
+    if (firstTableRow < 1) {
+        return group;
+    }
+
+    const newTop = rowsDesc[firstTableRow];
+    const bandTop = rowsDesc[0];
+
+    const bandBlocks = textBlocks.filter((block: any) => block.y >= newTop);
+
+    if (!bandBlocks.length) {
+        return group;
+    }
+
+    // The line below the heading is already recognized as a header
+    const isHeaderRecognised = Object.keys(group.headerRows).some((key) => {
+        const edges = key.split('-').map(Number).filter(Number.isFinite);
+
+        return edges.length && Math.abs(Math.max(...edges) - newTop) <= tolerance * 2;
+    });
+
+    if (!isHeaderRecognised) {
+        return group;
+    }
+
+    // The internal vertical lines do not extend into the header (merged cell)
+    const left = Math.min(...group.cols);
+    const right = Math.max(...group.cols);
+    const outerPad = lineMaxWidth * 1.3;
+
+    const crossesBand = (group.edges || []).some((edge: any) => {
+        if (!isVisibleVector(edge) || edge['_isFakeLine']) {
+            return false;
+        }
+
+        if (!(edge.width < lineMaxWidth && edge.height > lineMaxWidth)) {
+            return false;
+        }
+
+        const x = edge.x + edge.width / 2;
+
+        if (x <= left + outerPad || x >= right - outerPad) {
+            return false;
+        }
+
+        const overlap =
+            Math.min(edge.y + edge.height, bandTop) - Math.max(edge.y, newTop);
+
+        return overlap > Math.max(lineMaxWidth, 1);
+    });
+
+    if (crossesBand) {
+        return group;
+    }
+
+    DEBUG_LOG &&
+        console.error('[TITLE BAND TRIMMED]', {
+            rows: firstTableRow,
+            titles: bandBlocks.map((block: any) => String(block.str).trim()),
+            newTop: +newTop.toFixed(3),
+        });
+
+    const isBelowNewTop = (item: any): boolean =>
+        item.y + (item.height || 0) / 2 <= newTop + tolerance;
+
+    group.rows = group.rows.filter((y: number) => y <= newTop + 1e-6);
+    group.coordinates = (group.coordinates || []).filter(
+        (block: any) => !bandBlocks.includes(block)
+    );
+    group.edges = (group.edges || []).filter(isBelowNewTop);
+    group.rectangles = (group.rectangles || []).filter(isBelowNewTop);
+    group.rectanglesEdges = (group.rectanglesEdges || []).filter(isBelowNewTop);
+
+    ['edgesRows', 'rectanglesRows', 'synthesizedRows'].forEach((key) => {
+        if (Array.isArray(group[key])) {
+            group[key] = group[key].filter((y: number) => y <= newTop + 0.5);
+        }
+    });
+
+    group.y = [Math.min(...group.rows), Math.max(...group.rows)];
+
     group.headerRows = determineHeaderRows({
         coordinates: group.coordinates || [],
         edges: group.edges || [],
